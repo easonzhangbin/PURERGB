@@ -914,6 +914,13 @@ class WorkflowProject:
         automatic = origin == "automatic" or (
             origin is None and (high.get("automatic_reference") or high["reference_roi"] == recipe["roi"])
         )
+        x0, y0, x1, y1 = recipe["roi"]
+        a, b, c, d = high["reference_roi"]
+        # A density edit can leave a previously drawn reference entirely
+        # outside the new analysis area. Re-enable automatic selection so
+        # source rebuilds and tone preview can use the new support.
+        if origin == "manual" and (c <= x0 or a >= x1 or d <= y0 or b >= y1):
+            automatic = True
         avoidance = recipe["native_spatial_controls"].get("automatic_avoidance", {})
         if automatic and photo["source_mode"] == "rgb" and avoidance.get("action") == "exclude":
             # The worker can choose only after the current exclusions are frozen.

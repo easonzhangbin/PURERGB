@@ -106,7 +106,7 @@ def build(output, *, portable=False):
                 "CFBundleExecutable": executable.name,
                 "CFBundlePackageType": "APPL",
                 "CFBundleShortVersionString": release,
-                "CFBundleVersion": "1",
+                "CFBundleVersion": "2",
                 "CFBundleIconFile": "AppIcon.icns",
                 "NSHighResolutionCapable": True,
                 **({"PURE RGB Portable": True, "LSMinimumSystemVersion": "14.0"} if portable else {
