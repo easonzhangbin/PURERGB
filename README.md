@@ -1,0 +1,58 @@
+# PURE RGB
+
+**PURE RGB 0.1.0** 是基于 [NegPy 0.68](https://github.com/marcinz606/NegPy/tree/d8123a9b2a18fdaab5941347a91e402fa936d3dc) 的 macOS 胶片数字化工作台。面向同一帧分别以红、绿、蓝光拍摄的 RAW，将三路信号配准合成，在同一测量结果上比较色彩呈现，然后输出带 ICC 的 RGB16 TIFF。
+
+[中文操作手册](docs/OPERATING_MANUAL.zh-CN.md) · [GitHub Releases](https://github.com/easonzhangbin/PURERGB/releases) · [捐赠支持 StudioPURE](https://github.com/easonzhangbin/PURENeg/blob/main/SUPPORT.md)
+
+![PURE RGB 的五步工作台、正像预览与分析图](docs/images/workbench.png)
+
+界面截图使用实拍建筑底片。桌面壁纸由 Milad Fakurian 创作。 [Unsplash 原作](https://unsplash.com/photos/red-and-black-horizontal-striped-abstract-background-WlFOb5WgWvY)
+
+## 工作台设计
+
+- 五步流程贯穿**导入归组、画幅与测量、转换调色、修整审核、导出**。中央保留正像，左右侧栏分别承载参数与照片、波形图、RGB 分量图和直方图。应用继承 macOS 的原生材质设置。
+- **分区密度测量**在有效画面上叠加网格。点击单元可排除或恢复，单元的视觉状态会更新，密度测量按新的有效样本重新计算。输出裁切、拉直和方向随照片共用。
+- **修整审核**由 PURE RGB 承载界面，按需调用独立安装的 [PURE Neg](https://github.com/easonzhangbin/PURENeg/releases/latest) 后端。修复确认后返回工作台，再从同一流程导出。
+
+## 色彩引擎与输入
+
+| 引擎 | 实现范围 |
+| --- | --- |
+| NegPy · 原生 | 使用 NegPy 的密度分析、反相和数码印相处理。 |
+| Nikon CMS · 仅 CMS | 将中性 RGB16 正像送入 CML4 研究链，可选固定曲线。需要本机自备且有权使用的匹配研究资源。 |
+| FlexColor · 演算 | 默认以共享密度窗口与公开重建的曲线算法做中性演算。经过验证的本机资源配方可启用原曲线与六色校正。 |
+
+三种引擎的彩色工作流使用同一底片的三次分光拍摄，适用于经验证的 RGB RAW 组。单张彩色翻拍的 Bayer RAW 使用不同的采集域，本版没有对应转换入口。单张黑白负片可走 NegPy 原生流程。Nikon 与 FlexColor 路线用于比较逆向研究所得的处理阶段，色彩输出以相机采集与当前的工作域假设为基础。
+
+## 安装与启动
+
+当前提供 **0.1.0 源码发行**，目标是配备 Apple 芯片的 Mac。首次安装需要联网，以及 Git、[uv](https://docs.astral.sh/uv/getting-started/installation/)、稳定版 [Rust 工具链](https://rust-lang.org/tools/install/) 和 Apple 命令行开发者工具。可用 `xcode-select --install` 安装 Apple 工具。准备好这些工具后，再执行以下命令。安装脚本使用 Python 3.13 和固定依赖，首次编译可能需要数分钟。
+
+```bash
+git clone --branch v0.1.0 https://github.com/easonzhangbin/PURERGB.git
+cd PURERGB
+python3 bootstrap.py
+./PURE\ RGB.command
+```
+
+要在 Finder 里启动，可在本机完成上述安装后构建应用。该应用仍使用构建时的源码目录和虚拟环境。
+
+```bash
+vendor/negpy/.venv/bin/python tools/build_local_test_app.py "$HOME/Applications/PURE RGB 0.1.0.app"
+```
+
+设置中的「检查更新」查询 GitHub 的最新正式发布，提供发布页入口。按照新版本的安装说明更新源码即可。捐赠入口打开 StudioPURE 已公开的支持页面。
+
+### 可选 Nikon 资源
+
+仅在拥有可使用的匹配资源时，把 CML4 资源、ICC、固定曲线和验证文件放入本机的 `vendor/cool-colors/assets/nikon_cml4/`。安装脚本只取得参考源码。运行以下探针可核对所需名称和哈希。
+
+```bash
+vendor/negpy/.venv/bin/python -m pure_rgb.nikon_resource_probe
+```
+
+缺少资源时可使用 NegPy 和 FlexColor 路线。Nikon 的预扫描原始特性数据、扫描仪厂商配置与实验捕获数据保留在其各自的权利范围内。
+
+## 许可与致谢
+
+软件源码采用 [GPL-3.0](LICENSE)。项目由 NegPy 的开源工作发展而来，并参考 cool-colors、flexcolor-tool 与 nkscan。品牌图标和字标保留各自权利。详见 [第三方来源与许可](THIRD_PARTY_NOTICES.md)。

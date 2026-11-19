@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$ROOT"
+exec uv run --project "$ROOT/vendor/negpy" python -m pure_rgb.preview_ui "$@"
