@@ -1,4 +1,4 @@
-"""Build a local Finder app using the current PURE RGB source checkout."""
+"""Build a Finder app, optionally with a relocatable runtime."""
 
 import argparse
 import platform
@@ -9,6 +9,7 @@ import sys
 import sysconfig
 from pathlib import Path
 import runpy
+import tarfile
 from tempfile import TemporaryDirectory
 
 
@@ -19,13 +20,34 @@ MANUAL = Path("docs/OPERATING_MANUAL.zh-CN.md")
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store", "* 2.*")
 
 
+def bundle_vendors(source, scratch):
+    pins = runpy.run_path(str(ROOT / "bootstrap.py"))["SOURCES"]
+    local_vendor = Path(sys.prefix).parent.parent
+    for name, _, revision in pins:
+        checkout = local_vendor / name
+        paths = {
+            "negpy": ["negpy", "icc", "crosstalk", "gear", "LICENSE", "NOTICE.md", "VERSION"],
+            "cool-colors": ["LICENSE", "nikon_cml4.py", "nikon_cml4_oracle.py", "invert_c41.py",
+                            "build_builder_luts.py"],
+            "flexcolor-tool": ["LICENSE", "flexcolor"],
+        }[name]
+        archive = scratch / (name + ".tar")
+        subprocess.run(["git", "-C", str(checkout), "archive", "-o", str(archive), revision, "--", *paths],
+                       check=True)
+        destination = source / "vendor" / name
+        destination.mkdir(parents=True)
+        with tarfile.open(archive) as package:
+            package.extractall(destination, filter="data")
+        (destination / ".pure-rgb-revision").write_text(revision + "\n")
+
+
 def copy_file(relative, destination):
     target = destination / relative
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(ROOT / relative, target)
 
 
-def build(output):
+def build(output, *, portable=False):
     if sys.platform != "darwin" or platform.machine() != "arm64":
         raise ValueError("此测试版构建要求 Apple Silicon macOS")
     if output.suffix != ".app" or output.exists():
@@ -63,6 +85,19 @@ def build(output):
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "site-packages"),
                         copy_function=shutil.copyfile)
         shutil.copyfile(python_base / library_name, runtime / library_name)
+        if portable:
+            bundle_vendors(source, Path(scratch))
+            shutil.copytree(dependency_path, resources / "Packages", symlinks=True, ignore=shutil.ignore_patterns(
+                "__pycache__", "*.pyc", ".DS_Store", "*.pth", "_virtualenv*", "__editable__*",
+                "direct_url.json", "PyInstaller", "pyinstaller*", "_pyinstaller*", "pytest*",
+                "_pytest", "coverage*", "ruff*", "ty", "ty-*.dist-info",
+            ))
+            negpy_pin = runpy.run_path(str(ROOT / "bootstrap.py"))["SOURCES"][0][2]
+            build_source = (Path(sys.prefix).parent / "negpy_core").as_uri()
+            public_source = f"https://github.com/marcinz606/NegPy/tree/{negpy_pin}/negpy_core"
+            for sbom in (resources / "Packages").glob("negpy_core-*.dist-info/sboms/*.json"):
+                sbom.write_text(sbom.read_text().replace(build_source, public_source))
+            copy_file(Path("LICENSE"), source)
         with (contents / "Info.plist").open("wb") as stream:
             plistlib.dump({
                 "CFBundleIdentifier": "io.github.easonzhangbin.purergb",
@@ -74,8 +109,10 @@ def build(output):
                 "CFBundleVersion": "1",
                 "CFBundleIconFile": "AppIcon.icns",
                 "NSHighResolutionCapable": True,
-                "PURE RGB Test Workspace": str(ROOT),
-                "PURE RGB Python Dependencies": str(dependency_path),
+                **({"PURE RGB Portable": True} if portable else {
+                    "PURE RGB Test Workspace": str(ROOT),
+                    "PURE RGB Python Dependencies": str(dependency_path),
+                }),
                 "PURE RGB Python Library": library_name,
             }, stream)
         subprocess.run([
@@ -94,8 +131,9 @@ def build(output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--portable", action="store_true")
     args = parser.parse_args()
-    build(args.output.resolve())
+    build(args.output.resolve(), portable=args.portable)
     print(args.output.resolve())
 
 

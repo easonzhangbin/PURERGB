@@ -7,7 +7,16 @@ import sys
 
 import numpy as np
 
-from . import WORKSPACE_ROOT as ROOT
+from . import BUNDLED_VENDOR, VENDOR_ROOT, WORKSPACE_ROOT
+
+ROOT = WORKSPACE_ROOT
+
+
+def check_bundled_revision(folder, revision):
+    # The marker and reference source are sealed together by the app signature.
+    if (VENDOR_ROOT / folder / ".pure-rgb-revision").read_text().strip() != revision:
+        raise ValueError(f"Packaged reference revision is invalid: {folder}")
+
 COOL_SHA = "74ffceb79e6e976858d9bffddfeefddba626378f"
 FLEX_SHA = "04e745a2fde3559acb2d4f194b7a192150b26f5c"
 CAPABILITIES = {
@@ -57,7 +66,10 @@ def check_reference_sources():
     import subprocess
 
     for folder, sha in (("cool-colors", COOL_SHA), ("flexcolor-tool", FLEX_SHA)):
-        path = ROOT / "vendor" / folder
+        if BUNDLED_VENDOR:
+            check_bundled_revision(folder, sha)
+            continue
+        path = VENDOR_ROOT / folder
         actual = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=path, text=True
         ).strip()
@@ -220,7 +232,7 @@ def flexcolor_research(
     sliders_kernel="legacy-linear",
 ):
     """Apply the supported reconstructed stages; exclude the placeholder sensor LUT."""
-    sys.path.insert(0, str(ROOT / "vendor/flexcolor-tool"))
+    sys.path.insert(0, str(VENDOR_ROOT / "flexcolor-tool"))
     from flexcolor.profiles import gradations
     from flexcolor.render import build_lut, contrast_brightness, neg_gamma
     from .engine_resources import inspect_flex_profile, require_flex_profile

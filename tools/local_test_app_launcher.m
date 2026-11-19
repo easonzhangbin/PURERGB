@@ -31,11 +31,29 @@ int main(int argc, char **argv) {
         NSString *runtime = [resources stringByAppendingPathComponent:@"Python"];
         NSString *libraryName = config[@"PURE RGB Python Library"];
         NSFileManager *files = NSFileManager.defaultManager;
+        BOOL portable = [config[@"PURE RGB Portable"] boolValue];
+        NSString *vendor = nil;
+        if (portable) {
+            NSString *support = [files URLsForDirectory:NSApplicationSupportDirectory
+                                              inDomains:NSUserDomainMask].firstObject.path;
+            workspace = [support stringByAppendingPathComponent:@"PURE RGB"];
+            deps = [resources stringByAppendingPathComponent:@"Packages"];
+            vendor = [source stringByAppendingPathComponent:@"vendor"];
+            if (!workspace || ![files createDirectoryAtPath:workspace withIntermediateDirectories:YES
+                                                 attributes:nil error:NULL]) {
+                return startupError(@"无法创建 PURE RGB 的应用数据目录。", worker);
+            }
+            setenv("PURE_RGB_BUNDLED_VENDOR", vendor.fileSystemRepresentation, 1);
+        } else {
+            vendor = [workspace stringByAppendingPathComponent:@"vendor"];
+            unsetenv("PURE_RGB_BUNDLED_VENDOR");
+        }
         if (!workspace.length || !deps.length || !resources.length || !libraryName.length ||
-            ![files isReadableFileAtPath:[workspace stringByAppendingPathComponent:@"vendor/negpy/negpy/__init__.py"]] ||
+            ![files isReadableFileAtPath:[vendor stringByAppendingPathComponent:@"negpy/negpy/__init__.py"]] ||
             ![files isReadableFileAtPath:[deps stringByAppendingPathComponent:@"PyQt6"]] ||
             chdir(workspace.fileSystemRepresentation) != 0) {
-            return startupError(@"此应用使用构建时的 PURE RGB 源码目录及其运行依赖。请恢复该目录的位置，或在新位置重新构建。", worker);
+            return startupError(portable ? @"应用运行资源缺失，请重新解压应用包。"
+                : @"此应用使用构建时的 PURE RGB 源码目录及其运行依赖。请恢复该目录的位置，或在新位置重新构建。", worker);
         }
         NSString *packages = [NSString stringWithFormat:@"%@:%@", source, deps];
         setenv("PURE_RGB_TEST_WORKSPACE", workspace.fileSystemRepresentation, 1);

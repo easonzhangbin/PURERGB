@@ -72,7 +72,7 @@ def _runtime():
     # The frozen test app runs its own pure_rgb snapshot from the bundle while
     # the pinned negpy sources stay in the workspace; hash each from where it
     # actually loads. In the repository both roots coincide.
-    from . import WORKSPACE_ROOT
+    from . import VENDOR_ROOT
 
     local = Path(__file__).resolve().parents[1]
     own = [
@@ -97,7 +97,7 @@ def _runtime():
     }
     files.update(
         {
-            name: hashlib.sha256((WORKSPACE_ROOT / name).read_bytes()).hexdigest()
+            name: hashlib.sha256((VENDOR_ROOT / name.removeprefix("vendor/")).read_bytes()).hexdigest()
             for name in vendor
         }
     )

@@ -12,7 +12,7 @@ import tomllib
 
 import numpy as np
 
-from .engines import ROOT
+from . import VENDOR_ROOT
 
 
 def generic_film():
@@ -123,7 +123,7 @@ def film_catalog(user_directories=None):
     errors = []
     # As in original NegPy, bundled names take precedence over user duplicates.
     seen = {"Generic C41"}
-    for directory in [ROOT / "vendor/negpy/crosstalk", *map(Path, directories)]:
+    for directory in [VENDOR_ROOT / "negpy/crosstalk", *map(Path, directories)]:
         for path in sorted(directory.glob("*.toml")):
             try:
                 item = read_film(path)

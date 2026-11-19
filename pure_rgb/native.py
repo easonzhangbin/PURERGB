@@ -7,7 +7,8 @@ import subprocess
 
 import numpy as np
 
-from .engines import ROOT
+from . import BUNDLED_VENDOR, VENDOR_ROOT
+from .engines import check_bundled_revision
 
 NEGPY_SHA = "d8123a9b2a18fdaab5941347a91e402fa936d3dc"
 
@@ -21,7 +22,10 @@ def sha256(path):
 
 
 def check_baseline():
-    source = ROOT / "vendor/negpy"
+    if BUNDLED_VENDOR:
+        check_bundled_revision("negpy", NEGPY_SHA)
+        return
+    source = VENDOR_ROOT / "negpy"
     actual = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=source, text=True
     ).strip()
