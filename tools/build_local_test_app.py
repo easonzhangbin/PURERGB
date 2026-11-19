@@ -109,7 +109,7 @@ def build(output, *, portable=False):
                 "CFBundleVersion": "1",
                 "CFBundleIconFile": "AppIcon.icns",
                 "NSHighResolutionCapable": True,
-                **({"PURE RGB Portable": True} if portable else {
+                **({"PURE RGB Portable": True, "LSMinimumSystemVersion": "14.0"} if portable else {
                     "PURE RGB Test Workspace": str(ROOT),
                     "PURE RGB Python Dependencies": str(dependency_path),
                 }),
@@ -117,6 +117,7 @@ def build(output, *, portable=False):
             }, stream)
         subprocess.run([
             "/usr/bin/xcrun", "clang", "-fobjc-arc", "-O2", "-Wall", "-Wextra",
+            *(["-mmacosx-version-min=14.0"] if portable else []),
             "-framework", "Cocoa", "-o", str(executable), str(ROOT / "tools/local_test_app_launcher.m"),
         ], check=True)
         # Finder metadata from locally copied directories prevents signing.

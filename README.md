@@ -26,7 +26,7 @@
 
 ## 安装与启动
 
-**Apple 芯片 Mac 下载**。解压 ZIP 后把 `PURE RGB.app` 拖入「应用程序」。随包交付运行环境，可直接启动。此包为临时签名，尚未通过 Apple 公证。若 macOS 在首次打开时提示无法验证，请核对发布页的 SHA-256 与来源，再参照 Apple 的说明处理。 [下载应用](https://github.com/easonzhangbin/PURERGB/releases/download/v0.1.0/PURE-RGB-0.1.0-macos-arm64.zip) · [Apple 官方说明](https://support.apple.com/en-us/102445)
+**Apple 芯片 Mac 下载，要求 macOS 14 或更新版本**。解压 ZIP 后把 `PURE RGB.app` 拖入「应用程序」。随包交付运行环境，可直接启动。此包为临时签名，尚未通过 Apple 公证。若 macOS 在首次打开时提示无法验证，请核对发布页的 SHA-256 与来源，再参照 Apple 的说明处理。 [下载应用](https://github.com/easonzhangbin/PURERGB/releases/download/v0.1.0/PURE-RGB-0.1.0-macos-arm64.zip) · [Apple 官方说明](https://support.apple.com/en-us/102445)
 
 ### 从源码运行
 
