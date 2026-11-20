@@ -259,6 +259,7 @@ class DraftPreview:
         return recipe, mode, full
 
     def render(self, request):
+        from .diagnostics import span
         from .viewport_preview_v43 import (
             output_size_for_recipe, render_viewport, sample_full_viewport,
         )
@@ -294,7 +295,8 @@ class DraftPreview:
         interactive = render_interactive_post(self, request, recipe, mode)
         if interactive is not None:
             return interactive
-        sampled = self.density_preview.try_render(request, recipe, mode)
+        with span("preview_sampled_density", mode=mode):
+            sampled = self.density_preview.try_render(request, recipe, mode)
         if sampled is not None:
             return sampled
         if "viewport" in request:

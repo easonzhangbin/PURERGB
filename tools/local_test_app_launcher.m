@@ -21,7 +21,8 @@ int main(int argc, char **argv) {
     @autoreleasepool {
         BOOL worker = argc >= 3 && strcmp(argv[1], "-m") == 0 &&
             (strcmp(argv[2], "pure_rgb.workflow_worker") == 0 ||
-             strcmp(argv[2], "pure_rgb.live_worker") == 0);
+             strcmp(argv[2], "pure_rgb.live_worker") == 0 ||
+             strcmp(argv[2], "pure_rgb.decode_prewarm") == 0);
         NSBundle *bundle = NSBundle.mainBundle;
         NSString *resources = bundle.resourcePath;
         NSDictionary *config = bundle.infoDictionary;

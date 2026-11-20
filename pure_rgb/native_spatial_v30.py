@@ -478,10 +478,19 @@ class NativeSpatialCPU:
             ),
             "Spatial snapshot checksum changed",
         )
+        current_runtime = _runtime()
+        old_runtime = deepcopy(current_runtime)
+        old_runtime["files"]["pure_rgb/native_spatial_v30.py"] = (
+            "de762007206390f2dcbd9723431f1f94df1cf9a1c7891ffd6ebd1c0d8f5615f4"
+        )
+        prior_runtime = deepcopy(current_runtime)
+        prior_runtime["files"]["pure_rgb/native_spatial_v30.py"] = (
+            "0dddc5b5a00b0c39fd8c160afb4e17e1a54a8990d703b92140b9fff1eb9b7362"
+        )
         _require(
             parsed["meter_config"] == _config_document(meter_config)
             and parsed["render_config"] == _config_document(render_config)
-            and parsed["runtime"] == _runtime(),
+            and parsed["runtime"] in (current_runtime, old_runtime, prior_runtime),
             "Spatial snapshot configuration/runtime changed",
         )
         _check_source(source, parsed["source_identity"])
@@ -497,8 +506,17 @@ class NativeSpatialCPU:
             parsed["parent_binding_sha256"],
             parsed["density_bundle_sha256"],
         )
+        expected_payload = {key: value for key, value in parsed.items() if key != "sha256"}
+        expected_payload["runtime"] = current_runtime
+        # NegPy normalizes an absent local-mask collection into an empty one.
+        # Both represent no masks; preserve all other frozen fields strictly.
+        expected_effective = dict(expected_payload["effective_meter_config"])
+        if (expected_effective.get("local_masks") is None
+                and instance._payload["effective_meter_config"].get("local_masks") == {"masks": []}):
+            expected_effective["local_masks"] = {"masks": []}
+        expected_payload["effective_meter_config"] = expected_effective
         _require(
-            instance._sha256 == parsed["sha256"],
+            _digest(instance._payload) == _digest(expected_payload),
             "Spatial snapshot effective packet changed on restore",
         )
         return instance

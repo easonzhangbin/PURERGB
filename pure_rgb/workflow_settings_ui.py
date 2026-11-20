@@ -260,7 +260,7 @@ class SettingsPanel(QWidget):
             self.proof_changed.emit(self.proof_choice.currentData())
 
     def _refresh_policy(self):
-        policy = resolve_performance(self.settings, hardware=self.hardware)
+        policy = resolve_performance(self.settings, hardware=self.hardware, include_backend=False)
         self.cpu_threads.readout.setText(
             "自动" if not self.settings["cpu_threads"] else str(self.settings["cpu_threads"])
         )

@@ -27,6 +27,9 @@ def shutdown_window(window):
     settings = getattr(window, "settings_window", None)
     if settings is not None:
         settings.dispose()
+    update_notice = getattr(window, "update_notice", None)
+    if update_notice is not None:
+        update_notice.dispose()
     # Invalidate queued display completions before joining their pools.
     window.token += 1
     window.live.invalidate(window.token)

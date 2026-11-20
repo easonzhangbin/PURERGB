@@ -423,7 +423,18 @@ def render(request, *, emit_callback=None, prepared_source=None):
         frozen = replace(
             config, process=fixed_process(config.process, window, source.shape)
         )
-        if recipe.get("density_metering"):
+        # A Native-only spatial render derives its own source, reference and
+        # RGB16 output. The neutral positive is only consumed by the other
+        # engines, so avoid rendering a second full frame in that case.
+        skip_neutral_native = (
+            only_mode == "native"
+            and bool(recipe.get("native_spatial_controls"))
+            and not recipe.get("density_metering")
+            and not recipe.get("nikon_research_controls")
+        )
+        if skip_neutral_native:
+            payload = export = native = icc = None
+        elif recipe.get("density_metering"):
             from .shared_density_metering_v43 import render_shared_measurement
 
             report["shared_measurement_input_density_window"] = asdict(window)
@@ -437,7 +448,8 @@ def render(request, *, emit_callback=None, prepared_source=None):
         else:
             with span("native_reference", backend="cpu"):
                 payload, export = native_export(processor, frozen, records)
-        native, icc = inspect_tiff(payload)
+        if payload is not None:
+            native, icc = inspect_tiff(payload)
         nikon_controls = recipe.get("nikon_research_controls")
         nikon_reference = None
         if nikon_controls:
@@ -447,12 +459,13 @@ def render(request, *, emit_callback=None, prepared_source=None):
             nikon_reference = native.view()
             nikon_reference.setflags(write=False)
             report["nikon_research_reference_config"] = frozen.to_dict()
-        with tifffile.TiffFile(io.BytesIO(payload)) as tif:
-            page = tif.pages[0]
-            dpi = {
-                "resolution": (page.tags[282].value, page.tags[283].value),
-                "resolutionunit": int(page.tags[296].value),
-            }
+        if payload is not None:
+            with tifffile.TiffFile(io.BytesIO(payload)) as tif:
+                page = tif.pages[0]
+                dpi = {
+                    "resolution": (page.tags[282].value, page.tags[283].value),
+                    "resolutionunit": int(page.tags[296].value),
+                }
         # The fitters use only this exact ROI-origin grid. Convert the selected
         # RGB16 samples rather than retaining a full float64 reference ROI.
         # Creative Native edits below remain independent of this neutral grid.
@@ -469,7 +482,7 @@ def render(request, *, emit_callback=None, prepared_source=None):
             source_shape=list(source.shape),
             density_window=asdict(window),
             native_config=frozen.to_dict(),
-            icc_sha256=hashlib.sha256(icc).hexdigest(),
+            **({"icc_sha256": hashlib.sha256(icc).hexdigest()} if icc is not None else {}),
         )
         # Keep neutral reference and all experimental fitting independent of
         # Native-only creative controls. The original export above is immutable.
@@ -536,7 +549,20 @@ def render(request, *, emit_callback=None, prepared_source=None):
             else:
                 payload, _ = native_export(processor, adjusted, records)
             native, adjusted_icc = inspect_tiff(payload)
-            if adjusted_icc != icc:
+            if icc is None:
+                from .positive_float import working_icc_bytes
+
+                if adjusted_icc != working_icc_bytes():
+                    raise ValueError("Native 输出 ICC 与共同工作色彩空间不一致")
+                icc = adjusted_icc
+                report["icc_sha256"] = hashlib.sha256(icc).hexdigest()
+                with tifffile.TiffFile(io.BytesIO(payload)) as tif:
+                    page = tif.pages[0]
+                    dpi = {
+                        "resolution": (page.tags[282].value, page.tags[283].value),
+                        "resolutionunit": int(page.tags[296].value),
+                    }
+            elif adjusted_icc != icc:
                 raise ValueError("Native 控件渲染的 ICC 与参考不一致")
             report["native_reference_config"] = report["native_config"]
             report["native_config"] = adjusted.to_dict()

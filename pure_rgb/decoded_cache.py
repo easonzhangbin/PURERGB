@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import pickle
 import tempfile
+import time
 
 import numpy as np
 
@@ -57,6 +58,10 @@ def cache_key(manifest, recipe, config_document, reference_shape):
     material = {
         "format": _FORMAT,
         "inputs": [record["sha256"] for record in manifest["inputs"]],
+        # Decoder metadata and import receipts retain source paths. Identical
+        # files at different paths must have independent entries until that
+        # state can be safely rebound across paths.
+        "input_paths": [record.get("path") for record in manifest["inputs"]],
         "flatfield": bool(recipe["flatfield"]),
         "calibration": (manifest.get("calibration") or {}).get("sha256")
         if recipe["flatfield"]
@@ -65,7 +70,9 @@ def cache_key(manifest, recipe, config_document, reference_shape):
         "raw_import": recipe.get("raw_import", LEGACY_IMPORT),
         **({"lens_correction": True} if recipe.get("lens_correction") else {}),
         "registration_check": recipe.get("registration_check"),
-        "flatfield_strength": float(recipe.get("flatfield_strength", 1.0)),
+        "flatfield_strength": (
+            float(recipe.get("flatfield_strength", 1.0)) if recipe["flatfield"] else 1.0
+        ),
         **({"flatfield_strength_curve": "exposure-stops-v1"}
            if recipe["flatfield"] and recipe.get("flatfield_strength", 1.0) > 1.0 else {}),
         "flatfield_reference_shape": list(reference_shape) if reference_shape else None,
@@ -78,6 +85,22 @@ def cache_key(manifest, recipe, config_document, reference_shape):
 
 def _entry_paths(directory, key):
     return directory / f"{key}.npy", directory / f"{key}.pkl"
+
+
+def _report_prewarm_entry(data_path, meta_path):
+    """Report a validated entry to the optional, private prewarm subprocess."""
+    destination = os.environ.get("PURE_RGB_PREWARM_RESULT")
+    if not destination:
+        return
+    try:
+        document = {
+            "key": data_path.stem,
+            "data_identity": file_identity(data_path),
+            "meta_identity": file_identity(meta_path),
+        }
+        Path(destination).write_text(json.dumps(document))
+    except (OSError, ValueError, TypeError):
+        pass
 
 
 def _drop(data_path, meta_path):
@@ -182,6 +205,7 @@ def restore_source(
         except OSError:
             pass
     event("decoded_cache_hit", bytes=int(source.nbytes))
+    _report_prewarm_entry(data_path, meta_path)
     return source
 
 
@@ -199,6 +223,9 @@ def store_source(
     """Persist a real decode for later sessions; caching never breaks a preview."""
     if not _enabled() or ir is not None:
         return
+    # Avoid hashing and writing a frame that eviction would immediately remove.
+    if _budget_bytes() < source.nbytes + 4096:
+        return
     directory = _directory()
     if directory is None:
         return
@@ -207,7 +234,7 @@ def store_source(
         if key is None:
             return
         data_path, meta_path = _entry_paths(directory, key)
-        if data_path.exists() or meta_path.exists():
+        if data_path.exists() and meta_path.exists():
             return
         standard = recipe.get("raw_import", LEGACY_IMPORT) != LEGACY_IMPORT
         meta = {
@@ -247,12 +274,12 @@ def store_source(
         temporary = []
         try:
             with tempfile.NamedTemporaryFile(
-                "wb", dir=directory, delete=False
+                "wb", dir=directory, prefix=".decoded-cache-tmp-", delete=False
             ) as stream:
                 temporary.append(Path(stream.name))
                 np.save(stream, source)
             with tempfile.NamedTemporaryFile(
-                "wb", dir=directory, delete=False
+                "wb", dir=directory, prefix=".decoded-cache-tmp-", delete=False
             ) as stream:
                 temporary.append(Path(stream.name))
                 pickle.dump(meta, stream)
@@ -265,7 +292,11 @@ def store_source(
         failure("decoded_cache_store_failed", error)
         return
     event("decoded_cache_store", bytes=int(source.nbytes))
-    _evict_overflow(directory, _budget_bytes())
+    try:
+        _evict_overflow(directory, _budget_bytes())
+    except OSError as error:
+        failure("decoded_cache_evict_failed", error)
+    _report_prewarm_entry(data_path, meta_path)
 
 
 class RenderDecodeCache:
@@ -364,7 +395,20 @@ def render_decode_context(request, recipe, anchor):
 
 def _evict_overflow(directory, budget):
     entries = {}
+    now = time.time()
     for path in directory.iterdir():
+        # A killed process cannot run its temporary-file cleanup. Remove only
+        # our old files, leaving active writes and unrelated files untouched.
+        transient = path.name.startswith((".decoded-cache-tmp-", ".prewarm-marker-"))
+        marker = path.name.startswith("prewarm-") and path.suffix == ".json"
+        if (transient or marker) and not path.is_symlink():
+            try:
+                max_age = (24 if transient else 30 * 24) * 60 * 60
+                if path.is_file() and path.stat().st_mtime < now - max_age:
+                    path.unlink()
+            except OSError:
+                pass
+            continue
         stem = path.stem
         if (
             path.is_symlink()
@@ -374,7 +418,11 @@ def _evict_overflow(directory, budget):
             or any(character not in "0123456789abcdef" for character in stem)
         ):
             continue
-        stat = path.lstat()
+        try:
+            stat = path.lstat()
+        except OSError:
+            # Other render processes can evict the same entry concurrently.
+            continue
         entry = entries.setdefault(stem, {"mtime": stat.st_mtime_ns, "size": 0, "paths": []})
         entry["mtime"] = min(entry["mtime"], stat.st_mtime_ns)
         entry["size"] += stat.st_size

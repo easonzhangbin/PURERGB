@@ -258,13 +258,31 @@ def suggest_highlight_reference(recipe, source_shape, additional_exclusions=()):
     )
 
 
-def validate_highlight_reference(recipe, source_shape, additional_exclusions=()):
+def fit_manual_highlight_reference(recipe, source_shape, bounds, receipt):
+    """Align a manual reference within the original source image."""
+    del receipt  # The density selection does not constrain a manual reference.
+    height, width = source_shape[:2]
+    a, b, c, d = bounds
+    if not (0 <= a < c <= width and 0 <= b < d <= height):
+        raise ValueError("高光参考区超出原图范围，请重新绘制")
+    if recipe.get("native_spatial_controls") and min(c - a, d - b) < 4:
+        raise ValueError("高光参考至少需要 4 × 4 源像素")
+    return align_highlight_reference(recipe, bounds)
+
+
+def validate_highlight_reference(
+    recipe, source_shape, additional_exclusions=(), *, require_metering_support=True
+):
+    a, b, c, d = recipe["highlight_controls"]["reference_roi"]
+    height, width = source_shape[:2]
+    if not (0 <= a < c <= width and 0 <= b < d <= height) or min(c - a, d - b) < 4:
+        raise ValueError("高光参考区超出原图范围或过小，请重新绘制")
+    if not require_metering_support:
+        return
     allowed = highlight_support(recipe, source_shape, additional_exclusions)
     x0, y0, x1, y1 = recipe["roi"]
-    a, b, c, d = recipe["highlight_controls"]["reference_roi"]
     if (
         not (x0 <= a < c <= x1 and y0 <= b < d <= y1)
-        or min(c - a, d - b) < 4
         or not allowed[b - y0 : d - y0, a - x0 : c - x0].all()
     ):
         raise ValueError("高光参考区跨越已排除的测量支持，请在有效区域内重选")
@@ -573,6 +591,7 @@ class WorkflowProject:
         "drafts", "color_engine", "output_orientation", "measurement",
         "protected_rois", "fixed_last_strength", "highlight_reference_origin",
         "highlight_reference_drawn_roi", "highlight_reference_aligned",
+        "suspended_highlight_controls",
         "flatfield_input", "repair_reset_index",
     )
 
@@ -849,9 +868,8 @@ class WorkflowProject:
             candidate = deepcopy(photo)
             engine = self.color_engine(candidate)
             before = self.recipe(candidate, engine)
+            before_edit = self._edit_snapshot(candidate)
             after = checked_recipe(merged_adjustments(source, candidate, engine, before, groups))
-            if after == before:
-                continue
             candidate["drafts"][engine] = after
             if "engine" in groups and engine == "nikon":
                 fixed = after.get("nikon_research_controls", {}).get("fixed_strength", 0)
@@ -864,12 +882,15 @@ class WorkflowProject:
             if "orientation" in groups:
                 candidate["output_orientation"] = checked_output_orientation(after.get("output_orientation"))
                 self._shared_orientation(candidate)
+            if self._edit_snapshot(candidate) == before_edit:
+                continue
             updates.append((photo, deepcopy(photo), candidate))
 
         if not updates:
             return []
         histories = [self._edit_history(photo) for photo, _, _ in updates]
         for photo, _, candidate in updates:
+            photo.clear()
             photo.update(candidate)
         try:
             self.save()
@@ -914,13 +935,6 @@ class WorkflowProject:
         automatic = origin == "automatic" or (
             origin is None and (high.get("automatic_reference") or high["reference_roi"] == recipe["roi"])
         )
-        x0, y0, x1, y1 = recipe["roi"]
-        a, b, c, d = high["reference_roi"]
-        # A density edit can leave a previously drawn reference entirely
-        # outside the new analysis area. Re-enable automatic selection so
-        # source rebuilds and tone preview can use the new support.
-        if origin == "manual" and (c <= x0 or a >= x1 or d <= y0 or b >= y1):
-            automatic = True
         avoidance = recipe["native_spatial_controls"].get("automatic_avoidance", {})
         if automatic and photo["source_mode"] == "rgb" and avoidance.get("action") == "exclude":
             # The worker can choose only after the current exclusions are frozen.
@@ -951,7 +965,9 @@ class WorkflowProject:
             recipe["highlight_controls"]["reference_roi"] = suggest_highlight_reference(
                 recipe, photo["source_shape"], extras
             )
-        validate_highlight_reference(recipe, photo["source_shape"], extras)
+        validate_highlight_reference(
+            recipe, photo["source_shape"], extras, require_metering_support=automatic
+        )
         return recipe, automatic
 
     def completed(self, job_id):

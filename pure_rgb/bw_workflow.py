@@ -88,8 +88,40 @@ def _prepare_metering(source, config, roi, recipe, *, snapshot=None):
         if snapshot is not None
         else BWMaskedState(source, config, roi, recipe["bw_metering"])
     )
-    if recipe.get("highlight_controls"):
-        state.register_reference_roi(recipe["highlight_controls"]["reference_roi"])
+    high = recipe.get("highlight_controls")
+    if high:
+        from .spatial_workflow_v31 import _check_highlight_reference_bounds
+
+        reference = high["reference_roi"]
+        _check_highlight_reference_bounds(reference, source.shape)
+        a, b, c, d = reference
+        x0, y0, x1, y1 = state.roi
+        inside = (x0 <= a < c <= x1 and y0 <= b < d <= y1
+                  and state._support[b - y0 : d - y0, a - x0 : c - x0].all())
+        if inside or high.get("automatic_reference"):
+            state.register_reference_roi(reference)
+        else:
+            # The legacy BW snapshot authenticates the density support. Keep
+            # it unchanged and register the independently selected highlight
+            # reference only for this render; replay can rebuild it from the
+            # saved recipe while retaining the frozen base measurement.
+            from .bw_metering import _measure, _window_record
+
+            state._independent_snapshot = state.to_json()
+            selected = np.ascontiguousarray(source[b:d, a:c])
+            meter = replace(state.effective_config, process=replace(
+                state.effective_config.process, meter_rect=None,
+            ))
+            window = negpy_window(selected, meter, (0, 0, c - a, d - b))
+            window = replace(window, analysis=replace(window.analysis, roi=tuple(reference)))
+            ref_config = state._reference_config(_window_record(window))
+            _, metrics, receipt = _measure(
+                source, ref_config, window, reference,
+                np.ones((d - b, c - a), dtype=bool), 1.0,
+                require_full_grid=True,
+            )
+            state._register("reference", ref_config, window, metrics, receipt)
+            state._validate()
     return state
 
 
@@ -277,7 +309,8 @@ def render_bw(request, *, emit_callback=None):
             density_window=asdict(window),
             native_config=config.to_dict(),
             icc_sha256=record["icc_sha256"],
-            bw_metering_snapshot=state.to_json() if state else None,
+            bw_metering_snapshot=(getattr(state, "_independent_snapshot", None)
+                                  or state.to_json()) if state else None,
             bw_metering_processing=deepcopy(state.receipt) if state else None,
             highlight_processing=high,
         )

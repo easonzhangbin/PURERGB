@@ -52,6 +52,17 @@ def _require(condition, message):
         raise ValueError(message)
 
 
+def _check_highlight_reference_bounds(reference, source_shape):
+    """Validate a manual reference in source coordinates, independently of metering."""
+    x0, y0, x1, y1 = reference
+    _require(
+        0 <= x0 < x1 <= source_shape[1]
+        and 0 <= y0 < y1 <= source_shape[0]
+        and min(x1 - x0, y1 - y0) >= 4,
+        "高光参考区必须位于原图内，且至少为 4 × 4 源像素",
+    )
+
+
 def _canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -371,8 +382,31 @@ def _prepare(source, config, roi, document, source_key, highlight, *, checkpoint
             source, meter, roi, effective_document["metering"], identity=identity
         )
         if highlight:
-            reference_config = state.register_reference_roi(highlight["reference_roi"])
-            record = state._records[_digest(_config_document(reference_config))]
+            if highlight.get("automatic_reference"):
+                from .highlight_workflow import resolve_spatial_highlight_reference
+
+                restored = restore_zonal_metering(state.bundle.to_json(), identity)
+                highlight = resolve_spatial_highlight_reference(highlight, restored)
+            reference_roi = highlight["reference_roi"]
+            _check_highlight_reference_bounds(reference_roi, source.shape)
+            x0, y0, x1, y1 = reference_roi
+            bx0, by0, bx1, by1 = state.roi
+            reference_state = state
+            if not (
+                bx0 <= x0 < x1 <= bx1
+                and by0 <= y0 < y1 <= by1
+                and state._support[y0 - by0 : y1 - by0, x0 - bx0 : x1 - bx0].all()
+            ):
+                refmeter = deepcopy(effective_document["metering"])
+                refmeter.update(
+                    include=[], exclude=[], excluded_rois=[], padding=0,
+                    min_area_fraction=1.0, zones=[2, 2], blocks_per_zone=[2, 2],
+                )
+                reference_state = BWMaskedState(
+                    source, meter, reference_roi, refmeter, identity=identity
+                )
+            reference_config = reference_state.register_reference_roi(reference_roi)
+            record = reference_state._records[_digest(_config_document(reference_config))]
             reference = NativeSpatialCPU.__new__(NativeSpatialCPU)
             reference._initialize(
                 reference_config,
@@ -381,8 +415,8 @@ def _prepare(source, config, roi, document, source_key, highlight, *, checkpoint
                 identity,
                 record["serialized"]["metrics"],
                 "BW",
-                json.loads(state.to_json())["sha256"],
-                state.bundle.sha256,
+                json.loads(reference_state.to_json())["sha256"],
+                reference_state.bundle.sha256,
             )
         base = NativeSpatialCPU.from_bw(state, meter, render)
         bundle = state.bundle
@@ -390,26 +424,13 @@ def _prepare(source, config, roi, document, source_key, highlight, *, checkpoint
         packet, bundle = _c41_packet(source, meter, roi, effective_document, identity, checkpoint=checkpoint)
         base = NativeSpatialCPU.from_c41(packet, meter, render)
         if highlight:
-            # The base selection determines admissible reference support.
+            # Automatic references follow metering support. Explicit references
+            # measure the independently chosen region of the complete source.
             restored = restore_zonal_metering(bundle.to_json(), identity)
             from .highlight_workflow import resolve_spatial_highlight_reference
 
             highlight = resolve_spatial_highlight_reference(highlight, restored)
-            rx0, ry0, rx1, ry1 = highlight["reference_roi"]
-            x0, y0, x1, y1 = roi
-            _require(
-                x0 <= rx0 < rx1 <= x1 and y0 <= ry0 < ry1 <= y1,
-                "Spatial highlight reference must be inside the meter ROI",
-            )
-            allowed = np.ones((y1 - y0, x1 - x0), bool)
-            if restored.selection_mask is not None:
-                allowed &= restored.selection_mask.mask
-            for a, b, c, d in restored.receipt["effective_excluded_rois"]:
-                allowed[b - y0 : d - y0, a - x0 : c - x0] = False
-            _require(
-                allowed[ry0 - y0 : ry1 - y0, rx0 - x0 : rx1 - x0].all(),
-                "Spatial highlight reference intersects excluded support",
-            )
+            _check_highlight_reference_bounds(highlight["reference_roi"], source.shape)
             refdoc = deepcopy(effective_document)
             refdoc["metering"].update(
                 include=[],
@@ -419,10 +440,6 @@ def _prepare(source, config, roi, document, source_key, highlight, *, checkpoint
                 min_area_fraction=1.0,
                 zones=[2, 2],
                 blocks_per_zone=[2, 2],
-            )
-            _require(
-                min(rx1 - rx0, ry1 - ry0) >= 4,
-                "Spatial C41 reference needs at least4x4 source pixels",
             )
             refpacket, _ = _c41_packet(
                 source, meter, highlight["reference_roi"], refdoc, identity
@@ -501,10 +518,31 @@ def _load_snapshot(snapshot, source, config, roi, document, source_key, highligh
     )
     runtime = _runtime()
     # Existing frozen packets use the same metering and explicit-reference format.
-    previous_runtime = {**runtime, "spatial_workflow_v31.py":
-                        "f6888eb0012f29858d477404da5d8d28daca7dcc58e3cd686640348d62b134bd"}
+    previous_runtimes = [
+        {**runtime, "spatial_workflow_v31.py": digest}
+        for digest in (
+            "f6888eb0012f29858d477404da5d8d28daca7dcc58e3cd686640348d62b134bd",
+            "965bd641dd471f5cff599536f7e899c8b862c35bf26d4bdd5fe1aad52cd8555c",
+            "fa2cddb2e52f153c89153352640e7f9b5e9ef6a9e4653f6cdbd352de4f1892e7",
+        )
+    ]
+    # These exact packets predate the runtime compatibility fix. All other
+    # runtime components still have to match byte-for-byte.
+    previous_runtimes.extend(
+        {
+            **runtime,
+            "spatial_workflow_v31.py": spatial_hash,
+            "native_spatial_v30.py": native_hash,
+        }
+        for spatial_hash, native_hash in (
+            ("965bd641dd471f5cff599536f7e899c8b862c35bf26d4bdd5fe1aad52cd8555c", "de762007206390f2dcbd9723431f1f94df1cf9a1c7891ffd6ebd1c0d8f5615f4"),
+            ("f6888eb0012f29858d477404da5d8d28daca7dcc58e3cd686640348d62b134bd", "0dddc5b5a00b0c39fd8c160afb4e17e1a54a8990d703b92140b9fff1eb9b7362"),
+            ("fa2cddb2e52f153c89153352640e7f9b5e9ef6a9e4653f6cdbd352de4f1892e7", "0dddc5b5a00b0c39fd8c160afb4e17e1a54a8990d703b92140b9fff1eb9b7362"),
+            ("acb13c78fe25a423e49a44ee213123640638e11edd86cf4371a3aa25230a31e4", "0dddc5b5a00b0c39fd8c160afb4e17e1a54a8990d703b92140b9fff1eb9b7362"),
+        )
+    )
     _require(
-        data["runtime"] in (runtime, previous_runtime)
+        data["runtime"] in [runtime, *previous_runtimes]
         and data["source_key"] == source_key
         and data["input_config"] == _config_document(config)
         and data["roi"] == list(roi)
@@ -630,10 +668,13 @@ def encode_spatial_workflow(
         bool(records) and all(type(x.get("sha256")) is str for x in records),
         "Explicit source records required",
     )
-    base_result = base.render(readonly, base._meter, base._render)
+    # Both renderers are local to this one-shot export. Retaining their full
+    # intermediate stages cannot accelerate another render and multiplies the
+    # peak memory needed by large scans.
+    base_result = base.render(readonly, base._meter, base._render, cache_stages=False)
     image = base_result.image
     ref_image = (
-        reference.render(readonly, reference._meter, reference._render).image
+        reference.render(readonly, reference._meter, reference._render, cache_stages=False).image
         if reference
         else None
     )
@@ -650,6 +691,14 @@ def encode_spatial_workflow(
             if highlight and highlight["protection"]
             else None
         )
+        effect_document = highlight.get("effect_area") if highlight else None
+        effect_area = None
+        effect_block = None
+        effect_start = effect_end = 0
+        if effect_document and source.shape[1] * 64 > 4_194_304:
+            effect_area = build_highlight_protection(
+                source.shape, source_key, dtype="float64", **effect_document
+            )
         final_image = np.empty(source.shape, dtype=np.float32)
         for start in range(0, len(image), 64):
             part = image[start : start + 64]
@@ -658,6 +707,22 @@ def encode_spatial_workflow(
             ).image
             output = linear
             if highlight:
+                effect_mask = None
+                if effect_area is not None:
+                    effect_mask = effect_area.mask[start : start + len(part)]
+                elif effect_document:
+                    if effect_block is None or start >= effect_end:
+                        from .highlight_sample_v46 import sample_highlight_protection
+
+                        rows = max(64, (4_194_304 // source.shape[1] // 64) * 64)
+                        effect_start = start
+                        effect_end = min(source.shape[0], start + rows)
+                        effect_block = sample_highlight_protection(
+                            list(source.shape), source_key, **effect_document,
+                            rectangle=[0, effect_start, source.shape[1], effect_end],
+                            sample_step=1, dtype="float64",
+                        ).mask
+                    effect_mask = effect_block[start - effect_start : start - effect_start + len(part)]
                 ref = adapt_positive_float(
                     ref_image[start : start + 64], domain=encoded_domain, icc_bytes=icc
                 ).image
@@ -669,6 +734,7 @@ def encode_spatial_workflow(
                     protection_mask=protection.mask[start : start + len(part)]
                     if protection
                     else None,
+                    effect_mask=effect_mask,
                 )
                 high_receipt = _merge_highlight(high_receipt, observation)
             if point["values"]:

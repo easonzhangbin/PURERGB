@@ -6,6 +6,7 @@ import os
 from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
+import shutil
 import sys
 import time
 
@@ -156,6 +157,48 @@ def emit(**data):
     print(json.dumps(data, ensure_ascii=False), flush=True)
 
 
+def _legacy_flatfield_binding(manifest, processor, source, config, snapshot):
+    """Rebind a historical profile only when its complete source is proven identical."""
+    from dataclasses import replace
+
+    saved = manifest.get("raw_import_receipt")
+    actual = getattr(processor, "pure_raw_import_receipt", None)
+    calibration = manifest.get("calibration") or {}
+    if not isinstance(saved, dict) or not isinstance(actual, dict):
+        return None
+    try:
+        packet = json.loads(snapshot)
+        old_flat = saved["flatfield"]
+        new_flat = actual["flatfield"]
+        old_id, new_id = old_flat["profile_id"], new_flat["profile_id"]
+        if not (old_id and new_id and old_flat["applied"] and new_flat["applied"]
+                and old_flat["gain_token"] and old_flat["gain_token"] == new_flat["gain_token"]
+                and packet["input_config"]["profile_id"] == old_id
+                and config.flatfield.profile_id
+                and calibration.get("gain_path") and calibration.get("gain_sha256")
+                and sha256(calibration["gain_path"]) == calibration["gain_sha256"]):
+            return None
+        old_copy, new_copy = deepcopy(saved), deepcopy(actual)
+        old_copy["flatfield"].pop("profile_id")
+        new_copy["flatfield"].pop("profile_id")
+        if json.dumps(old_copy, sort_keys=True, allow_nan=False) != json.dumps(
+            new_copy, sort_keys=True, allow_nan=False
+        ):
+            return None
+        pixels = hashlib.sha256(memoryview(source).cast("B")).hexdigest()
+        packet_pixels = packet.get("source_pixels_sha256") or packet["source_identity"]["source_pixels_sha256"]
+        if not (pixels == saved["source_pixels_sha256"] == packet_pixels
+                and list(source.shape) == manifest["source_shape"] == saved["source_shape"]):
+            return None
+        token = hashlib.sha256(json.dumps(saved, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        source_key = hashlib.sha256(("".join(r["sha256"] for r in manifest["inputs"]) + token).encode()).hexdigest()
+        if source_key != packet["source_key"]:
+            return None
+        return replace(config, flatfield=replace(config.flatfield, profile_id=old_id)), source_key
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+
+
 class Session:
     def __init__(self, path, digest, state_directory):
         path = Path(path).resolve()
@@ -193,8 +236,13 @@ class Session:
             if sha256(cal["path"]) != cal["sha256"]:
                 raise ValueError("平场源文件已改变")
             self.identities[cal["path"]] = self.identity(cal["path"])
+            if cal.get("gain_path") and cal.get("gain_sha256"):
+                if sha256(cal["gain_path"]) != cal["gain_sha256"]:
+                    raise ValueError("平场增益文件已改变")
+                self.identities[cal["gain_path"]] = self.identity(cal["gain_path"])
         self.processor = self.config = self.source = self.export = None
         self.experimental, self.native_cache, self.references = {}, {}, {}
+        self._spatial_context_cache = {}
         self.headroom_cache = {}
         self.flex_research_cache = {}
         self.nikon_reference_cache = None
@@ -487,6 +535,7 @@ class Session:
             float_controls = recipe.get("native_float_controls")
             highlight_controls = recipe.get("highlight_controls")
             spatial_controls = recipe.get("native_spatial_controls")
+            spatial_config = spatial_source_key = None
             cache_documents = [document, film]
             if float_controls:
                 cache_documents.append(float_controls)
@@ -504,16 +553,31 @@ class Session:
                         != self.spatial_snapshot
                     ):
                         raise ValueError("冻结的分区空间快照发生变化")
-                    spatial_config = native_config(self.config, document)
+                    context_key = json.dumps([film, document], sort_keys=True, allow_nan=False)
+                    if context_key not in self._spatial_context_cache:
+                        with span("preview_native_context"):
+                            spatial_config, _ = native_film_context(
+                                self.config, self.source, self.manifest["roi"], recipe["density"], film
+                            )
+                            spatial_config = native_config(spatial_config, document)
+                        bound = _legacy_flatfield_binding(
+                            self.manifest, self.processor, self.source, spatial_config, self.spatial_snapshot
+                        ) if self.recipe.get("flatfield") else None
+                        if bound:
+                            spatial_config, spatial_source_key = bound
+                        else:
+                            spatial_source_key = _export_source_key(
+                                self.processor, spatial_config, self.manifest["inputs"]
+                            )
+                        self._spatial_context_cache = {context_key: (spatial_config, spatial_source_key)}
+                    spatial_config, spatial_source_key = self._spatial_context_cache[context_key]
                     validate_spatial_replay(
                         self.spatial_snapshot,
                         self.source,
                         spatial_config,
                         self.manifest["roi"],
                         spatial_controls,
-                        _export_source_key(
-                            self.processor, spatial_config, self.manifest["inputs"]
-                        ),
+                        spatial_source_key,
                         highlight_controls,
                         film=film,
                     )
@@ -521,68 +585,78 @@ class Session:
                 self.full_resolution
             )
             if key not in self.native_cache:
-                with span("preview_native_context"):
-                    config, _ = native_film_context(
-                        self.config,
-                        self.source,
-                        self.manifest["roi"],
-                        recipe["density"],
-                        film,
-                    )
-                    config = native_config(config, document)
                 if spatial_controls:
-                    from .spatial_workflow_v31 import encode_spatial_workflow
-
-                    payload, _, _, _ = encode_spatial_workflow(
-                        self.processor,
-                        self.source,
-                        config,
-                        self.manifest["inputs"],
-                        self.manifest["roi"],
-                        spatial_controls,
-                        source_key=_export_source_key(
-                            self.processor, config, self.manifest["inputs"]
-                        ),
-                        snapshot=self.spatial_snapshot,
-                        highlight=highlight_controls,
-                        point=float_controls,
-                        film=film,
-                    )
-                elif highlight_controls:
-                    payload, _ = _native_highlight_export(
-                        self.processor,
-                        config,
-                        self.manifest["inputs"],
-                        self.source,
-                        self.export,
-                        highlight_controls,
-                        float_controls,
-                    )
-                elif float_controls:
-                    payload, _ = _native_float_export(
-                        self.processor,
-                        config,
-                        self.manifest["inputs"],
-                        self.export,
-                        float_controls,
-                    )
-                elif recipe.get("density_metering"):
-                    pixels, other = self.prepare_shared_measurement()
-                    if other != icc:
-                        raise ValueError("共享密度Native中性参考ICC不一致")
-                    pixels, _ = self.source_view(pixels)
-                    self.native_cache = {key: pixels}
-                    payload = None
+                    config = spatial_config
                 else:
-                    payload, _ = native_export(
-                        self.processor, config, self.manifest["inputs"]
-                    )
-                if payload is not None:
-                    pixels, other = inspect_tiff(payload)
-                    if other != icc:
-                        raise ValueError("预览工作 ICC 与原图不一致")
-                    pixels, _ = self.source_view(pixels)
-                    self.native_cache = {key: pixels}
+                    with span("preview_native_context"):
+                        config, _ = native_film_context(
+                            self.config,
+                            self.source,
+                            self.manifest["roi"],
+                            recipe["density"],
+                            film,
+                        )
+                        config = native_config(config, document)
+                with span(
+                    "preview_native_positive",
+                    spatial=bool(spatial_controls),
+                    film=bool(film),
+                    highlight=bool(highlight_controls),
+                    shared_density=bool(recipe.get("density_metering")),
+                    full_grid=self.full_resolution,
+                    source_shape=self.manifest.get("source_shape"),
+                ):
+                    if spatial_controls:
+                        from .spatial_workflow_v31 import encode_spatial_workflow
+
+                        payload, _, _, _ = encode_spatial_workflow(
+                            self.processor,
+                            self.source,
+                            config,
+                            self.manifest["inputs"],
+                            self.manifest["roi"],
+                            spatial_controls,
+                            source_key=spatial_source_key,
+                            snapshot=self.spatial_snapshot,
+                            highlight=highlight_controls,
+                            point=float_controls,
+                            film=film,
+                        )
+                    elif highlight_controls:
+                        payload, _ = _native_highlight_export(
+                            self.processor,
+                            config,
+                            self.manifest["inputs"],
+                            self.source,
+                            self.export,
+                            highlight_controls,
+                            float_controls,
+                        )
+                    elif float_controls:
+                        payload, _ = _native_float_export(
+                            self.processor,
+                            config,
+                            self.manifest["inputs"],
+                            self.export,
+                            float_controls,
+                        )
+                    elif recipe.get("density_metering"):
+                        pixels, other = self.prepare_shared_measurement()
+                        if other != icc:
+                            raise ValueError("共享密度Native中性参考ICC不一致")
+                        pixels, _ = self.source_view(pixels)
+                        self.native_cache = {key: pixels}
+                        payload = None
+                    else:
+                        payload, _ = native_export(
+                            self.processor, config, self.manifest["inputs"]
+                        )
+                    if payload is not None:
+                        pixels, other = inspect_tiff(payload)
+                        if other != icc:
+                            raise ValueError("预览工作 ICC 与原图不一致")
+                        pixels, _ = self.source_view(pixels)
+                        self.native_cache = {key: pixels}
             pixels = self.native_cache[key]
         elif mode == "cool-shared-rgb" and recipe.get("nikon_research_controls"):
             original = self.prepare_nikon_reference()
@@ -770,6 +844,52 @@ class Session:
         return pixels, reference, icc
 
 
+def _write_preview_records(directory, token, pixels, reference, icc):
+    """Write both protocol paths, reusing the encoding for identical images."""
+    records = []
+    paths = []
+    same_image = pixels is reference or (
+        pixels.nbytes <= 16 * 1024**2
+        and pixels.shape == reference.shape
+        and pixels.dtype == reference.dtype
+        and np.array_equal(pixels[::64, ::64], reference[::64, ::64])
+        and np.array_equal(pixels, reference)
+    )
+    try:
+        for suffix, image in (("current", pixels), ("reference", reference)):
+            path = Path(directory) / f"{token}-{suffix}.tiff"
+            paths.append(path)
+            copied = False
+            if suffix == "reference" and same_image:
+                try:
+                    shutil.copyfile(records[0]["path"], path)
+                    copied = True
+                except OSError:
+                    # Preserve the independent-encoding path when copying fails.
+                    pass
+            if copied:
+                digest = records[0]["sha256"]
+            else:
+                tifffile.imwrite(
+                    path,
+                    image,
+                    photometric="rgb",
+                    metadata=None,
+                    # Screen-sized previews are short-lived. Avoid compression
+                    # latency while keeping large, full-resolution views bounded.
+                    compression=None if image.nbytes <= 16 * 1024**2 else "deflate",
+                    maxworkers=max(1, int(os.environ.get("PURE_RGB_IO_THREADS", "4"))),
+                    extratags=[(34675, 7, len(icc), icc, False)],
+                )
+                digest = sha256(path)
+            records.append({"path": str(path), "sha256": digest})
+    except BaseException:
+        for path in paths:
+            path.unlink(missing_ok=True)
+        raise
+    return records
+
+
 def main():
     global _REQUEST_STATE
     from .preview_requests_v44 import IncomingRequests, PreviewSuperseded, preview_metering_path
@@ -846,18 +966,9 @@ def main():
                 shape=list(pixels.shape),
                 resources=resources.report(),
             )
-            for suffix, image in (("current", pixels), ("reference", reference)):
-                path = Path(request["directory"]) / f"{request['token']}-{suffix}.tiff"
-                tifffile.imwrite(
-                    path,
-                    image,
-                    photometric="rgb",
-                    metadata=None,
-                    compression="deflate",
-                    maxworkers=max(1, int(os.environ.get("PURE_RGB_IO_THREADS", "4"))),
-                    extratags=[(34675, 7, len(icc), icc, False)],
-                )
-                records.append({"path": str(path), "sha256": sha256(path)})
+            records = _write_preview_records(
+                request["directory"], request["token"], pixels, reference, icc
+            )
             metering = getattr(session, "metering_receipt", None)
             desktop = request.get("metering_transport") == "sidecar"
             metering_fields = {"metering_receipt": metering}

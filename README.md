@@ -1,6 +1,6 @@
 # PURE RGB
 
-**PURE RGB 0.1.0** 是基于 [NegPy 0.68](https://github.com/marcinz606/NegPy/tree/d8123a9b2a18fdaab5941347a91e402fa936d3dc) 的 macOS 胶片数字化工作台。面向同一帧分别以红、绿、蓝光拍摄的 RAW，将三路信号配准合成，在同一测量结果上比较色彩呈现，然后输出带 ICC 的 RGB16 TIFF。
+**PURE RGB 0.1.1** 是基于 [NegPy 0.68](https://github.com/marcinz606/NegPy/tree/d8123a9b2a18fdaab5941347a91e402fa936d3dc) 的 macOS 胶片数字化工作台。面向同一帧分别以红、绿、蓝光拍摄的 RAW，将三路信号配准合成，在同一测量结果上比较色彩呈现，然后输出带 ICC 的 RGB16 TIFF。
 
 [中文操作手册](docs/OPERATING_MANUAL.zh-CN.md) · [GitHub Releases](https://github.com/easonzhangbin/PURERGB/releases) · [捐赠支持 StudioPURE](https://github.com/easonzhangbin/PURENeg/blob/main/SUPPORT.md)
 
@@ -11,7 +11,9 @@
 ## 工作台设计
 
 - 五步流程贯穿**导入归组、画幅与测量、转换调色、修整审核、导出**。中央保留正像，左右侧栏分别承载参数与照片、波形图、RGB 分量图和直方图。应用继承 macOS 的原生材质设置。
+- 窗口背景结合 SwiftUI 极薄材质与 AppKit 的桌面背景效果，无法加载时回退到 AppKit 材质。
 - **分区密度测量**在有效画面上叠加网格。点击单元可排除或恢复，单元的视觉状态会更新，密度测量按新的有效样本重新计算。输出裁切、拉直和方向随照片共用。
+- **高光找回**支持独立参考区、局部作用区和可调整的羽化半径。关闭后重新启用时保留用户设置。
 - **修整审核**由 PURE RGB 承载界面，按需调用独立安装的 [PURE Neg](https://github.com/easonzhangbin/PURENeg/releases/latest) 后端。修复确认后返回工作台，再从同一流程导出。
 
 ## 色彩引擎与输入
@@ -26,14 +28,14 @@
 
 ## 安装与启动
 
-**Apple 芯片 Mac 下载，要求 macOS 14 或更新版本**。解压 ZIP 后把 `PURE RGB.app` 拖入「应用程序」。随包交付运行环境，可直接启动。此包为临时签名，尚未通过 Apple 公证。若 macOS 在首次打开时提示无法验证，请核对发布页的 SHA-256 与来源，再参照 Apple 的说明处理。 [下载应用](https://github.com/easonzhangbin/PURERGB/releases/download/v0.1.0/PURE-RGB-0.1.0-macos-arm64.zip) · [Apple 官方说明](https://support.apple.com/en-us/102445)
+**Apple 芯片 Mac 下载，要求 macOS 14 或更新版本**。解压 ZIP 后把 `PURE RGB.app` 拖入「应用程序」。随包交付运行环境，可直接启动。此包为临时签名，尚未通过 Apple 公证。若 macOS 在首次打开时提示无法验证，请核对发布页的 SHA-256 与来源，再参照 Apple 的说明处理。 [下载应用](https://github.com/easonzhangbin/PURERGB/releases/download/v0.1.1/PURE-RGB-0.1.1-macos-arm64.zip) · [Apple 官方说明](https://support.apple.com/en-us/102445)
 
 ### 从源码运行
 
 需要 Git、[uv](https://docs.astral.sh/uv/getting-started/installation/)、稳定版 [Rust 工具链](https://rust-lang.org/tools/install/) 和 Apple 命令行开发者工具。可用 `xcode-select --install` 安装 Apple 工具。准备好这些工具后，再执行以下命令。安装脚本使用 Python 3.13 和固定依赖，首次编译可能需要数分钟。
 
 ```bash
-git clone --branch v0.1.0 https://github.com/easonzhangbin/PURERGB.git
+git clone --branch v0.1.1 https://github.com/easonzhangbin/PURERGB.git
 cd PURERGB
 python3 bootstrap.py
 ./PURE\ RGB.command
@@ -42,10 +44,10 @@ python3 bootstrap.py
 要在 Finder 里启动，可在本机完成上述安装后构建应用。该应用仍使用构建时的源码目录和虚拟环境。
 
 ```bash
-vendor/negpy/.venv/bin/python tools/build_local_test_app.py "$HOME/Applications/PURE RGB 0.1.0.app"
+vendor/negpy/.venv/bin/python tools/build_local_test_app.py "$HOME/Applications/PURE RGB 0.1.1.app"
 ```
 
-设置中的「检查更新」查询 GitHub 的最新正式发布，提供发布页入口。按照新版本的安装说明更新源码即可。捐赠入口打开 StudioPURE 已公开的支持页面。
+应用在后台检查 GitHub 的最新正式发布，发现新版时显示发布页入口；也可在设置中手动检查。下载和安装由用户自行完成。捐赠入口打开 StudioPURE 已公开的支持页面。
 
 ### 可选 Nikon 资源
 

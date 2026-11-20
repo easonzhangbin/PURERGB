@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 GITHUB_REPOSITORY = "easonzhangbin/PURERGB"
 GITHUB_URL = f"https://github.com/{GITHUB_REPOSITORY}"
 RELEASES_URL = f"{GITHUB_URL}/releases"

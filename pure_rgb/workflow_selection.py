@@ -39,7 +39,7 @@ class SelectionView(QGraphicsView):
         self.geometry_info = None
         self.source_photo_id = None
         self.drawing_enabled = True
-        self.shape_kind = "rounded_rectangle"
+        self.shape_kind = "rectangle"
         self.points = []
         self.temporary = None
         self.overlays = []
@@ -78,6 +78,14 @@ class SelectionView(QGraphicsView):
         self._set_frame(self.pixmap, self.mapping, dict(self.geometry_info), overlays, grid,
                         preserve_view=True)
         return True
+
+    def cancel_drawing(self):
+        """Discard an uncommitted stroke without changing saved overlays."""
+        self.points = []
+        self.temporary_shape = None
+        if self.temporary is not None:
+            self.scene().removeItem(self.temporary)
+            self.temporary = None
 
     def set_preview(self, image, source_shape, output_roi=None, output_orientation=None,
                     overlays=None, grid=_UNCHANGED, preserve_view=True, *, crop_locator=False):

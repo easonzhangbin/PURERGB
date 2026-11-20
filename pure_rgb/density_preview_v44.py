@@ -13,6 +13,7 @@ import math
 
 import numpy as np
 
+from .diagnostics import span
 from .immutable_source_v44 import ImmutableSourceCertificate
 
 
@@ -288,10 +289,15 @@ class DensityPreviewCache:
         session = self.session
         if self.certificate is None:
             from negpy.kernel.system.config import DEFAULT_WORKSPACE_CONFIG as default
-            from .workflow_render import _export_source_key
 
             self._progress("source_authenticate", 0.12, "正在认证完整来源并建立预览缓存…")
-            self.source_key = _export_source_key(session.processor, session.config, self.owner.records)
+            # This session already loaded and validated its source above. Calling
+            # _export_source_key here reloads the RAW when a restored flatfield
+            # has a different process-local profile ID.
+            self.source_key = hashlib.sha256(
+                ("".join(record["sha256"] for record in self.owner.records)
+                 + getattr(session.processor, "pure_raw_import_token", "")).encode()
+            ).hexdigest()
             self.certificate = ImmutableSourceCertificate.create(session.source)
             original = session.source
             session.source = self.certificate.source
@@ -398,7 +404,9 @@ class DensityPreviewCache:
         """Freeze the exact clean local reference, without rerendering/retesting base M."""
         from .metering_snapshot import restore_zonal_metering
         from .native_spatial_v30 import NativeSpatialCPU
-        from .spatial_workflow_v31 import _c41_packet, _meter_config, _render_config
+        from .spatial_workflow_v31 import (
+            _c41_packet, _check_highlight_reference_bounds, _meter_config, _render_config,
+        )
 
         runner = entry["runner"]
         runner._validate()
@@ -411,15 +419,7 @@ class DensityPreviewCache:
             restored = restore_zonal_metering(entry["bundle_text"], runner._identity)
             if restored.sha256 != runner._payload["density_bundle_sha256"]:
                 raise ValueError("Highlight reference belongs to a changed base support")
-            x0, y0, x1, y1 = restored.config["roi"]
-            a, b, c, d = roi
-            if not (x0 <= a < c <= x1 and y0 <= b < d <= y1 and min(c-a, d-b) >= 4):
-                raise ValueError("Spatial highlight reference must be at least4x4 inside the meter ROI")
-            if restored.selection_mask is not None and not restored.selection_mask.mask[b-y0:d-y0, a-x0:c-x0].all():
-                raise ValueError("Spatial highlight reference intersects excluded support")
-            if any(a < right and left < c and b < bottom and top < d
-                   for left, top, right, bottom in restored.receipt["effective_excluded_rois"]):
-                raise ValueError("Spatial highlight reference intersects excluded support")
+            _check_highlight_reference_bounds(roi, entry["source"].shape)
             document = deepcopy(entry["document"])
             document.pop("automatic_avoidance", None)
             document["metering"].update(include=[], exclude=[], excluded_rois=[], padding=0,
@@ -503,6 +503,7 @@ class DensityPreviewCache:
 
         image, icc = self._point_float(entry, entry["runner"], render_config, rectangle, step, entry["key"], exact=exact)
         ref, protection, protection_receipt = None, None, None
+        effect, effect_receipt = None, None
         if reference is not None:
             ref_config = replace(reference["runner"]._effective, exposure=render_config.exposure,
                                  lab=render_config.lab, toning=render_config.toning)
@@ -510,7 +511,7 @@ class DensityPreviewCache:
             if other != icc:
                 raise ValueError("Frozen highlight reference ICC differs from the Native base")
         if highlight and highlight["protection"]:
-            key = _key([entry["key"], highlight["protection"], rectangle, step])
+            key = _key([entry["key"], "protection", highlight["protection"], rectangle, step])
             item = self.protection_samples.get(key)
             if item is None:
                 item = sample_highlight_protection(list(entry["source"].shape), entry["key"],
@@ -520,10 +521,24 @@ class DensityPreviewCache:
                     self.protection_samples.popitem(last=False)
             self.protection_samples.move_to_end(key)
             protection, protection_receipt = item.mask, item.receipt
+        if highlight and highlight.get("effect_area"):
+            key = _key([entry["key"], "effect", highlight["effect_area"], rectangle, step])
+            item = self.protection_samples.get(key)
+            if item is None:
+                item = sample_highlight_protection(list(entry["source"].shape), entry["key"],
+                    **highlight["effect_area"], rectangle=rectangle, sample_step=step, dtype="float64")
+                self.protection_samples[key] = item
+                while len(self.protection_samples) > 3:
+                    self.protection_samples.popitem(last=False)
+            self.protection_samples.move_to_end(key)
+            effect, effect_receipt = item.mask, item.receipt
         image, receipt = compose_native_sample(image, icc=icc, reference_encoded=ref,
-                                               highlight=highlight, point=point, protection_mask=protection)
+                                               highlight=highlight, point=point,
+                                               protection_mask=protection, effect_mask=effect)
         if receipt is not None:
             receipt["protection_sampling"] = protection_receipt
+            if effect_receipt is not None:
+                receipt["effect_sampling"] = effect_receipt
         return _to_uint16_jit(image), icc, receipt
 
     def _reference(self, recipe, mode, rectangle, step, direction, fallback, icc):
@@ -594,7 +609,8 @@ class DensityPreviewCache:
         else:
             step = max(1, (max(size) + 1399) // 1400)
         phase_roi = oriented_source_sample_roi(rectangle, direction, step)
-        selected = self._entry(recipe, mode)
+        with span("preview_density_entry", mode=mode, sample_step=step):
+            selected = self._entry(recipe, mode)
         if selected is None:
             return None
         entry, render_config = selected
@@ -606,7 +622,10 @@ class DensityPreviewCache:
 
             restored = restore_zonal_metering(entry["bundle_text"], entry["runner"]._identity)
             highlight = resolve_spatial_highlight_reference(highlight, restored)
-        reference_entry = self._highlight_reference(entry, highlight) if highlight else None
+        reference_entry = None
+        if highlight:
+            with span("preview_highlight_reference", sample_step=step):
+                reference_entry = self._highlight_reference(entry, highlight)
         usm = mode == "native" and native_usm_supported(render_config)
         exact_neighborhood = viewport is not None or step == 1
         if usm and not exact_neighborhood:

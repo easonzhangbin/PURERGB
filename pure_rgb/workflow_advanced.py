@@ -346,7 +346,7 @@ def advanced_groups(recipe, engine, bw, stage):
                 _group(
                     "experimental_nikon",
                     "Nikon 实验胶片链（未标定）",
-                    "显式未标定实验：parameterized 启用 analyzer/LUT 反演研究链。采集绑定与相机-扫描器标定均未证明；cms-only 且强度0时与生产输出一致。",
+                    "参数化 analyzer/LUT 反演尚未标定，可能增加处理时间并出现负像。切换为「仅 CMS（生产同构）」可使用标准路径。",
                     _nikon_film_specs(recipe),
                 )
             )

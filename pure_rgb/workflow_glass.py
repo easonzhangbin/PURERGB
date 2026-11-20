@@ -131,6 +131,18 @@ def attach_glass(window, *, base="under", veil=None):
         effect.setMaterial_(materials.get(base, NSVisualEffectMaterialHUDWindow))
         effect.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
         effect.setState_(NSVisualEffectStateActive)
+        # SwiftUI materials blur app content. Retain the AppKit behind-window
+        # backdrop for the desktop and layer the requested SwiftUI material on it.
+        from .workflow_ultrathin import make_ultrathin_view
+
+        swiftui_view, swiftui_reason = make_ultrathin_view()
+        if swiftui_view is not None:
+            try:
+                swiftui_view.setFrame_(effect.bounds())
+                effect.addSubview_(swiftui_view)
+            except Exception as error:
+                swiftui_view = None
+                swiftui_reason = f"swiftui-material-attach-error: {error}"
         brand_veil = None
         if veil:
             brand_veil = NSView.alloc().initWithFrame_(effect.bounds())
@@ -150,6 +162,7 @@ def attach_glass(window, *, base="under", veil=None):
 
         chrome = attach_chrome(ns_window, view, container, effect)
         window._native_glass = effect
+        window._native_swiftui_material = swiftui_view
         window._native_glass_veil = brand_veil
         return dict(
             mode="native-vibrancy",
@@ -159,6 +172,8 @@ def attach_glass(window, *, base="under", veil=None):
             accent_theme="orange-red" if veil else "system",
             subtle_native_gradient=bool(veil),
             base_material=base,
+            swiftui_material="ultraThinMaterial" if swiftui_view is not None else None,
+            swiftui_reason=swiftui_reason,
             veil_alpha=veil,
             chrome=chrome,
         )
@@ -274,6 +289,7 @@ def detach_glass(window):
     if effect is not None:
         effect.removeFromSuperview()
         window._native_glass = None
+        window._native_swiftui_material = None
         window._native_glass_veil = None
 
 

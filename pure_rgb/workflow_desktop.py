@@ -73,7 +73,7 @@ from .workflow_ui_model import (  # noqa: E402
     nikon_controls,
     shape_bounds,
     spatial_document,
-    align_highlight_reference,
+    fit_manual_highlight_reference,
 )
 from .workspace import source_recipe_identity, write_json  # noqa: E402
 from .workflow_advanced import advanced_groups  # noqa: E402
@@ -475,7 +475,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         set_debug_logging(self.performance["debug_logging"])
         if hasattr(self, "idle_scheduler"):
             self.idle_scheduler.set_enabled(self.performance["idle_previews"])
-        policy = resolve_performance(self.performance)
+        policy = resolve_performance(self.performance, include_backend=False)
         if hasattr(self, "display_cache"):
             self.display_cache.set_budget(min(512 * 1024**2, policy["preview_cache_budget_bytes"] // 4))
             self.display_cache.set_workers(policy["display_threads"])
@@ -506,7 +506,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
 
         rss = memory().get("rss_bytes") or 0
         worker_rss = process_rss_bytes(int(self.live.process.processId())) if self.live.process else 0
-        policy = resolve_performance(self.performance)
+        policy = resolve_performance(self.performance, include_backend=False)
         self.settings_panel.set_runtime_status(
             f"CPU · {policy['cpu_threads']} 线程\n"
             f"界面内存 {rss / 1024**2:.0f} MB · 预览进程 {(worker_rss or 0) / 1024**2:.0f} MB\n"
@@ -561,7 +561,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         from .workflow_display_cache import DisplayImageCache
         from .workflow_idle import IdlePreviewScheduler
 
-        policy = resolve_performance(self.performance)
+        policy = resolve_performance(self.performance, include_backend=False)
         self.display_cache = DisplayImageCache(
             budget_bytes=min(512 * 1024**2, policy["preview_cache_budget_bytes"] // 4),
             workers=policy["display_threads"],
@@ -640,6 +640,11 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                     record, target, proof=proof,
                     source_step=saved_display_source_step(record) or 1,
                 )
+            if hasattr(self.project.workspace, "root"):
+                from .decode_prewarm import prewarm
+
+                manifest = self.project.workspace.root / "runs" / item[0] / "manifest.json"
+                prewarm(manifest, lambda: generation in self.idle_cancelled or self.closing)
             return None
 
         work = Work(generation, read)
@@ -945,6 +950,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         right.addWidget(self.photo_list, 1)
         self.batch_note = text("未勾选时处理当前照片", True)
         right.addWidget(self.batch_note)
+        from .workflow_update_notice import UpdateNotice
+
+        self.update_notice = UpdateNotice(photos)
+        right.addWidget(self.update_notice)
         self.status = text("请选择素材开始导入。", True)
         self.status.setAccessibleName("任务状态")
         self.status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
@@ -1081,7 +1090,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             ("polygon", "手绘套索"),
         ):
             self.shape_choice.addItem(name, value)
-        self.shape_choice.setCurrentIndex(1)
+        self.shape_choice.setCurrentIndex(0)
         self.shape_choice.currentIndexChanged.connect(self.selection_shape_changed)
         body.addWidget(self.shape_choice)
         body.addWidget(
@@ -1207,6 +1216,19 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         high.addWidget(
             button("绘制高光参考区", lambda: self.begin_selection("highlight"))
         )
+        self.highlight_effect_draw = button(
+            "添加高光作用区", lambda: self.begin_selection("highlight_effect")
+        )
+        high.addWidget(self.highlight_effect_draw)
+        self.highlight_effect_clear = button("恢复高光全图作用", self.clear_highlight_effect)
+        high.addWidget(self.highlight_effect_clear)
+        self.highlight_effect_feather = self.spin(
+            high, "作用区羽化半径（源像素）", 0, 512, 1, 64,
+            self.highlight_effect_feather_changed,
+        )
+        self.highlight_effect_feather.setToolTip(
+            "羽化从作用区边界向外渐变；0 为硬边，单位为原始源像素。"
+        )
         high.addWidget(
             button(
                 "绘制人物／中间调保护",
@@ -1217,6 +1239,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             "默认参考当前测量区域，可另选局部；保护区由人工绘制。", True
         )
         high.addWidget(self.highlight_note)
+        self.highlight_effect_note = text(
+            "默认作用于全图。可添加作用区并调整羽化；保护区内减弱高光找回。", True
+        )
+        high.addWidget(self.highlight_effect_note)
         layout.addWidget(self.high_box)
         self.engine_note = text("", True)
         layout.addWidget(self.engine_note)
@@ -1675,15 +1701,29 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 high["controls"]["strength"] * 100 if high else 50
             )
             self.highlight_strength.setEnabled(bool(high))
+            effect_area = (high or {}).get("effect_area")
+            self.highlight_effect_feather.setValue(
+                effect_area.get("feather_pixels", 64) if effect_area else 64
+            )
+            self.highlight_effect_feather.setEnabled(bool(effect_area) and ready and not busy)
+            self.highlight_effect_clear.setEnabled(bool(effect_area) and ready and not busy)
+            self.highlight_effect_draw.setEnabled(ready and not busy)
+            self.highlight_effect_note.setText(
+                f"已添加 {len(effect_area['include'])} 个作用区。橙色为作用区，青色为参考区，绿色为保护区。"
+                if effect_area else
+                "高光找回作用于全图。添加作用区后可调整羽化；保护区内减弱高光找回。"
+            )
             self.highlight_note.setText(
-                "已在有效测量支持内选择独立参考，可另选局部。"
+                ("正在使用手动高光参考。青色框为参考，绿色框为保护。"
+                 if photo.get("highlight_reference_origin") == "manual" else
+                 "正在使用自动高光参考。可在源画面内另选局部。")
                 if high
                 else "默认关闭；启用后建立独立参考，人物保护由人工绘制。"
             )
-            if photo.get("highlight_reference_aligned"):
+            if high and photo.get("highlight_reference_aligned"):
                 self.highlight_note.setText(
                     self.highlight_note.text()
-                    + "\n手工参考边缘已向内对齐原生分析网格。"
+                    + "\n手工框已按原生分析网格收边。"
                 )
             flex_note = (
                 "本机资源配方 · 采用已核对的 FlexColor 研究配置。"
@@ -2361,8 +2401,16 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.sync_controls()
             self.status_message("请先修正左侧高级参数组合。")
             return
+        photo = self.project.photo()
+        highlight_keys = (
+            "suspended_highlight_controls", "highlight_reference_origin",
+            "highlight_reference_drawn_roi", "highlight_reference_aligned",
+        )
+        previous_highlight_state = {
+            key: deepcopy(photo[key]) for key in highlight_keys if key in photo
+        }
+        committed = False
         try:
-            photo = self.project.photo()
             recipe = self.project.recipe()
             engine, bw = photo["engine"], photo["source_mode"] == "bw"
             recipe["exposure_ev"] = desired["exposure"]
@@ -2378,15 +2426,27 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                     roi = recipe.get("roi") or photo["analysis_roi"]
                     if roi is None:
                         raise ValueError("请先完成源准备，再启用高光找回")
-                    high = recipe.setdefault(
-                        "highlight_controls",
-                        dict(version=1, reference_roi=list(roi), controls={}),
-                    )
-                    if "highlight_controls" not in self.project.recipe():
-                        photo["highlight_reference_origin"] = "automatic"
+                    high = recipe.get("highlight_controls")
+                    if high is None:
+                        high = photo.pop("suspended_highlight_controls", None)
+                        if high is None:
+                            high = dict(version=1, reference_roi=list(roi), controls={})
+                            photo["highlight_reference_origin"] = "automatic"
+                            photo.pop("highlight_reference_drawn_roi", None)
+                            photo.pop("highlight_reference_aligned", None)
+                        else:
+                            high = deepcopy(high)
+                            desired["highlight_strength"] = high["controls"]["strength"] * 100
+                        recipe["highlight_controls"] = high
+                    elif desired["highlight_strength"] == 0:
+                        # A zero-strength recipe canonicalizes to disabled; keep
+                        # the last active settings and source-coordinate masks.
+                        photo["suspended_highlight_controls"] = deepcopy(high)
                     high["controls"]["strength"] = desired["highlight_strength"] / 100
                 else:
-                    recipe.pop("highlight_controls", None)
+                    high = recipe.pop("highlight_controls", None)
+                    if high is not None:
+                        photo["suspended_highlight_controls"] = deepcopy(high)
             if not bw:
                 mode = RESULT_MODES[engine]
                 values = deepcopy(
@@ -2408,11 +2468,56 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.live.invalidate(self.token)
             self.set_preview_updating(False)
             self.project.set_recipe(recipe)
+            committed = True
             if engine == "native":
                 self.project.prepare_highlight_reference()
             self.sync_controls()
             self.mark_preview_pending()
             self.preview_timer.start()
+        except Exception as error:
+            if not committed:
+                for key in highlight_keys:
+                    photo.pop(key, None)
+                photo.update(previous_highlight_state)
+            self.error(error)
+            self.sync_controls()
+
+    def highlight_effect_feather_changed(self, value):
+        if self.loading or self.tasks.busy or not self.current_photo():
+            return
+        if not self.flush_advanced():
+            self.sync_controls()
+            return
+        try:
+            recipe = self.project.recipe()
+            effect_area = recipe.get("highlight_controls", {}).get("effect_area")
+            if effect_area is None:
+                return
+            effect_area["feather_pixels"] = value
+            self.project.set_recipe(recipe, label="调整高光作用区羽化")
+            self.sync_controls()
+            self.schedule_preview()
+        except Exception as error:
+            self.error(error)
+            self.sync_controls()
+
+    def clear_highlight_effect(self):
+        if self.loading or self.tasks.busy or not self.current_photo():
+            return
+        if not self.flush_advanced():
+            self.sync_controls()
+            return
+        try:
+            recipe = self.project.recipe()
+            high = recipe.get("highlight_controls")
+            if not high or not high.get("effect_area"):
+                return
+            high.pop("effect_area")
+            self.project.set_recipe(recipe, label="恢复高光全图作用")
+            self.sync_controls()
+            self.refresh_selection_preview()
+            self.schedule_preview()
+            self.status_message("高光找回已恢复全图作用。")
         except Exception as error:
             self.error(error)
             self.sync_controls()
@@ -2651,13 +2756,14 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.select_meter_zone()
         elif role == "crop" and recipe.get("output_roi"):
             overlays.append((dict(type="rectangle", bounds=recipe["output_roi"]), "#f0a055"))
-        elif role in ("highlight", "highlight_protect") and recipe.get("highlight_controls"):
-            high = recipe["highlight_controls"]
-            reference_roi = high["reference_roi"]
+        elif role in ("highlight", "highlight_effect", "highlight_protect"):
+            high = recipe.get("highlight_controls", {})
+            reference_roi = high.get("reference_roi")
             if high.get("automatic_reference"):
                 reference_roi = self.project.metering_receipt().get("highlight_reference_roi")
             if reference_roi:
                 overlays.append((dict(type="rectangle", bounds=reference_roi), "#62ccdf"))
+            overlays.extend((shape, "#f0a055") for shape in (high.get("effect_area") or {}).get("include", []))
             overlays.extend((shape, "#a3d7b9") for shape in (high.get("protection") or {}).get("include", []))
         if role not in ("include", "exclude", "protect", "inspect", "meter_grid"):
             self.selection.set_hover_model(None)
@@ -2677,7 +2783,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             return refresh_crop_frame(self)
         if self.selection.crop_handles.bounds is not None:
             self.selection.crop_handles.configure(None, 0)
-        if (self.geometry_role == "meter_grid" and self.selection.source_photo_id == photo["id"]
+        if (self.geometry_role in ("meter_grid", "highlight", "highlight_effect", "highlight_protect")
+                and self.selection.source_photo_id == photo["id"]
                 and self.selection.geometry_info
                 and not self.selection.geometry_info.get("preview_kind")):
             overlays, grid = self.selection_overlays()
@@ -2694,6 +2801,11 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             # Its existing full-source positioning view remains authoritative.
             return False
         shown_rectangle = output_rectangle(shown_recipe, photo["analysis_roi"], photo["source_shape"])
+        if (self.geometry_role in ("highlight", "highlight_effect", "highlight_protect")
+                and shown_rectangle != [0, 0, photo["source_shape"][1], photo["source_shape"][0]]):
+            # A cropped preview hides source pixels. Use the complete positive
+            # locator so a reference remains selectable outside the crop.
+            return False
         if self.geometry_role == "meter_grid":
             a, b, c, d = self.project.recipe()["roi"] or photo["analysis_roi"]
             desired_rectangle = output_rectangle(
@@ -2725,6 +2837,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             photo = self.project.photo()
             if not photo["initial_job"] or self.tasks.busy:
                 raise ValueError("请先完成源准备，并等待当前处理结束")
+            if role != self.geometry_role:
+                self.selection.cancel_drawing()
             if role == "crop":
                 from .workflow_crop_preview import begin_crop_selection
 
@@ -2736,6 +2850,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.show_region_exit()
                 self.status_message("格内为 RGB 平均光密度；悬停查看 RGB 分量、范围及有效样本。"
                                     if role == "meter_grid" else
+                                    "框选高光作用区。橙色为作用区，青色为参考区，绿色为保护区。"
+                                    if role == "highlight_effect" else
+                                    "在画面上绘制高光参考。青色为参考区，绿色为保护区。"
+                                    if role == "highlight" else
                                     "在当前正像上绘制；选区和异常策略自动更新预览，可连续绘制。")
                 return
             self.geometry_role = previous_role
@@ -2785,6 +2903,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.status_message(
                 "完整源分区网格；点击选择分区，悬停查看 RGB 光密度。"
                 if role == "meter_grid" else
+                "在完整源画面框选高光作用区。橙色为作用区，青色为参考区，绿色为保护区。"
+                if role == "highlight_effect" else
+                "在完整源画面绘制高光参考。青色为参考区，绿色为保护区。"
+                if role == "highlight" else
                 "使用完整源画幅正像定位；选区仍自动生效。"
             )
         except Exception as error:
@@ -2823,6 +2945,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.__dict__.pop("_import_roi_context", None)
         self.geometry_role = None
         if hasattr(self, "canvas_stack"):
+            self.selection.cancel_drawing()
             self.selection.crop_handles.configure(None, 0)
             if self._straighten_panel is not None:
                 self._exit_straighten_draw(message=None)
@@ -2849,6 +2972,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         if not self.flush_advanced():
             self.status_message("请先修正左侧高级参数组合。")
             return
+        photo = None
+        previous_highlight_state = None
+        committed = False
         try:
             role = self.geometry_role
             bounds = shape_bounds(shape)
@@ -2858,6 +2984,13 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 accept_import_roi(self, bounds)
                 return
             photo = self.project.photo()
+            if role in ("highlight", "highlight_effect", "highlight_protect"):
+                previous_highlight_state = {
+                    key: deepcopy(photo[key]) for key in (
+                        "suspended_highlight_controls", "highlight_reference_origin",
+                        "highlight_reference_drawn_roi", "highlight_reference_aligned",
+                    ) if key in photo
+                }
             if role in ("include", "exclude", "protect"):
                 recipe = self.meter_recipe()
                 meter = recipe["native_spatial_controls"]["metering"]
@@ -2879,23 +3012,34 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 if role == "crop":
                     recipe.update(crop=True, output_roi=bounds)
                 else:
-                    high = recipe.setdefault(
-                        "highlight_controls",
-                        dict(
-                            version=1,
-                            reference_roi=recipe.get("roi") or photo["analysis_roi"],
-                            controls=dict(
-                                strength=self.highlight_strength.value() / 100
-                            ),
-                        ),
-                    )
+                    high = recipe.get("highlight_controls")
+                    if high is None:
+                        high = photo.pop("suspended_highlight_controls", None)
+                        if high is None:
+                            high = dict(
+                                version=1,
+                                reference_roi=recipe.get("roi") or photo["analysis_roi"],
+                                controls=dict(strength=self.highlight_strength.value() / 100),
+                            )
+                            photo["highlight_reference_origin"] = "automatic"
+                            photo.pop("highlight_reference_drawn_roi", None)
+                            photo.pop("highlight_reference_aligned", None)
+                        else:
+                            high = deepcopy(high)
+                        recipe["highlight_controls"] = high
                     if role == "highlight":
-                        aligned = align_highlight_reference(recipe, bounds)
+                        aligned = fit_manual_highlight_reference(
+                            recipe, photo["source_shape"], bounds, self.project.metering_receipt()
+                        )
                         high.pop("automatic_reference", None)
                         high["reference_roi"] = aligned
                         photo["highlight_reference_origin"] = "manual"
                         photo["highlight_reference_drawn_roi"] = bounds
                         photo["highlight_reference_aligned"] = aligned != bounds
+                    elif role == "highlight_effect":
+                        if high.get("effect_area") is None:
+                            high["effect_area"] = dict(include=[], feather_pixels=64)
+                        high["effect_area"]["include"].append(shape)
                     else:
                         if high.get("protection") is None:
                             high["protection"] = dict(include=[], feather_pixels=0)
@@ -2903,8 +3047,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.project.set_recipe(recipe, label={
                 "crop": "调整裁切范围", "include": "调整密度选区", "exclude": "添加测量避让",
                 "protect": "添加保护区", "highlight": "调整高光参考区",
-                "highlight_protect": "添加高光保护区",
+                "highlight_effect": "添加高光作用区", "highlight_protect": "添加高光保护区",
             }[role])
+            committed = True
             self.sync_controls()
             if (
                 role == "highlight"
@@ -2929,8 +3074,20 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.refresh_selection_preview()
             self.schedule_preview()
             self.region_done.remind()
-            self.status_message("选区已生效，正在更新正像；可继续绘制，无需确认。")
+            self.status_message(
+                "高光参考已按分析网格收边，正在更新预览。"
+                if role == "highlight" and aligned != bounds else
+                "选区已生效，正在更新正像；可继续绘制，无需确认。"
+            )
         except Exception as error:
+            if previous_highlight_state is not None and not committed:
+                for key in (
+                    "suspended_highlight_controls", "highlight_reference_origin",
+                    "highlight_reference_drawn_roi", "highlight_reference_aligned",
+                ):
+                    photo.pop(key, None)
+                photo.update(previous_highlight_state)
+                self.selection.cancel_drawing()
             self.error(error)
 
     def clear_exclusions(self):
@@ -3923,6 +4080,7 @@ def main():
         window.set_stage(args.stage)
     write_json(preferences, dict(workspace=str(project)))
     window.showMaximized()
+    window.update_notice.schedule()
     if args.settings:
         window.open_settings()
         window.settings_panel.tabs.setCurrentIndex(

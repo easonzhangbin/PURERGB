@@ -3,6 +3,7 @@
 import argparse
 import platform
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,51 @@ FLAT = Path("assets/branding/deliveries/2026-11-17-flat")
 SPLASH = Path("assets/branding/deliveries/2026-11-13-png-final/Asset-1@2x.png")
 MANUAL = Path("docs/OPERATING_MANUAL.zh-CN.md")
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store", "* 2.*")
+_IGNORE_PACKAGES = shutil.ignore_patterns(
+    "__pycache__", "*.pyc", ".DS_Store", "*.pth", "_virtualenv*", "__editable__*",
+    "PyInstaller", "pyinstaller*", "_pyinstaller*", "pytest*", "_pytest", "coverage*",
+    "ruff*", "ty", "ty-*.dist-info",
+)
+
+
+def ignore_packages(directory, names):
+    """Omit local origin metadata and Finder-created duplicate copies."""
+    ignored = set(_IGNORE_PACKAGES(directory, names))
+    for name in names:
+        if re.fullmatch(r"direct_url(?: \d+)?\.json", name):
+            ignored.add(name)
+            continue
+        original = re.sub(r" 2(?=\.|$)", "", name)
+        if original != name and original in names:
+            ignored.add(name)
+    return ignored
+
+
+def sanitize_sboms(packages, public_source):
+    """Remove local editable-build file URIs from the NegPy core SBOM."""
+    for sbom in packages.glob("negpy_core-*.dist-info/sboms/*.json"):
+        contents = sbom.read_text()
+        contents = re.sub(r"file://[^\s\"\\#]+", public_source, contents)
+        sbom.write_text(contents)
+
+
+def relocate_sysconfig(runtime, version, python_base):
+    """Resolve Python build-prefix metadata against the bundled runtime."""
+    token = "/__pure_rgb_bundled_python__"
+    for data in (runtime / "lib" / f"python{version}").glob("_sysconfigdata*.py"):
+        contents = data.read_text()
+        if str(python_base) not in contents:
+            continue
+        contents = contents.replace(str(python_base), token)
+        contents += (
+            "\n# Replace the original build prefix with the actual bundled runtime.\n"
+            "import sys as _pure_rgb_sys\n"
+            "for _pure_rgb_key, _pure_rgb_value in build_time_vars.items():\n"
+            "    if isinstance(_pure_rgb_value, str):\n"
+            f"        build_time_vars[_pure_rgb_key] = _pure_rgb_value.replace({token!r}, _pure_rgb_sys.base_prefix)\n"
+            "del _pure_rgb_sys, _pure_rgb_key, _pure_rgb_value\n"
+        )
+        data.write_text(contents)
 
 
 def bundle_vendors(source, scratch):
@@ -86,17 +132,12 @@ def build(output, *, portable=False):
                         copy_function=shutil.copyfile)
         shutil.copyfile(python_base / library_name, runtime / library_name)
         if portable:
+            relocate_sysconfig(runtime, version, python_base)
             bundle_vendors(source, Path(scratch))
-            shutil.copytree(dependency_path, resources / "Packages", symlinks=True, ignore=shutil.ignore_patterns(
-                "__pycache__", "*.pyc", ".DS_Store", "*.pth", "_virtualenv*", "__editable__*",
-                "direct_url.json", "PyInstaller", "pyinstaller*", "_pyinstaller*", "pytest*",
-                "_pytest", "coverage*", "ruff*", "ty", "ty-*.dist-info",
-            ))
+            shutil.copytree(dependency_path, resources / "Packages", symlinks=True, ignore=ignore_packages)
             negpy_pin = runpy.run_path(str(ROOT / "bootstrap.py"))["SOURCES"][0][2]
-            build_source = (Path(sys.prefix).parent / "negpy_core").as_uri()
             public_source = f"https://github.com/marcinz606/NegPy/tree/{negpy_pin}/negpy_core"
-            for sbom in (resources / "Packages").glob("negpy_core-*.dist-info/sboms/*.json"):
-                sbom.write_text(sbom.read_text().replace(build_source, public_source))
+            sanitize_sboms(resources / "Packages", public_source)
             copy_file(Path("LICENSE"), source)
         with (contents / "Info.plist").open("wb") as stream:
             plistlib.dump({
@@ -120,6 +161,14 @@ def build(output, *, portable=False):
             *(["-mmacosx-version-min=14.0"] if portable else []),
             "-framework", "Cocoa", "-o", str(executable), str(ROOT / "tools/local_test_app_launcher.m"),
         ], check=True)
+        material_library = source / "pure_rgb/libPUREUltraThinMaterial.dylib"
+        subprocess.run([
+            "/usr/bin/xcrun", "swiftc", "-emit-library", "-O",
+            "-target", "arm64-apple-macosx14.0", "-module-name", "PUREUltraThinMaterial",
+            "-Xlinker", "-install_name", "-Xlinker", "@rpath/libPUREUltraThinMaterial.dylib",
+            str(ROOT / "pure_rgb/UltraThinMaterial.swift"), "-o", str(material_library),
+        ], check=True)
+        subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(material_library)], check=True)
         # Finder metadata from locally copied directories prevents signing.
         subprocess.run(["/usr/bin/xattr", "-cr", str(bundle)], check=True)
         subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(bundle)], check=True)

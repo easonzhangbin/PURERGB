@@ -117,7 +117,7 @@ def sample_highlight_protection(source_shape, source_key, *, include,
 
 
 def compose_native_sample(encoded, *, icc, reference_encoded=None, highlight=None,
-                          point=None, protection_mask=None):
+                          point=None, protection_mask=None, effect_mask=None):
     """Apply the unchanged full-save float ordering before the one quantizer."""
     from negpy.kernel.image.logic import working_oetf_encode
     from .native_float import checked_native_float
@@ -131,12 +131,14 @@ def compose_native_sample(encoded, *, icc, reference_encoded=None, highlight=Non
     linear = adapt_positive_float(encoded, domain=encoded_domain, icc_bytes=icc).image
     output, high_receipt = linear, None
     if highlight:
-        if reference_encoded is None or bool(highlight["protection"]) != (protection_mask is not None):
+        if (reference_encoded is None
+                or bool(highlight["protection"]) != (protection_mask is not None)
+                or bool(highlight.get("effect_area")) != (effect_mask is not None)):
             raise ValueError("Highlight sample requires its real reference and declared source protection")
         reference = adapt_positive_float(reference_encoded, domain=encoded_domain, icc_bytes=icc).image
         output, high_receipt = apply_highlight_reference_guarded(
             linear, reference, highlight["controls"], domain=linear_domain,
-            protection_mask=protection_mask)
+            protection_mask=protection_mask, effect_mask=effect_mask)
     if point["values"]:
         output = apply_positive_float(output, point, domain=linear_domain, icc_bytes=icc).image
     result = working_oetf_encode(np.clip(output, 0, 1))

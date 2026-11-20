@@ -78,6 +78,12 @@ def verified_pixels(record):
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
     if digest != record["sha256"]:
         raise ValueError("样片 TIFF 已变化，哈希核验失败")
+    return _checked_pixels(path)
+
+
+def _checked_pixels(path):
+    from .diagnostics import span
+
     with span("verify_tiff_decode"):
         pixels, icc = read_rgb(path)
     if pixels.dtype != np.uint16 or pixels.ndim != 3 or pixels.shape[2] != 3:
@@ -122,7 +128,6 @@ def copy_verified_tiff(record, destination):
     partially written final filename. No rendering or color conversion occurs.
     """
     source, destination = Path(record["path"]), Path(destination)
-    verified_pixels(record)
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(destination))
     temporary = destination.with_name(f".pure-rgb-export-{uuid.uuid4().hex}.part")
@@ -135,9 +140,12 @@ def copy_verified_tiff(record, destination):
                 digest.update(chunk)
                 dst.write(chunk)
             if digest.hexdigest() != record["sha256"]:
-                raise ValueError("导出期间源文件发生变化")
+                raise ValueError("样片 TIFF 哈希核验失败或导出期间源文件发生变化")
             dst.flush()
             os.fsync(dst.fileno())
+        # Validate the copied bytes before making the final filename visible.
+        # Hashing while copying avoids a separate full pass over the source.
+        _checked_pixels(temporary)
         _publish_exclusive(temporary, destination)
     finally:
         if created:

@@ -20,6 +20,7 @@ GROUPS = {
     "details": ("色度、锐化、降噪与暗角", True),
     "paper": ("印相相纸与胶片配置", True),
     "engine": ("当前引擎专用调整", True),
+    "highlight": ("高光找回参数（保留目标选区）", False),
     "orientation": ("输出旋转与翻转", False),
     "crop": ("输出裁切（按画幅比例）", False),
     "geometry": ("拉直、透视与后期几何", False),
@@ -32,6 +33,7 @@ def copy_adjustments(project, photo):
         photo_id=photo["id"], name=Path(photo["base"]["raw"][0]).stem,
         source_mode=photo["source_mode"], engine=engine,
         shape=deepcopy(photo.get("source_shape")), recipe=project.recipe(photo, engine),
+        suspended_highlight_controls=deepcopy(photo.get("suspended_highlight_controls")),
     )
 
 
@@ -46,6 +48,13 @@ def available_groups(source, photo, engine):
         result.update(("tone", "details"))
     if same_native:
         result.add("paper")
+        target = photo["drafts"][engine]
+        origin_high = (source["recipe"].get("highlight_controls")
+                       or source.get("suspended_highlight_controls"))
+        if (not origin_high or target.get("highlight_controls")
+                or photo.get("suspended_highlight_controls")
+                or target.get("roi") or photo.get("analysis_roi")):
+            result.add("highlight")
     if same_mode and source["engine"] == engine:
         origin = source["recipe"]
         target = photo["drafts"][engine]
@@ -128,6 +137,8 @@ def merged_adjustments(source, photo, engine, target, groups):
         post_categories.add("后期 · 几何")
     if "engine" in groups:
         _copy_engine_adjustments(result, recipe, engine, target_mode)
+    if "highlight" in groups:
+        _copy_highlight_adjustments(result, source, photo)
     if "crop" in groups:
         _fields(result, recipe, ("crop",))
         result.pop("output_roi", None)
@@ -170,6 +181,31 @@ def merged_adjustments(source, photo, engine, target, groups):
                 _fields(target_values, {"lab." + key: value for key, value in source_lab.items()},
                         ("lab." + key for key in LAB_FIELDS))
     return result
+
+
+def _copy_highlight_adjustments(target, source, photo):
+    """Copy controls while retaining the target photo's source-coordinate shapes."""
+    source_high = source["recipe"].get("highlight_controls")
+    source_settings = source_high or source.get("suspended_highlight_controls")
+    target_high = deepcopy(target.get("highlight_controls")
+                           or photo.get("suspended_highlight_controls"))
+    if target_high is None and source_settings is not None:
+        roi = target.get("roi") or photo.get("analysis_roi")
+        if roi is None:
+            raise ValueError("目标照片尚无可用的高光参考区域")
+        target_high = dict(version=1, reference_roi=deepcopy(roi), controls={})
+        photo["highlight_reference_origin"] = "automatic"
+        photo.pop("highlight_reference_drawn_roi", None)
+        photo.pop("highlight_reference_aligned", None)
+    if target_high is not None and source_settings is not None:
+        target_high["controls"] = deepcopy(source_settings["controls"])
+    if source_high is not None:
+        target["highlight_controls"] = target_high
+        photo.pop("suspended_highlight_controls", None)
+    else:
+        target.pop("highlight_controls", None)
+        if target_high is not None:
+            photo["suspended_highlight_controls"] = target_high
 
 
 def _copy_engine_adjustments(target, source, engine, mode):
@@ -215,7 +251,7 @@ class PasteAdjustmentsDialog(QDialog):
             control.setChecked(default)
             layout.addWidget(control)
             self.options[key] = control
-        note = QLabel("仅替换所选调整。跨引擎只应用兼容参数。密度选区、平场和除尘笔画按各照片保留。")
+        note = QLabel("仅替换所选调整。跨引擎只应用兼容参数。密度选区、高光参考区、作用区、保护区、平场和除尘笔画按各照片保留。")
         note.setObjectName("muted")
         note.setWordWrap(True)
         layout.addWidget(note)

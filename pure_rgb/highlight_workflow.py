@@ -123,7 +123,7 @@ def checked_highlight_workflow(document=None):
         return _neutral_document()
     _require(
         isinstance(document, dict)
-        and not set(document) - {"version", "reference_roi", "controls", "protection", "automatic_reference"},
+        and not set(document) - {"version", "reference_roi", "controls", "protection", "effect_area", "automatic_reference"},
         "Unexpected highlight workflow fields",
     )
     version = document.get("version", 1)
@@ -135,6 +135,7 @@ def checked_highlight_workflow(document=None):
     if region is not None:
         region = _roi(region)
     protection = _protection(document.get("protection"))
+    effect_area = _protection(document.get("effect_area"))
     automatic = document.get("automatic_reference", False)
     _require(type(automatic) is bool, "automatic_reference must be boolean")
     if (
@@ -153,6 +154,7 @@ def checked_highlight_workflow(document=None):
         **({"automatic_reference": True} if automatic else {}),
         "controls": controls,
         "protection": protection,
+        **({"effect_area": effect_area} if effect_area is not None else {}),
     }
 
 
@@ -368,6 +370,13 @@ def _merge_highlight(current, incoming):
             current[key]["maximum"] = max(
                 current[key]["maximum"], incoming[key]["maximum"]
             )
+    if "effect_mask_range" in current:
+        current["effect_mask_range"]["minimum"] = min(
+            current["effect_mask_range"]["minimum"], incoming["effect_mask_range"]["minimum"]
+        )
+        current["effect_mask_range"]["maximum"] = max(
+            current["effect_mask_range"]["maximum"], incoming["effect_mask_range"]["maximum"]
+        )
     for key in ("affected_pixel_count", "fully_protected_pixel_count"):
         current[key] = current.get(key, 0) + incoming.get(key, 0)
     count = old_count + incoming["pixel_count"]
@@ -447,6 +456,14 @@ def render_highlight_workflow(
         else None
     )
     protection_layout = _layout(protection.mask) if protection else None
+    effect_area = (
+        build_highlight_protection(
+            source.shape, source_key, dtype="float64", **recipe["effect_area"]
+        )
+        if recipe.get("effect_area")
+        else None
+    )
+    effect_layout = _layout(effect_area.mask) if effect_area else None
     x0, y0, x1, y1 = region
     # Exact ROI crop avoids float normalized-edge round-trip changes in the
     # density calculation. The returned window is restored to source coords;
@@ -549,6 +566,7 @@ def render_highlight_workflow(
             recipe["controls"],
             domain=linear_domain,
             protection_mask=mask,
+            effect_mask=effect_area.mask[start : start + len(base_part)] if effect_area else None,
         )
         high_receipt = _merge_highlight(high_receipt, observation)
         base_linear_sha.update(memoryview(base_linear).cast("B"))
@@ -591,6 +609,11 @@ def render_highlight_workflow(
             protection_layout,
             protection.receipt["mask_pixels_sha256"],
             "Highlight protection",
+        )
+    if effect_area:
+        _unchanged(
+            effect_area.mask, effect_layout, effect_area.receipt["mask_pixels_sha256"],
+            "Highlight effect area",
         )
     encoded_sha = _pixels(encoded)
     payload, status = processor.encode_export(
@@ -646,6 +669,7 @@ def render_highlight_workflow(
         "highlight_processing": high_receipt,
         "native_float_processing": point_receipt,
         "protection": protection.receipt if protection else None,
+        **({"effect_area": effect_area.receipt} if effect_area else {}),
         "final_encoding_boundary": {
             "linear_clip_bounds": [0, 1],
             "lower_truncated_count_rgb": lower.tolist(),

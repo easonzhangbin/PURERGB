@@ -127,13 +127,15 @@ def _budget(y, start, tau, minimum_slope):
 
 
 def apply_highlight_reference_guarded(
-    base_linear, reference_linear, document=None, *, domain, protection_mask=None
+    base_linear, reference_linear, document=None, *, domain, protection_mask=None,
+    effect_mask=None,
 ):
     """Return (working-linear RGB, receipt), with RGB-common burn/protection.
 
     Protection is one HW float mask of the image dtype: 1 protects, 0 permits
     the effect. The caller binds its source/geometry; no mask means zero
-    protection. Disabled/zero-budget calls return the original base object.
+    protection. An optional effect mask uses 1 for full effect and 0 for no
+    effect. Disabled/zero-budget calls return the original base object.
     """
     controls = checked_highlight_reference_guarded(document)
     checked_domain = _domain(domain)
@@ -151,6 +153,11 @@ def apply_highlight_reference_guarded(
             or protection_mask.dtype != base_linear.dtype
         ):
             raise ValueError("Protection must be HW with the base shape and dtype")
+    effect_range = None
+    if effect_mask is not None:
+        effect_range = _inspect(effect_mask, mask=True)
+        if effect_mask.shape != base_linear.shape[:2] or effect_mask.dtype != base_linear.dtype:
+            raise ValueError("Effect area must be HW with the base shape and dtype")
     tau = _tau(controls["range_start"], controls["budget_reference"])
     count = base_linear.shape[0] * base_linear.shape[1]
     receipt = {
@@ -182,6 +189,8 @@ def apply_highlight_reference_guarded(
         "integer_encoding_performed": False,
         "burn_limit_is_recovered_scene_EV": False,
     }
+    if effect_mask is not None:
+        receipt.update(effect_mask_present=True, effect_mask_range=effect_range)
     if (
         controls["strength"] == 0
         or controls["max_burn_ev"] == 0
@@ -235,6 +244,8 @@ def apply_highlight_reference_guarded(
             protected = controls["protection_strength"] * mask
             burn *= 1 - protected
             fully_protected += int(np.count_nonzero(protected == 1))
+        if effect_mask is not None:
+            burn *= effect_mask[start : start + block.shape[0]]
         gain = np.exp2(-burn)
         result = (base * gain[..., None]).astype(base_linear.dtype)
         output[start : start + block.shape[0]] = result

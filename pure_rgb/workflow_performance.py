@@ -7,6 +7,8 @@ window compositing and native glass are independent of this computation policy.
 """
 
 from copy import deepcopy
+import ctypes
+from functools import lru_cache
 import json
 import os
 from pathlib import Path
@@ -96,16 +98,72 @@ def save_performance_settings(path, document):
     return settings
 
 
+class _MacProcessTaskInfo(ctypes.Structure):
+    # PROC_PIDTASKINFO returns struct proc_taskinfo. Only the first two fields
+    # are needed here; its remaining 80 bytes contain timing and counters.
+    _fields_ = [
+        ("virtual_size", ctypes.c_uint64),
+        ("resident_size", ctypes.c_uint64),
+        ("remaining", ctypes.c_ubyte * 80),
+    ]
+
+
+@lru_cache(maxsize=1)
+def _mac_system_functions():
+    """Load macOS process and hardware queries once per application process."""
+    try:
+        library = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        system_info = library.sysctlbyname
+        system_info.argtypes = [
+            ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p, ctypes.c_size_t,
+        ]
+        system_info.restype = ctypes.c_int
+        process_info = library.proc_pidinfo
+        process_info.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int,
+        ]
+        process_info.restype = ctypes.c_int
+        return system_info, process_info
+    except (OSError, AttributeError):
+        return None
+
+
+def _mac_physical_memory():
+    functions = _mac_system_functions()
+    if functions is None:
+        return None
+    value = ctypes.c_uint64()
+    size = ctypes.c_size_t(ctypes.sizeof(value))
+    if functions[0](b"hw.memsize", ctypes.byref(value), ctypes.byref(size), None, 0) != 0:
+        return None
+    return int(value.value) if size.value == ctypes.sizeof(value) and value.value else None
+
+
+def _mac_process_rss(pid):
+    functions = _mac_system_functions()
+    if functions is None or pid > 2**31 - 1:
+        return None
+    info = _MacProcessTaskInfo()
+    size = ctypes.sizeof(info)
+    # PROC_PIDTASKINFO is 4 in <sys/proc_info.h>.
+    if functions[1](pid, 4, 0, ctypes.byref(info), size) != size:
+        return None
+    return int(info.resident_size)
+
+
 def hardware_info():
     cores = max(1, os.cpu_count() or 1)
     memory = None
     try:
         if sys.platform == "darwin":
-            memory = int(
-                subprocess.check_output(
-                    ["/usr/sbin/sysctl", "-n", "hw.memsize"], timeout=2, text=True
-                ).strip()
-            )
+            memory = _mac_physical_memory()
+            if memory is None:
+                memory = int(
+                    subprocess.check_output(
+                        ["/usr/sbin/sysctl", "-n", "hw.memsize"], timeout=2, text=True
+                    ).strip()
+                )
         else:
             memory = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -133,7 +191,7 @@ def backend_status(document=None):
     )
 
 
-def resolve_performance(document=None, *, hardware=None):
+def resolve_performance(document=None, *, hardware=None, include_backend=True):
     settings = checked_performance_settings(document)
     hardware = hardware_info() if hardware is None else hardware
     cores = max(1, int(hardware.get("cpu_count") or 1))
@@ -158,14 +216,14 @@ def resolve_performance(document=None, *, hardware=None):
         preview_cache_budget_bytes=int(budget),
         preview_idle_release_seconds=300 if high else 30,
         memory_pressure_idle_seconds=15 if high else 8,
-        backend=backend_status(settings),
+        **({"backend": backend_status(settings)} if include_backend else {}),
         memory_budget_is_hard_limit=False,
     )
 
 
 def worker_environment(document=None, *, hardware=None):
     """Only the explicitly owned variables, for a newly started worker."""
-    policy = resolve_performance(document, hardware=hardware)
+    policy = resolve_performance(document, hardware=hardware, include_backend=False)
     threads = str(policy["cpu_threads"])
     return {
         **{name: str(policy["blas_threads"]) for name in BLAS_VARIABLES},
@@ -212,6 +270,16 @@ def process_rss_bytes(pid):
     if type(pid) is not int or pid <= 0:
         return None
     try:
+        if sys.platform == "darwin":
+            rss = _mac_process_rss(pid)
+            if rss is not None:
+                return rss
+        elif sys.platform.startswith("linux"):
+            statm = Path(f"/proc/{pid}/statm").read_text().split()
+            return max(0, int(statm[1])) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError, OverflowError):
+        pass
+    try:
         result = subprocess.check_output(
             ["ps", "-o", "rss=", "-p", str(pid)],
             text=True,
@@ -231,7 +299,7 @@ def preview_release_decision(
     The GUI owns shutdown.  No signals or resource limits are applied here;
     active previews, queued replacements and saved-output jobs must pass busy.
     """
-    policy = resolve_performance(document, hardware=hardware)
+    policy = resolve_performance(document, hardware=hardware, include_backend=False)
     if type(retained_source_bytes) is not int or retained_source_bytes < 0:
         raise ValueError("保留源缓存字节数必须为非负整数")
     effective_budget = policy["preview_cache_budget_bytes"] + retained_source_bytes

@@ -4,10 +4,12 @@ The explicit standard-crop policy selects each sensor band before registration.
 Legacy recipes keep the original processor and their original coordinate space.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import asdict, replace
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +25,27 @@ IMPORT_POLICIES = (LEGACY_IMPORT, STANDARD_IMPORT, STANDARD_DNG_IMPORT)
 REGISTRATION_CHECK = "translation-consistency-v1"
 REGISTRATION_SOURCE_CHECK = "translation-consistency-source-v2"
 REGISTRATION_CHECKS = (REGISTRATION_CHECK, REGISTRATION_SOURCE_CHECK)
+
+
+def _raw_decode_workers(source_shape):
+    """Use independent LibRaw decoders only when CPU and memory allow them."""
+    if source_shape[0] * source_shape[1] < 1_000_000:
+        return 1
+    try:
+        from .workflow_exports import _available_memory
+
+        available = _available_memory()
+        threads = int(os.environ.get("RAYON_NUM_THREADS") or os.cpu_count() or 1)
+    except (OSError, ValueError, TypeError):
+        return 1
+    if available is None:
+        return 1
+    # LibRaw maintains private decode buffers beyond its RGB16 result. Reserve
+    # foreground memory and conservatively budget each simultaneous decode.
+    pixels = source_shape[0] * source_shape[1]
+    reserve = 4 * 1024**3
+    per_decoder = max(1024**3, pixels * 48)
+    return max(1, min(3, threads, (available - reserve) // per_decoder))
 
 
 def checked_registration_check(policy, value):
@@ -262,10 +285,12 @@ class StandardRawProcessor(ImageProcessor):
         plan, orientation = first["plan"], first["orientation"]
         planes, bands, primary_metadata = [], [], None
         lens_profiles = []
-        # Decode sequentially, release each full RGB buffer once its band is
-        # selected. Full sources are never modified or padded to fake validity.
-        for band, (path, header) in enumerate(zip(paths, headers)):
-            pixels, metadata = super()._decode_sensor_rgb(
+        def decode_band(item):
+            band, (path, header) = item
+            # The pinned decoder creates a fresh LibRaw handle per invocation;
+            # it has no shared processor state. Keep only the selected band.
+            pixels, metadata = ImageProcessor._decode_sensor_rgb(
+                self,
                 path,
                 True,
                 fast=False,
@@ -284,23 +309,31 @@ class StandardRawProcessor(ImageProcessor):
                 )
             x0, y0, x1, y1 = plan.visible_roi
             plane = uint16_to_float32(pixels[y0:y1, x0:x1, band])
-            planes.append(plane)
-            if self.pure_lens_correction:
-                lens_profiles.append(metadata.get("lens_correction"))
-            if band == 0:
-                primary_metadata = metadata
-            bands.append(
-                {
-                    "role": "RGB"[band],
-                    "path": path,
-                    "geometry": asdict(plan),
-                    "orientation": orientation,
-                    "camera": header["camera"],
-                }
-            )
-            del pixels
             if file_identity(path) != identities[band]:
                 raise ValueError("RAW changed during single-frame decoding")
+            return plane, metadata
+
+        workers = _raw_decode_workers(plan.source_shape)
+        inputs = list(enumerate(zip(paths, headers)))
+        # Mapping retains RGB order even when independent decoders finish in a
+        # different order. Serial operation remains the low-memory fallback.
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for band, (plane, metadata) in enumerate(executor.map(decode_band, inputs)):
+                path, header = paths[band], headers[band]
+                planes.append(plane)
+                if self.pure_lens_correction:
+                    lens_profiles.append(metadata.get("lens_correction"))
+                if band == 0:
+                    primary_metadata = metadata
+                bands.append(
+                    {
+                        "role": "RGB"[band],
+                        "path": path,
+                        "geometry": asdict(plan),
+                        "orientation": orientation,
+                        "camera": header["camera"],
+                    }
+                )
         registration_options = (
             {"model_check": self.pure_registration_check}
             if self.pure_registration_check is not None
