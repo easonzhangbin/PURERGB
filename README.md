@@ -1,5 +1,7 @@
 # PURE RGB
 
+**上游项目：[marcinz606/NegPy](https://github.com/marcinz606/NegPy)。** PURE RGB 是基于 NegPy 的派生开发版本，感谢原作者 marcinz606 及 NegPy 贡献者；保留原项目署名与 GPL-3.0 许可。当前采用的 NegPy 基线为 0.68.0（[`d8123a9`](https://github.com/marcinz606/NegPy/tree/d8123a9b2a18fdaab5941347a91e402fa936d3dc)）。
+
 **PURE RGB 0.1.1** 是基于 [NegPy 0.68](https://github.com/marcinz606/NegPy/tree/d8123a9b2a18fdaab5941347a91e402fa936d3dc) 的 macOS 胶片数字化工作台。面向同一帧分别以红、绿、蓝光拍摄的 RAW，将三路信号配准合成，在同一测量结果上比较色彩呈现，然后输出带 ICC 的 RGB16 TIFF。
 
 [0.1.1 新特性与修复](docs/releases/0.1.1.md) · [中文操作手册](docs/OPERATING_MANUAL.zh-CN.md) · [GitHub Releases](https://github.com/easonzhangbin/PURERGB/releases) · [捐赠支持 StudioPURE](https://github.com/easonzhangbin/PURENeg/blob/main/SUPPORT.md)
