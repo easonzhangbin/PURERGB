@@ -152,8 +152,12 @@ def _measure_leaf(source, box, leaf_mask, selected_area, area):
         samples = samples[leaf_mask]
         original = original[leaf_mask]
         axes = 0
-    nonpositive = np.count_nonzero(original <= 0, axis=axes)
-    below_floor = np.count_nonzero(original < LOG_FLOOR, axis=axes)
+    nonpositive = np.array([
+        np.count_nonzero(original[..., channel] <= 0) for channel in range(3)
+    ], dtype=np.int64)
+    below_floor = np.array([
+        np.count_nonzero(original[..., channel] < LOG_FLOOR) for channel in range(3)
+    ], dtype=np.int64)
     logs = samples if domain is not None else np.log10(np.maximum(samples, LOG_FLOOR))
     median = np.median(logs, axis=axes).tolist()
     return nonpositive, below_floor, median

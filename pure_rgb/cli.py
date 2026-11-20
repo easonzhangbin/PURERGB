@@ -26,7 +26,7 @@ from .engines import (
     sample_film_base,
 )
 from .native import NEGPY_SHA, encode_experiment, native_export, open_triplet, sha256
-from .picture import detect_picture
+from .picture import AUTO_PICTURE_INSET, detect_picture
 
 
 def inspect_tiff(data):
@@ -265,15 +265,15 @@ def main():
     parser.add_argument(
         "--picture-inset",
         type=float,
-        default=0.02,
-        help="Per-side safety inset inside detected picture (default 0.02)",
+        default=AUTO_PICTURE_INSET,
+        help="Per-side inset inside detected picture (default keeps central 80%% area)",
     )
     parser.add_argument(
         "--raw", nargs=3, help="Three same-frame RW2 files, in any order"
     )
     parser.add_argument(
         "--raw-import",
-        choices=("legacy-v1", "standard-crop-v1", "standard-cfa-dng-v1"),
+        choices=("legacy-v1", "standard-crop-v1", "standard-cfa-dng-v1", "standard-mono-v1"),
         default="legacy-v1",
         help="Versioned input geometry; standard crop uses crop-local ROIs and strict registration",
     )

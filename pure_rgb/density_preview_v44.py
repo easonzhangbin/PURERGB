@@ -230,7 +230,7 @@ class DensityPreviewCache:
                     if decode_cache is not None
                     and (
                         not recipe.get("flatfield")
-                        or recipe.get("raw_import") == "standard-crop-v1"
+                        or recipe.get("raw_import") in ("standard-crop-v1", "standard-mono-v1")
                     )
                     else None
                 )
@@ -241,7 +241,7 @@ class DensityPreviewCache:
                        if recipe.get("registration_check") else {}),
                     **({"configure_source": configure_standard_source}
                        if recipe.get("flatfield")
-                       and recipe.get("raw_import") == "standard-crop-v1" else {}),
+                       and recipe.get("raw_import") in ("standard-crop-v1", "standard-mono-v1") else {}),
                     **({"decode_cache": open_cache} if open_cache is not None else {}),
                 )
                 if [item["path"] for item in automatic] != recipe["raw"]:
@@ -510,12 +510,16 @@ class DensityPreviewCache:
             ref, other = self._point_float(entry, reference["runner"], ref_config, rectangle, step, reference["key"], exact=exact)
             if other != icc:
                 raise ValueError("Frozen highlight reference ICC differs from the Native base")
+        from .highlight_protection import automatic_highlight_feather
+
+        automatic_feather = automatic_highlight_feather(entry["source"].shape)
         if highlight and highlight["protection"]:
             key = _key([entry["key"], "protection", highlight["protection"], rectangle, step])
             item = self.protection_samples.get(key)
             if item is None:
                 item = sample_highlight_protection(list(entry["source"].shape), entry["key"],
-                    **highlight["protection"], rectangle=rectangle, sample_step=step, dtype="float64")
+                    **highlight["protection"], rectangle=rectangle, sample_step=step, dtype="float64",
+                    automatic_feather_pixels=automatic_feather)
                 self.protection_samples[key] = item
                 while len(self.protection_samples) > 3:
                     self.protection_samples.popitem(last=False)
@@ -526,7 +530,8 @@ class DensityPreviewCache:
             item = self.protection_samples.get(key)
             if item is None:
                 item = sample_highlight_protection(list(entry["source"].shape), entry["key"],
-                    **highlight["effect_area"], rectangle=rectangle, sample_step=step, dtype="float64")
+                    **highlight["effect_area"], rectangle=rectangle, sample_step=step, dtype="float64",
+                    automatic_feather_pixels=automatic_feather)
                 self.protection_samples[key] = item
                 while len(self.protection_samples) > 3:
                     self.protection_samples.popitem(last=False)

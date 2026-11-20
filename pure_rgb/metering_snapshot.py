@@ -297,7 +297,7 @@ def identity_from_import_receipt(receipt):
     _require(isinstance(receipt, dict), "Expected standard RAW import receipt")
     _json_values(receipt)
     _require(
-        receipt.get("policy") in ("standard-crop-v1", "standard-cfa-dng-v1")
+        receipt.get("policy") in ("standard-crop-v1", "standard-cfa-dng-v1", "standard-mono-v1")
         and type(receipt.get("version")) is int
         and receipt["version"] == 1,
         "Expected an explicit standard RAW import receipt",

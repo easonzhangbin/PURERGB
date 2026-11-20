@@ -214,6 +214,27 @@ def _signed_power(values, power):
     return np.copysign(np.power(np.abs(values), power), values)
 
 
+def _decode_working_oetf(image):
+    return _signed_power(image.astype(np.float64, copy=False), GAMMA)
+
+
+def decode_working_oetf_pixels(image, *, icc_bytes):
+    """Decode a Native render block when only its linear pixels are consumed."""
+    _require(
+        isinstance(icc_bytes, bytes) and icc_bytes == working_icc_bytes(),
+        "working-oetf requires the actual pinned working ICC",
+    )
+    image = _input(image)
+    try:
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            output = _decode_working_oetf(image)
+    except FloatingPointError as error:
+        raise ValueError("Float colour adaptation overflow; no clipping fallback") from error
+    _require(np.isfinite(output).all(), "Nonfinite float colour adaptation")
+    output.setflags(write=False)
+    return output
+
+
 def _stage(name, before, after, **extra):
     return {
         "stage": name,
@@ -254,7 +275,7 @@ def adapt_positive_float(image, *, domain, icc_bytes):
                     _sha(icc_bytes) == ICC_SHA256,
                     "working-oetf requires the actual pinned working ICC",
                 )
-                output = _signed_power(image.astype(np.float64), GAMMA)
+                output = _decode_working_oetf(image)
                 stages.append(
                     _stage(
                         "pinned-working-OETF-decode",

@@ -1,8 +1,72 @@
 """One cancellable, generation-checked display prefetch after user inactivity."""
 
 from collections import deque
+from threading import Lock
 
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal
+
+
+class PrewarmGate(QObject):
+    """Let foreground workers start after an active decode prewarm exits."""
+
+    _released = pyqtSignal()
+
+    def __init__(self, cancel, parent=None):
+        super().__init__(parent)
+        self._lock = Lock()
+        self._cancel = cancel
+        self._active = False
+        self._resuming = False
+        self._waiting = []
+        self._released.connect(self._resume, Qt.ConnectionType.QueuedConnection)
+
+    def enter(self, cancelled):
+        """Register a prewarm atomically with the foreground cancellation."""
+        with self._lock:
+            if self._active or self._waiting or self._resuming or cancelled():
+                return False
+            self._active = True
+            return True
+
+    def leave(self):
+        with self._lock:
+            self._active = False
+        self._released.emit()
+
+    def defer(self, callback, on_error=None):
+        """Cancel idle work and queue the foreground callback if necessary."""
+        with self._lock:
+            self._cancel()
+            if not self._active:
+                return False
+            self._waiting.append((callback, on_error))
+            return True
+
+    def _resume(self):
+        with self._lock:
+            if self._active:
+                return
+            waiting, self._waiting = self._waiting, []
+            self._resuming = True
+        try:
+            for callback, on_error in waiting:
+                try:
+                    callback()
+                except Exception as error:
+                    try:
+                        if on_error is not None:
+                            on_error(error)
+                        else:
+                            from .diagnostics import failure
+
+                            failure("prewarm_foreground_resume_failed", error)
+                    except Exception as handler_error:
+                        from .diagnostics import failure
+
+                        failure("prewarm_foreground_error_handler_failed", handler_error)
+        finally:
+            with self._lock:
+                self._resuming = False
 
 
 class IdlePreviewScheduler(QObject):

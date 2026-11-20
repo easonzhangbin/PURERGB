@@ -209,7 +209,7 @@ def _cropped(pixels, recipe, roi, *, apply_orientation=True, preview=False):
 
 def render_bw(request, *, emit_callback=None):
     from .workspace import checked_recipe, output_rectangle, write_json
-    from .workflow_render import emit
+    from .workflow_render import _study_picture_region, emit
 
     emit_event = emit_callback or emit
     recipe = checked_recipe(request["recipe"])
@@ -243,7 +243,16 @@ def render_bw(request, *, emit_callback=None):
         report["bw_source_receipt"] = deepcopy(processor.pure_bw_source_receipt)
         report["bw_input_config"] = base.to_dict()
         config = _configured(base, recipe)
-        roi = _roi(source, config, recipe["roi"])
+        if recipe["roi"] is None and type(request.get("import_stage")) is int:
+            from .workflow_geometry_preview import write_geometry_previews
+
+            locators = write_geometry_previews(source, out, monochrome=True)
+            region = _study_picture_region(source, None, locators)
+            region["coordinate_space"] = "EXIF-oriented single RAW linear source; half-open xyxy"
+            report["picture_region"] = region
+            roi = list(region["analysis_roi"])
+        else:
+            roi = _roi(source, config, recipe["roi"])
         # The spatial helper requires an exact source ROI, including auto-resolved BW jobs.
         effective_recipe = {**recipe, "roi": roi}
         state = _prepare_metering(source, config, roi, recipe)

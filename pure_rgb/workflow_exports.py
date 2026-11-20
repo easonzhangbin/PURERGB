@@ -294,6 +294,30 @@ def export_batch(request, progress):
     active = []
     condition = threading.Condition()
     closing = [False]
+    probe_slot = threading.BoundedSemaphore(1)
+
+    def start_probe(callback, complete):
+        # A stalled filesystem call cannot be cancelled. Keep at most one
+        # outstanding probe and use the serial fallback while it is stalled.
+        if not probe_slot.acquire(blocking=False):
+            return False
+
+        def run():
+            try:
+                result = callback()
+            except Exception:
+                result = None
+            with condition:
+                probe_slot.release()
+                complete(result)
+                condition.notify_all()
+
+        try:
+            _thread.start_new_thread(run, ())
+        except RuntimeError:
+            probe_slot.release()
+            return False
+        return True
 
     def terminate_running():
         with lock:
@@ -379,15 +403,13 @@ def export_batch(request, progress):
                                 deadlines[index] = time.monotonic() + _HEADER_TIMEOUT_SECONDS
 
                                 def inspect_item(target=index):
-                                    value = _render_budget(items[target])
-                                    with condition:
-                                        if estimates[target] is pending:
-                                            estimates[target] = value
-                                            condition.notify_all()
+                                    return _render_budget(items[target])
 
-                                try:
-                                    _thread.start_new_thread(inspect_item, ())
-                                except RuntimeError:
+                                def inspected(value, target=index):
+                                    if estimates[target] is pending:
+                                        estimates[target] = value or (_DEFAULT_RENDER_BUDGET, True, ())
+
+                                if not start_probe(inspect_item, inspected):
                                     estimates[index] = (_DEFAULT_RENDER_BUDGET, True, ())
                             if estimates[index] is pending:
                                 remaining = deadlines[index] - time.monotonic()
@@ -406,16 +428,14 @@ def export_batch(request, progress):
                                     validations[index] = token
                                     validation_deadlines[index] = time.monotonic() + _HEADER_TIMEOUT_SECONDS
 
-                                    def validate_item(target=index, generation=token):
-                                        result = _budget_still_valid(estimates[target])
-                                        with condition:
-                                            if validations[target] is generation:
-                                                validations[target] = result
-                                                condition.notify_all()
+                                    def validate_item(target=index):
+                                        return _budget_still_valid(estimates[target])
 
-                                    try:
-                                        _thread.start_new_thread(validate_item, ())
-                                    except RuntimeError:
+                                    def validated(result, target=index, generation=token):
+                                        if validations[target] is generation:
+                                            validations[target] = result or (_DEFAULT_RENDER_BUDGET, True)
+
+                                    if not start_probe(validate_item, validated):
                                         validations[index] = (_DEFAULT_RENDER_BUDGET, True)
                                 if type(validations[index]) is not tuple:
                                     remaining = validation_deadlines[index] - time.monotonic()

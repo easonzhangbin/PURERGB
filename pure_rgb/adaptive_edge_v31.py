@@ -33,6 +33,20 @@ POLICY = dict(
 )
 
 
+def _annular_median(ring):
+    """Measure each ring while ignoring the NaN padding at image edges."""
+    samples = ring.reshape(-1, ring.shape[-1])
+    counts = np.count_nonzero(~np.isnan(samples), axis=1)
+    result = np.empty(samples.shape[0], dtype=ring.dtype)
+    for count in np.unique(counts):
+        indices = np.flatnonzero(counts == count)
+        lower = (count - 1) // 2
+        upper = count // 2
+        ordered = np.partition(samples[indices], (lower, upper), axis=1)
+        result[indices] = np.mean(ordered[:, [lower, upper]], axis=1)
+    return result.reshape(ring.shape[:-1])
+
+
 def detect_adaptive_edge(source, roi, document):
     from .automatic_metering_v31 import _boxes, _components
 
@@ -112,7 +126,7 @@ def detect_adaptive_edge(source, roi, document):
     )
     # Grid size is capped48x72: no full-camera-size annular temporary is created.
     ring = windows[..., footprint]
-    residual = np.nanmedian(ring, axis=-1, overwrite_input=True) - med
+    residual = _annular_median(ring) - med
     common = np.median(residual, axis=2)
     span = np.ptp(residual, axis=2)
     flat = spread <= POLICY["maximum_seed_spread"]

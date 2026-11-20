@@ -303,7 +303,7 @@ def render(request, *, emit_callback=None, prepared_source=None):
                     if decode_context is not None
                     and (
                         not recipe["flatfield"]
-                        or recipe.get("raw_import") == "standard-crop-v1"
+                        or recipe.get("raw_import") in ("standard-crop-v1", "standard-mono-v1")
                     )
                     else None
                 )
@@ -314,7 +314,7 @@ def render(request, *, emit_callback=None, prepared_source=None):
                        if recipe.get("registration_check") else {}),
                     **({"configure_source": configure_standard_source}
                        if recipe["flatfield"]
-                       and recipe.get("raw_import") == "standard-crop-v1" else {}),
+                       and recipe.get("raw_import") in ("standard-crop-v1", "standard-mono-v1") else {}),
                     **({"decode_cache": open_cache} if open_cache is not None else {}),
                 )
             else:

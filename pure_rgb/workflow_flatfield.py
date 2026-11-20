@@ -27,6 +27,8 @@ def flatfield_support(photo):
         return False, "黑白单张尚未接通此平场链；当前不启用。"
     if photo["base"].get("raw_import") == "standard-cfa-dng-v1":
         return False, "CFA DNG 尚未接通此平场链；RGB RW2 可用。"
+    if photo["base"].get("raw_import") == "standard-mono-v1":
+        return True, "单色 RGB 可使用带完整传感器画幅记录的平场增益 NPZ。"
     return True, "使用同机位、镜头、光圈与对焦状态的均匀白光参考；先移开底片。"
 
 
@@ -171,7 +173,10 @@ class FlatfieldUI:
     def choose_flatfield(self):
         if self.tasks.busy or not flatfield_support(self.current_photo())[0]:
             return
-        path, _ = QFileDialog.getOpenFileName(self, "选择单张白光平场 RAW 或增益 NPZ", "", FILE_FILTER)
+        mono = self.current_photo()["base"].get("raw_import") == "standard-mono-v1"
+        title = "选择平场增益 NPZ" if mono else "选择单张白光平场 RAW 或增益 NPZ"
+        file_filter = "增益 NPZ (*.npz *.NPZ)" if mono else FILE_FILTER
+        path, _ = QFileDialog.getOpenFileName(self, title, "", file_filter)
         if path:
             self.import_flatfield(path)
 
@@ -186,6 +191,8 @@ class FlatfieldUI:
             return
         try:
             path = Path(path).resolve(strict=True)
+            if photo["base"].get("raw_import") == "standard-mono-v1" and path.suffix.lower() != ".npz":
+                raise ValueError("单色 RGB 需要带传感器画幅记录的增益 NPZ。")
             if path.suffix.lower() not in (*RAW_EXTENSIONS, ".npz"):
                 raise ValueError("请选择平场 RAW 或增益 NPZ。")
             request = dict(action="flatfield_import", photo=photo["id"],
@@ -204,7 +211,7 @@ class FlatfieldUI:
         report = result["calibration"]
         photo = self.project.photo(identifier)
         capture = (report.get("provenance") or {}).get("capture", {})
-        if photo["base"].get("raw_import") == "standard-crop-v1" and not capture.get("sensor_shape"):
+        if photo["base"].get("raw_import") in ("standard-crop-v1", "standard-mono-v1") and not capture.get("sensor_shape"):
             raise ValueError("增益配置缺少完整传感器尺寸，不能对标准裁切源定位。请选择平场 RAW 重新生成。")
         self.flatfield_pending[identifier] = dict(path=report["gain_path"], report=deepcopy(report))
         self.project.register_flatfield(report)
@@ -226,6 +233,9 @@ class FlatfieldUI:
             return
         entry = self.flatfield_library_choice.currentData()
         if not entry or not entry.get("gain_path"):
+            return
+        if photo["base"].get("raw_import") == "standard-mono-v1":
+            self.import_flatfield(str(entry["gain_path"]))
             return
         self.flatfield_pending[photo["id"]] = dict(path=str(entry["gain_path"]))
         self.flatfield_messages[photo["id"]] = "已从库中选用平场；点击应用后重新处理完整源。"

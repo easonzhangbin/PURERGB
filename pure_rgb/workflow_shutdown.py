@@ -12,6 +12,13 @@ def shutdown_window(window):
     if getattr(window, "_shutdown_complete", False):
         return
     window.closing = True
+    for cancel in list(getattr(window, "_deferred_display_work", {}).values()):
+        try:
+            cancel()
+        except OSError as error:
+            from .diagnostics import failure
+
+            failure("deferred_display_cleanup_failed", error)
     for panel in window.advanced_panels.values():
         panel.cancel_pending()
     window.maintenance_timer.stop()

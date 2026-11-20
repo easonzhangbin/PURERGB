@@ -206,3 +206,4 @@ class EditHistoryUI:
             panel = self.crop_panels[4]
             self.pages.widget(4).verticalScrollBar().setValue(0)
             self.pages.widget(4).ensureWidgetVisible(panel)
+

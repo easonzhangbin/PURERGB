@@ -23,7 +23,7 @@ from .tone_study import GAMMA, ICC_SHA256, brightness_statistics
 
 SIGNAL_FLOOR = 1e-6
 TAIL_FRACTION = 0.0001
-PRIMARY = Path(os.environ["PURE_RGB_PRIMARY_COHORT"]).resolve() if "PURE_RGB_PRIMARY_COHORT" in os.environ else None
+PRIMARY = Path("/Users/easonzhang/Pictures/makina/rgb测试/rgb2").resolve()
 
 
 def signed_coordinate(image, window):
@@ -161,8 +161,6 @@ def normalization_metrics(source, process):
 def run_case(baseline_path, destination):
     baseline_path = Path(baseline_path).resolve()
     old = json.loads((baseline_path / "manifest.json").read_text())
-    if PRIMARY is None:
-        raise ValueError("Set PURE_RGB_PRIMARY_COHORT to the local study source directory")
     if old["state"] != "complete" or any(
         Path(r["path"]).resolve().parent != PRIMARY for r in old["inputs"]
     ):

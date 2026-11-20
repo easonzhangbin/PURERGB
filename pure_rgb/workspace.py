@@ -168,6 +168,7 @@ def checked_recipe(recipe, *, verify_resources=True):
         IMPORT_POLICIES,
         is_standard_import,
         STANDARD_DNG_IMPORT,
+        STANDARD_MONO_IMPORT,
         checked_registration_check,
     )
 
@@ -177,6 +178,8 @@ def checked_recipe(recipe, *, verify_resources=True):
     lens = result.get("lens_correction", False)
     if type(lens) is not bool or (lens and not is_standard_import(policy)):
         raise ValueError("RAW 内嵌镜头矫正需要标准三色 RAW 配方")
+    if lens and policy == STANDARD_MONO_IMPORT:
+        raise ValueError("单色 RGB 暂不支持 RAW 内嵌镜头矫正")
     if not lens:
         result.pop("lens_correction", None)
     registration_check = checked_registration_check(
@@ -188,7 +191,7 @@ def checked_recipe(recipe, *, verify_resources=True):
     if (
         len(raw) != 3
         or len(set(raw)) != 3
-        or any(Path(p).suffix.lower() != suffix for p in raw)
+        or (policy != STANDARD_MONO_IMPORT and any(Path(p).suffix.lower() != suffix for p in raw))
     ):
         raise ValueError("配方需按 R/G/B 顺序包含三张不同 RW2")
     result["raw"] = [str(Path(p).resolve()) for p in raw]
@@ -209,6 +212,9 @@ def checked_recipe(recipe, *, verify_resources=True):
     result.setdefault("flatfield", None)
     if policy == STANDARD_DNG_IMPORT and result["flatfield"] is not None:
         raise ValueError("CFA DNG 导入暂不支持平场")
+    if (policy == STANDARD_MONO_IMPORT and result["flatfield"] is not None
+            and Path(result["flatfield"]).suffix.lower() != ".npz"):
+        raise ValueError("单色 RGB 平场需要带传感器画幅记录的增益 NPZ")
     # Missing in an existing frozen recipe means the original conservative output.
     result.setdefault("cool_tone", "conservative")
     if result["cool_tone"] not in ("conservative", "soft-shoulder"):

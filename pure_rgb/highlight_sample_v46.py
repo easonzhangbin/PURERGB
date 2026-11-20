@@ -38,7 +38,8 @@ class SampledHighlightProtection:
 
 def sample_highlight_protection(source_shape, source_key, *, include,
                                 feather_pixels=64.0, dtype="float64",
-                                rectangle=None, sample_step=1):
+                                rectangle=None, sample_step=1,
+                                automatic_feather_pixels=0.):
     """Sample the original outward EDT feather, never a resized vector mask.
 
     Only source pixels within feather distance of the requested rectangle can
@@ -60,6 +61,15 @@ def sample_highlight_protection(source_shape, source_key, *, include,
             or not 0 <= feather <= 512):
         raise ValueError("Protection sampling needs a positive integer step and source-pixel feather in [0,512]")
     feather_pixels = feather
+    if type(automatic_feather_pixels) not in (int, float):
+        raise ValueError("Automatic feather must be finite original-source pixels in [0,256]")
+    try:
+        automatic_feather_pixels = float(automatic_feather_pixels)
+    except OverflowError as error:
+        raise ValueError("Automatic feather must be finite original-source pixels in [0,256]") from error
+    if not math.isfinite(automatic_feather_pixels) or not 0 <= automatic_feather_pixels <= 256:
+        raise ValueError("Automatic feather must be finite original-source pixels in [0,256]")
+    effective_feather = feather_pixels + automatic_feather_pixels
     if not isinstance(include, (list, tuple)) or not 1 <= len(include) <= MAX_SHAPES:
         raise ValueError("Protection requires explicit nonempty source regions")
     shapes = [_shape(shape, full) for shape in include]
@@ -82,7 +92,7 @@ def sample_highlight_protection(source_shape, source_key, *, include,
             break
     if not valid:
         raise ValueError("Protection selection contains no source pixel centres")
-    halo = math.ceil(float(feather_pixels)) + 1 if feather_pixels else 0
+    halo = math.ceil(effective_feather) + 1 if effective_feather else 0
     a, b, c, d = max(0, x0-halo), max(0, y0-halo), min(full[1], x1+halo), min(full[0], y1+halo)
     selected = np.zeros((d-b, c-a), dtype=bool)
     for shape in shapes:
@@ -95,10 +105,10 @@ def sample_highlight_protection(source_shape, source_key, *, include,
     sy, sx = slice(y0-b, y1-b, sample_step), slice(x0-a, x1-a, sample_step)
     inside = selected[sy, sx]
     mask = inside.astype(dtype)
-    if feather_pixels > 0 and selected.any() and not selected.all():
+    if effective_feather > 0 and selected.any() and not selected.all():
         distance = cv2.distanceTransform(np.ascontiguousarray(~selected, dtype=np.uint8),
                                          cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-        t = np.minimum(distance[sy, sx].astype(np.float64) / feather_pixels, 1.0)
+        t = np.minimum(distance[sy, sx].astype(np.float64) / effective_feather, 1.0)
         mask = (1.0 - t*t*(3.0 - 2.0*t)).astype(dtype)
         mask[inside] = 1.0
     mask = np.frombuffer(np.ascontiguousarray(mask).tobytes(), dtype=np.dtype(dtype)).reshape(mask.shape)
@@ -112,6 +122,8 @@ def sample_highlight_protection(source_shape, source_key, *, include,
                    protection_domain="original full-source pixel centres and precise outward feather",
                    source_pixels_read_or_modified=False,
                    statistics_scope="requested source grid; not full-source protection counts")
+    if automatic_feather_pixels:
+        receipt["automatic_feather_pixels"] = float(automatic_feather_pixels)
     receipt["sha256"] = hashlib.sha256(_canonical(receipt).encode()).hexdigest()
     return SampledHighlightProtection(mask, _canonical(receipt))
 
@@ -122,20 +134,20 @@ def compose_native_sample(encoded, *, icc, reference_encoded=None, highlight=Non
     from negpy.kernel.image.logic import working_oetf_encode
     from .native_float import checked_native_float
     from .highlight_reference_guarded import apply_highlight_reference_guarded
-    from .positive_float import adapt_positive_float, apply_positive_float, positive_domain
+    from .positive_float import apply_positive_float, decode_working_oetf_pixels, positive_domain
 
     point = checked_native_float(point)
     if not highlight and not point["values"]:
         return encoded, None
-    encoded_domain, linear_domain = positive_domain("working-oetf", icc), positive_domain("linear", icc)
-    linear = adapt_positive_float(encoded, domain=encoded_domain, icc_bytes=icc).image
+    linear_domain = positive_domain("linear", icc)
+    linear = decode_working_oetf_pixels(encoded, icc_bytes=icc)
     output, high_receipt = linear, None
     if highlight:
         if (reference_encoded is None
                 or bool(highlight["protection"]) != (protection_mask is not None)
                 or bool(highlight.get("effect_area")) != (effect_mask is not None)):
             raise ValueError("Highlight sample requires its real reference and declared source protection")
-        reference = adapt_positive_float(reference_encoded, domain=encoded_domain, icc_bytes=icc).image
+        reference = decode_working_oetf_pixels(reference_encoded, icc_bytes=icc)
         output, high_receipt = apply_highlight_reference_guarded(
             linear, reference, highlight["controls"], domain=linear_domain,
             protection_mask=protection_mask, effect_mask=effect_mask)

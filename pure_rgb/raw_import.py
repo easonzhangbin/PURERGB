@@ -21,7 +21,8 @@ from .raw_validity import plan_standard_crop, StandardCropPlan
 LEGACY_IMPORT = "legacy-v1"
 STANDARD_IMPORT = "standard-crop-v1"
 STANDARD_DNG_IMPORT = "standard-cfa-dng-v1"
-IMPORT_POLICIES = (LEGACY_IMPORT, STANDARD_IMPORT, STANDARD_DNG_IMPORT)
+STANDARD_MONO_IMPORT = "standard-mono-v1"
+IMPORT_POLICIES = (LEGACY_IMPORT, STANDARD_IMPORT, STANDARD_DNG_IMPORT, STANDARD_MONO_IMPORT)
 REGISTRATION_CHECK = "translation-consistency-v1"
 REGISTRATION_SOURCE_CHECK = "translation-consistency-source-v2"
 REGISTRATION_CHECKS = (REGISTRATION_CHECK, REGISTRATION_SOURCE_CHECK)
@@ -54,7 +55,7 @@ def checked_registration_check(policy, value):
         return None
     if type(value) is not str or value not in REGISTRATION_CHECKS:
         raise ValueError("Unknown RAW registration check")
-    if policy not in (STANDARD_IMPORT, STANDARD_DNG_IMPORT):
+    if policy not in (STANDARD_IMPORT, STANDARD_DNG_IMPORT, STANDARD_MONO_IMPORT):
         raise ValueError("Registration model checking requires standard RAW import")
     return value
 
@@ -86,7 +87,7 @@ def validate_registration_requirement(receipt, requirement):
 
 
 def is_standard_import(policy):
-    return policy in (STANDARD_IMPORT, STANDARD_DNG_IMPORT)
+    return policy in (STANDARD_IMPORT, STANDARD_DNG_IMPORT, STANDARD_MONO_IMPORT)
 
 
 def probe_for_policy(policy):
@@ -229,6 +230,21 @@ class StandardRawProcessor(ImageProcessor):
     def _header(self, path):
         return inspect_raw_header(path)
 
+    def _decode_band(self, path, band, plan, orientation, params):
+        from negpy.kernel.image.logic import uint16_to_float32
+        from negpy.features.process.path import positive_decode
+
+        pixels, metadata = ImageProcessor._decode_sensor_rgb(
+            self, path, True, fast=False, wb_override=[1, 1, 1, 1],
+            demosaic=params.process.demosaic_export,
+            positive_decode=positive_decode(params.process), highlight_mode=0,
+        )
+        if (pixels.dtype != np.uint16 or pixels.shape != plan.source_shape
+                or metadata.get("orientation", 1) != orientation):
+            raise ValueError("Decoded RAW does not match the frozen sensor geometry")
+        x0, y0, x1, y1 = plan.visible_roi
+        return uint16_to_float32(pixels[y0:y1, x0:x1, band]), metadata
+
     def _load_source_f32(self, file_path, params, fast_decode=False, unmix=True):
         if fast_decode:
             raise ValueError("Standard RAW import does not use half-size decoding")
@@ -263,9 +279,8 @@ class StandardRawProcessor(ImageProcessor):
     def _decode_oriented_f32(
         self, file_path, params, fast_decode=False, wb_override=None, unmix=True
     ):
-        from negpy.kernel.image.logic import apply_exif_orientation, uint16_to_float32
+        from negpy.kernel.image.logic import apply_exif_orientation
         from negpy.infrastructure.display.color_spaces import WORKING_COLOR_SPACE
-        from negpy.features.process.path import positive_decode
         from .raw_registration import register_planes
         from .raw_flatfield import apply_standard_flatfield
         import rawpy
@@ -289,26 +304,7 @@ class StandardRawProcessor(ImageProcessor):
             band, (path, header) = item
             # The pinned decoder creates a fresh LibRaw handle per invocation;
             # it has no shared processor state. Keep only the selected band.
-            pixels, metadata = ImageProcessor._decode_sensor_rgb(
-                self,
-                path,
-                True,
-                fast=False,
-                wb_override=[1, 1, 1, 1],
-                demosaic=params.process.demosaic_export,
-                positive_decode=positive_decode(params.process),
-                highlight_mode=0,
-            )
-            if (
-                pixels.dtype != np.uint16
-                or pixels.shape != plan.source_shape
-                or metadata.get("orientation", 1) != orientation
-            ):
-                raise ValueError(
-                    "Decoded RAW does not match the frozen sensor geometry"
-                )
-            x0, y0, x1, y1 = plan.visible_roi
-            plane = uint16_to_float32(pixels[y0:y1, x0:x1, band])
+            plane, metadata = self._decode_band(path, band, plan, orientation, params)
             if file_identity(path) != identities[band]:
                 raise ValueError("RAW changed during single-frame decoding")
             return plane, metadata
@@ -449,6 +445,10 @@ def create_processor(
         if flatfield_reference_shape is not None:
             raise ValueError("CFA DNG import does not support flatfield references")
         return StandardCfaDngProcessor(**options)
+    if policy == STANDARD_MONO_IMPORT:
+        from .raw_mono_import import StandardMonoProcessor
+
+        return StandardMonoProcessor(flatfield_reference_shape=flatfield_reference_shape, **options)
     return (
         ImageProcessor(use_gpu=False)
         if policy == LEGACY_IMPORT

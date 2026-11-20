@@ -26,6 +26,8 @@ class Tasks(QObject):
         self.process = None
         self.request = None
         self.performance = None
+        self.prewarm_gate = None
+        self._deferred = False
 
     @property
     def busy(self):
@@ -55,8 +57,30 @@ class Tasks(QObject):
         process.readyReadStandardError.connect(self.read_error)
         process.finished.connect(self.finished)
         process.errorOccurred.connect(self.process_error)
+        self._deferred = True
         self.started.emit()
-        process.start(sys.executable, ["-m", "pure_rgb.workflow_worker", str(path)])
+        if self.process is not process:
+            return
+
+        def launch():
+            if self.process is not process or self.cancelled:
+                return
+            self._deferred = False
+            process.start(sys.executable, ["-m", "pure_rgb.workflow_worker", str(path)])
+
+        def launch_failed(error):
+            if self.process is process:
+                self._deferred = False
+                self.process = None
+                process.deleteLater()
+                self.failed.emit(self.request, "无法启动处理进程：" + str(error), False)
+
+        self._deferred = bool(self.prewarm_gate and self.prewarm_gate.defer(launch, launch_failed))
+        if not self._deferred:
+            try:
+                launch()
+            except Exception as error:
+                launch_failed(error)
 
     def process_error(self, error):
         if error == QProcess.ProcessError.FailedToStart and self.process:
@@ -142,10 +166,16 @@ class Tasks(QObject):
             )
 
     def cancel(self):
-        if not self.process or self.request.get("action") == "repair_confirm":
+        if not self.process or (self.request.get("action") == "repair_confirm" and not self._deferred):
             return
         self.cancelled = True
         event("task_cancel_requested", action=self.request.get("action"))
+        if self._deferred:
+            self._deferred = False
+            process, self.process = self.process, None
+            process.deleteLater()
+            self.failed.emit(self.request, "任务已取消", True)
+            return
         pid = int(self.process.processId())
         if not pid:
             self.process.kill()
@@ -169,6 +199,8 @@ class Tasks(QObject):
     def shutdown(self):
         if self.process:
             self.cancel()
+            if self.process is None:
+                return
             if not self.process.waitForFinished(3500):
                 self.process.kill()
                 self.process.waitForFinished(1000)

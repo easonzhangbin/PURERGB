@@ -231,6 +231,11 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.import_preview_timer.setSingleShot(True)
         self.import_preview_timer.setInterval(70)
         self.import_preview_timer.timeout.connect(self.request_import_preview)
+        self._measurement_hint_photo = None
+        self._measurement_hint_text = ""
+        self._measurement_hint_timer = QTimer(self)
+        self._measurement_hint_timer.setSingleShot(True)
+        self._measurement_hint_timer.timeout.connect(self.clear_measurement_hint)
         self.import_attention_photo = None
         self.import_lens_context = None
         self.setWindowTitle("PURE RGB")
@@ -262,6 +267,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
     def _make_live(self):
         self.live = LivePreview(self)
         self.live.performance = self.performance
+        self.live.prewarm_gate = getattr(self, "prewarm_gate", None)
         self.live.ready.connect(self.live_ready)
         self.live.failed.connect(self.preview_failed)
         self.live.progress.connect(self.preview_progress)
@@ -382,7 +388,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
 
     def schedule_preview(self):
         """Make an edit visible automatically; saving is a separate action."""
-        if self.geometry_role == "crop":
+        if (self.geometry_role == "crop" or
+                (self.geometry_role in ("highlight", "highlight_effect", "highlight_protect")
+                 and getattr(self, "highlight_full_source", False))):
             self.request_preview()
             return
         self.token += 1
@@ -559,7 +567,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
 
     def setup_background_previews(self):
         from .workflow_display_cache import DisplayImageCache
-        from .workflow_idle import IdlePreviewScheduler
+        from .workflow_idle import IdlePreviewScheduler, PrewarmGate
 
         policy = resolve_performance(self.performance, include_backend=False)
         self.display_cache = DisplayImageCache(
@@ -572,6 +580,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.idle_scheduler = IdlePreviewScheduler(
             self.prefetch_display, self.cancel_prefetch, parent=self
         )
+        self.prewarm_gate = PrewarmGate(self.idle_scheduler.user_activity, self)
+        self.tasks.prewarm_gate = self.prewarm_gate
+        self.live.prewarm_gate = self.prewarm_gate
         self.idle_scheduler.set_enabled(self.performance["idle_previews"])
         QApplication.instance().installEventFilter(self)
         self.maintenance_timer = QTimer(self)
@@ -605,9 +616,20 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
     def queue_idle_previews(self, saved_jobs=None):
         if not hasattr(self, "idle_scheduler"):
             return
+        photos = self.project.photos
+        current = self.project.data.get("current")
+        current_index = next(
+            (index for index, photo in enumerate(photos) if photo["id"] == current),
+            None,
+        )
+        ordered = list(enumerate(photos))
+        if current_index is not None:
+            ordered.sort(key=lambda item: (
+                abs(item[0] - current_index), item[0] < current_index
+            ))
         queue = []
-        for photo in self.project.photos:
-            if photo["id"] == self.project.data.get("current"):
+        for _, photo in ordered:
+            if photo["id"] == current:
                 continue
             job = (self.project.saved_job(photo) if saved_jobs is None
                    else saved_jobs.get(photo["id"]))
@@ -629,6 +651,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         target, proof = self.display_target, self.proof_space
 
         def read():
+            if generation in self.idle_cancelled or self.closing:
+                return None
             sample = self.project.workspace.sample(self.project.workspace.job(item[0]))
             for mode in dict.fromkeys((RESULT_MODES[item[1]], "native")):
                 if generation in self.idle_cancelled or self.closing:
@@ -644,7 +668,11 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 from .decode_prewarm import prewarm
 
                 manifest = self.project.workspace.root / "runs" / item[0] / "manifest.json"
-                prewarm(manifest, lambda: generation in self.idle_cancelled or self.closing)
+                def cancelled():
+                    return generation in self.idle_cancelled or self.closing
+                prewarm(manifest, cancelled,
+                        start_guard=lambda: self.prewarm_gate.enter(cancelled),
+                        end_guard=self.prewarm_gate.leave)
             return None
 
         work = Work(generation, read)
@@ -728,10 +756,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.stage_group = QButtonGroup(self)
         for index, name in enumerate(STAGES):
             number, visible_name = stage_presentation(index)
-            item = button(
-                f"{number}  {visible_name}",
-                lambda checked=False, index=index: self.navigate_stage(index),
-            )
+            # macOS accessibility can select a checkable button by changing
+            # its checked state without emitting clicked(). Route all input
+            # methods through the group's checked-state transition instead.
+            item = QPushButton(f"{number}  {visible_name}")
             item.setCheckable(True)
             item.setAccessibleName(visible_name)
             self.stage_group.addButton(item, index)
@@ -741,6 +769,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 item.setParent(stage_bar)
                 item.hide()
             self.stage_buttons.append(item)
+        self.stage_group.idToggled.connect(self.stage_toggled)
         from .workflow_stage_navigation import StageNavigation
 
         self.stage_navigation = StageNavigation(stage_bar, {
@@ -868,6 +897,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.canvas.full_resolution_requested.connect(self.request_actual)
         self.canvas_stack.addWidget(self.canvas)
         self.selection = SelectionView()
+        self.selection.stroke_changed.connect(self.sync_drawing_hint)
         self.selection.selected.connect(self.shape_selected)
         self.selection.crop_rotated.connect(self.crop_post_changed)
         self.selection.zone_selected.connect(self.open_meter_zone_menu)
@@ -900,6 +930,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         )
         self.preview_notice.hide()
         middle.addWidget(self.canvas_stack, 1)
+        self.highlight_frame_toggle = button("显示完整源画面", self.toggle_highlight_frame)
+        self.highlight_frame_toggle.hide()
+        middle.addWidget(self.highlight_frame_toggle)
         self.region_done = AttentionButton("退出绘制")
         self.region_done.clicked.connect(self.leave_selection)
         self.region_done.hide()
@@ -986,13 +1019,14 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         layout.addWidget(text("输入方式"))
         self.input_choice = QComboBox()
         self.input_choice.setAccessibleName("新素材输入方式")
-        self.input_choice.addItem("彩色负片 · RGB 三张", "rgb")
+        self.input_choice.addItem("拜耳 RGB · 三张 RAW", "rgb")
+        self.input_choice.addItem("单色 RGB · 三张 RAW", "mono_rgb")
         self.input_choice.addItem("黑白负片 · 单张 RAW", "bw")
         layout.addWidget(self.input_choice)
         layout.addWidget(button("选择 RAW 文件…", self.import_files))
         layout.addWidget(button("选择素材文件夹…", self.import_folder))
         layout.addWidget(
-            text("输入方式用于新导入，不会把已有三色组重新解释成黑白。", True)
+            text("输入方式用于新导入。单色 RGB 按文件名顺序分配通道，请在导入前核对。", True)
         )
         self.source_note = text("尚未导入源文件", True)
         layout.addWidget(self.source_note)
@@ -1227,7 +1261,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.highlight_effect_feather_changed,
         )
         self.highlight_effect_feather.setToolTip(
-            "羽化从作用区边界向外渐变；0 为硬边，单位为原始源像素。"
+            "边缘会自动柔化；此值在自动柔化基础上向外增加羽化，单位为源像素。"
         )
         high.addWidget(
             button(
@@ -1240,7 +1274,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         )
         high.addWidget(self.highlight_note)
         self.highlight_effect_note = text(
-            "默认作用于全图。可添加作用区并调整羽化；保护区内减弱高光找回。", True
+            "添加作用区后按画面亮度筛选高光；保护区内减弱高光找回。", True
         )
         high.addWidget(self.highlight_effect_note)
         layout.addWidget(self.high_box)
@@ -1276,6 +1310,12 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         layout.addWidget(button("选择导出目录…", self.choose_export_directory))
         self.export_button = button("导出当前／勾选照片", self.export_selected, True)
         layout.addWidget(self.export_button)
+        self.export_old_highlight_button = button(
+            "导出当前照片的已保存旧版", self.export_previous_highlight
+        )
+        self.export_old_highlight_button.setToolTip("导出旧算法保存的成片及其已确认除尘。")
+        self.export_old_highlight_button.hide()
+        layout.addWidget(self.export_old_highlight_button)
         layout.addWidget(text("参数自动保存；导出时自动生成当前配方的完整 TIFF，同名文件不会覆盖。", True))
 
     def current_photo(self):
@@ -1377,11 +1417,69 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.last_error = str(message)
         self.status_message("未完成：" + str(message))
 
+    def sync_drawing_hint(self):
+        message = ""
+        if self.geometry_role is not None and self._measurement_hint_timer.isActive():
+            self._measurement_hint_timer.stop()
+            self._measurement_hint_photo = None
+            self._measurement_hint_text = ""
+        if getattr(self, "step", None) == 2 and not self.selection.points:
+            if self.geometry_role == "import_roi":
+                message = "未能自动识别有效画面\n请拖出矩形密度检测区域。松开后自动测量，完成测量后才能进入下一步。"
+            elif self.geometry_role == "include":
+                message = "请绘制密度检测区域\n从画面内按住鼠标拖动，松开后开始测量。"
+            elif (self.geometry_role is None and self.current_photo()
+                  and self._measurement_hint_timer.isActive()
+                  and self.current_photo()["id"] == self._measurement_hint_photo
+                  and not self.tasks.busy):
+                message = self._measurement_hint_text
+        self.canvas_stack.set_drawing_hint(message)
+
+    def clear_measurement_hint(self):
+        self._measurement_hint_timer.stop()
+        self._measurement_hint_photo = None
+        self._measurement_hint_text = ""
+        if not self.closing:
+            self.sync_drawing_hint()
+
+    def stage_toggled(self, index, checked):
+        """Apply a selected stage once for mouse, keyboard and accessibility."""
+        if not checked or not hasattr(self, "step"):
+            return
+        target = canonical_stage(index)
+        if target == self.step:
+            # The historical hidden stage 1 aliases the visible stage 2.
+            if target != index:
+                self.stage_buttons[target].setChecked(True)
+            return
+        self.navigate_stage(target)
+
     def navigate_stage(self, index):
         index = canonical_stage(index)
         photo = self.current_photo()
         if index == self.step and (self.geometry_role or self._straighten_panel is not None):
             return
+        if index > 2 and photo and not photo["initial_job"] and not self.tasks.busy:
+            # An undetected first frame must be explicitly located before
+            # its density can be measured. Reopen the same source-bound
+            # locator if the user exited it and then tries to continue.
+            pending = getattr(self, "_import_roi_retry", None)
+            locating = self.geometry_role == "import_roi"
+            if not locating and pending:
+                from .workflow_import_roi import offer_import_roi
+
+                try:
+                    locating = offer_import_roi(self, pending, "No reliable picture rectangle")
+                except (OSError, TypeError, ValueError):
+                    # The temporary locator may have been removed. A normal
+                    # import retry can create a fresh, source-bound locator.
+                    self.__dict__.pop("_import_roi_retry", None)
+            if locating:
+                self.stage_buttons[2].setChecked(True)
+                self.region_done.remind()
+                self.sync_drawing_hint()
+                self.status_message("请在有效画面内拖出矩形密度检测区域，完成测量后才能进入下一步")
+                return
         if index > self.step and self.remind_pending_drawing():
             self.stage_buttons[self.step].setChecked(True)
             return
@@ -1414,6 +1512,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             index = canonical_stage(index)
         except ValueError:
             return
+        if index != 2 and self._measurement_hint_timer.isActive():
+            self.clear_measurement_hint()
         if not self.flush_advanced():
             if hasattr(self, "step"):
                 self.stage_buttons[self.step].setChecked(True)
@@ -1531,7 +1631,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.lens_correction_button.setEnabled(
                 bool(photo and self.import_lens_context
                      and self.import_lens_context[0] == self.import_preview_context()
-                     and self.import_lens_context[1] and not busy)
+                     and self.import_lens_context[1] and not busy
+                     and photo["base"].get("raw_import") != "standard-mono-v1")
             )
             self.native_film.setEnabled(ready and not busy)
             for control in self.orientation_buttons.values():
@@ -1594,11 +1695,12 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                     panel.rebase(recipe)
                 panel.setEnabled(ready and not busy)
                 panel.setVisible(bool(panel.groups))
-            self.input_choice.setCurrentIndex(
-                self.input_choice.findData(photo["source_mode"])
-            )
+            input_mode = ("mono_rgb" if recipe.get("raw_import") == "standard-mono-v1"
+                          else photo["source_mode"])
+            self.input_choice.setCurrentIndex(self.input_choice.findData(input_mode))
             self.context.setText(
-                ("黑白 · 单张 RAW" if bw else "彩负 · RGB 三张")
+                ("黑白 · 单张 RAW" if bw else "单色 RGB · 三张 RAW"
+                 if input_mode == "mono_rgb" else "拜耳 RGB · 三张 RAW")
                 + "   |   "
                 + ("NegPy · 黑白原生" if bw else "NegPy · 密度测量参考"
                    if self.step == 2 else ENGINES[engine])
@@ -1709,9 +1811,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.highlight_effect_clear.setEnabled(bool(effect_area) and ready and not busy)
             self.highlight_effect_draw.setEnabled(ready and not busy)
             self.highlight_effect_note.setText(
-                f"已添加 {len(effect_area['include'])} 个作用区。橙色为作用区，青色为参考区，绿色为保护区。"
+                f"已添加 {len(effect_area['include'])} 个作用区，区内按亮度筛选高光。橙色为作用区，青色为参考区，绿色为保护区。"
                 if effect_area else
-                "高光找回作用于全图。添加作用区后可调整羽化；保护区内减弱高光找回。"
+                "高光找回作用于全图。添加作用区后按亮度筛选高光；保护区内减弱找回。"
             )
             self.highlight_note.setText(
                 ("正在使用手动高光参考。青色框为参考，绿色框为保护。"
@@ -1731,9 +1833,11 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 else "中性曲线 · 使用公开算法演算，胶片原曲线面板需要本机资源配方。"
             )
             self.engine_note.setText(flex_note if engine == "flex" else "")
+            highlight_refresh = ready and self.project.highlight_reprocess_required(photo)
             self.canvas_title.setText(
                 Path(raw[0]).stem
                 + (" · 待核对导入" if not ready else
+                   " · 高光算法已更新，需重新生成完整版本" if highlight_refresh else
                    " · 调整已自动保存" if self.project.dirty() else " · 完整版本已就绪")
             )
             self.canvas_title.setToolTip(self.canvas_title.text())
@@ -1741,9 +1845,17 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.repair_button.setText(
                 "保存并打开 PURE Neg…" if self.project.dirty() else "PURE Neg 除尘与审核…")
             self.repair_button.setToolTip(
+                "高光算法已更新。生成新版后需要重新审核除尘；原版本与审核保留。"
+                if highlight_refresh else
                 "保存当前完整分辨率版本后自动打开除尘审核。" if self.project.dirty()
                 else "使用当前保存版本进入 PURE Neg 检测、画笔修整及审核。")
+            checked_photos = [self.project.photo(key) for key in self.project.data["checked"]]
+            export_refresh = any(self.project.highlight_reprocess_required(item) for item in checked_photos) if checked_photos else highlight_refresh
+            self.export_old_highlight_button.setVisible(bool(highlight_refresh))
+            self.export_old_highlight_button.setEnabled(bool(highlight_refresh) and not busy)
             self.export_note.setText(
+                "高光算法已更新，导出会生成新版；原版本除尘保留，需重新审核。"
+                if export_refresh else
                 f"已勾选 {len(self.project.data['checked'])} 张；按各照片自动保存的当前参数导出"
                 if self.project.data["checked"]
                 else "按当前自动保存的参数导出；需要时自动生成完整成片"
@@ -1753,6 +1865,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.sync_history_actions()
             self.sync_crop_controls()
             self.sync_flatfield_controls()
+            self.sync_drawing_hint()
 
     def refresh_photos(self):
         self.photo_list.blockSignals(True)
@@ -1764,7 +1877,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             job = self.project.saved_job(photo)
             if job:
                 saved_jobs[photo["id"]] = job
-            state = ("完整版本" if job and not self.project.dirty(photo, saved=job)
+            state = ("高光需重新生成" if job and self.project.highlight_reprocess_required(photo, saved=job)
+                     else "完整版本" if job and not self.project.dirty(photo, saved=job)
                      else "调整已保存" if photo["initial_job"] else "待导入")
             item = QListWidgetItem(
                 Path(photo["base"]["raw"][0]).stem
@@ -2100,6 +2214,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         context = self.import_preview_context()
         if context is None:
             return
+        self._import_preview_request = getattr(self, "_import_preview_request", 0) + 1
+        request_id = self._import_preview_request
         from .workflow_import_preview import import_preview
         from .raw_import import is_standard_import
         from .raw_lens_correction import camera_lens_info
@@ -2110,10 +2226,13 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             return
         icc = self.display_icc
         needs_image = not self.current_photo()["initial_job"]
-        supported = is_standard_import(self.current_photo()["base"].get("raw_import"))
+        policy = self.current_photo()["base"].get("raw_import")
+        supported = is_standard_import(policy) and policy != "standard-mono-v1"
 
         def prepare():
             equipment = camera_lens_info(paths, supported)
+            if policy == "standard-mono-v1":
+                equipment = (equipment[0], False, "单色 RGB 暂不支持 RAW 内嵌镜头矫正。")
             try:
                 image = import_preview(paths, icc) if needs_image else None
             except Exception:
@@ -2123,7 +2242,14 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         work = Work(context, prepare)
         work.signals.done.connect(self.show_import_preview)
         work.signals.failed.connect(self.import_preview_failed)
-        self.pool.start(work)
+        def start():
+            if (request_id == self._import_preview_request
+                    and context == self.import_preview_context()):
+                self.pool.start(work)
+
+        gate = getattr(self, "prewarm_gate", None)
+        if gate is None or not gate.defer(start, lambda error: self.import_preview_failed(context, str(error))):
+            start()
 
     def show_import_preview(self, context, result):
         if context != self.import_preview_context():
@@ -2185,15 +2311,28 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         )
         self.sync_controls()
 
+    def input_extensions(self):
+        if self.input_choice.currentData() != "mono_rgb":
+            return {".rw2", ".dng"}
+        from negpy.infrastructure.loaders.constants import (
+            SUPPORTED_JPEG_EXTENSIONS, SUPPORTED_JXL_EXTENSIONS,
+            SUPPORTED_RAW_EXTENSIONS, SUPPORTED_TIFF_EXTENSIONS,
+        )
+
+        return (SUPPORTED_RAW_EXTENSIONS - SUPPORTED_JPEG_EXTENSIONS
+                - SUPPORTED_JXL_EXTENSIONS - SUPPORTED_TIFF_EXTENSIONS)
+
     def import_files(self):
+        extensions = sorted(self.input_extensions())
+        patterns = " ".join(f"*{suffix} *{suffix.upper()}" for suffix in extensions)
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "选择原始 RAW",
             str(Path.home() / "Pictures"),
-            "RAW (*.RW2 *.rw2 *.DNG *.dng)",
+            f"RAW ({patterns});;所有文件 (*)",
         )
         if paths:
-            self.import_paths(paths, self.input_choice.currentData())
+            self.import_paths(paths, self.input_choice.currentData(), explicit_files=True)
 
     def import_folder(self):
         path = QFileDialog.getExistingDirectory(
@@ -2203,25 +2342,30 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             return
         self.status_message("正在扫描素材文件夹…")
         QApplication.processEvents()
+        extensions = self.input_extensions()
         paths = sorted(
             p
             for p in Path(path).rglob("*")
-            if p.is_file() and p.suffix.lower() in (".rw2", ".dng")
+            if p.is_file() and p.suffix.lower() in extensions
         )
         self.import_paths(paths, self.input_choice.currentData())
 
-    def import_paths(self, paths, source_mode):
+    def import_paths(self, paths, source_mode, *, explicit_files=False):
         if self.tasks.busy:
             self.error("请先完成或取消当前任务")
             return
         try:
             groups = {}
-            for path in sorted(str(Path(p).resolve()) for p in paths):
-                groups.setdefault(
-                    (str(Path(path).parent), Path(path).suffix.lower()), []
-                ).append(path)
+            ordered_paths = sorted(str(Path(p).resolve()) for p in paths)
+            if source_mode == "mono_rgb" and explicit_files and len(ordered_paths) == 3:
+                groups[None] = ordered_paths
+            else:
+                for path in ordered_paths:
+                    groups.setdefault(
+                        (str(Path(path).parent), Path(path).suffix.lower()), []
+                    ).append(path)
             if not groups:
-                raise ValueError("未找到支持的 RW2／DNG 文件")
+                raise ValueError("未找到支持的 RAW 文件")
             if source_mode == "bw":
                 for values in groups.values():
                     for path in values:
@@ -2236,7 +2380,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 usable = len(values) - len(values) % 3
                 pending.extend(values[i : i + 3] for i in range(0, usable, 3))
                 if usable != len(values):
-                    skipped[str(Path(values[0]).parent)] = len(values) - usable
+                    directory = str(Path(values[0]).parent)
+                    skipped[directory] = skipped.get(directory, 0) + len(values) - usable
             if skipped:
                 summary = "、".join(
                     f"{Path(directory).name or directory} 剩 {count} 张"
@@ -2257,8 +2402,16 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                         "请让每个目录的 RAW 数量为 3 的倍数，或用「选择 RAW 文件」逐组选择。",
                     )
                     return
-            self.pending_probe = pending
-            self.probe_next()
+            if source_mode == "mono_rgb":
+                for raw in pending:
+                    self.project.add_photo(raw, source_mode)
+                self.refresh_photos()
+                self.set_stage(0)
+                self.select_photo(self.project.data["current"])
+                self.status_message("单色 RGB 已按文件名顺序分配 R/G/B，请核对后导入。")
+            else:
+                self.pending_probe = pending
+                self.probe_next()
         except Exception as error:
             self.error(error)
 
@@ -2292,7 +2445,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             if raw != photo["base"]["raw"]:
                 recipe = self.project.recipe()
                 flatfield = recipe.get("flatfield")
-                photo = self.project.add_photo(raw, "rgb")
+                source_mode = ("mono_rgb" if photo["base"].get("raw_import") == "standard-mono-v1"
+                               else "rgb")
+                photo = self.project.add_photo(raw, source_mode)
                 if flatfield:
                     self.project.set_flatfield(flatfield, strength=recipe.get("flatfield_strength", 1.0))
                 if recipe.get("lens_correction"):
@@ -2774,7 +2929,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         photo, context = self.current_photo(), self.shown_context
         if self.geometry_role in (None, "import_roi") or not photo or not photo.get("source_shape"):
             return False
-        if self.geometry_role == "crop":
+        if (self.geometry_role == "crop" or
+                (self.geometry_role in ("highlight", "highlight_effect", "highlight_protect")
+                 and getattr(self, "highlight_full_source", False))):
             # Keep the complete source locator while the rendered canvas is
             # cropped/straightened; otherwise the next preview would hide
             # everything outside the existing crop and prevent expanding it.
@@ -2783,7 +2940,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             return refresh_crop_frame(self)
         if self.selection.crop_handles.bounds is not None:
             self.selection.crop_handles.configure(None, 0)
-        if (self.geometry_role in ("meter_grid", "highlight", "highlight_effect", "highlight_protect")
+        if (self.geometry_role == "meter_grid"
                 and self.selection.source_photo_id == photo["id"]
                 and self.selection.geometry_info
                 and not self.selection.geometry_info.get("preview_kind")):
@@ -2801,11 +2958,6 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             # Its existing full-source positioning view remains authoritative.
             return False
         shown_rectangle = output_rectangle(shown_recipe, photo["analysis_roi"], photo["source_shape"])
-        if (self.geometry_role in ("highlight", "highlight_effect", "highlight_protect")
-                and shown_rectangle != [0, 0, photo["source_shape"][1], photo["source_shape"][0]]):
-            # A cropped preview hides source pixels. Use the complete positive
-            # locator so a reference remains selectable outside the crop.
-            return False
         if self.geometry_role == "meter_grid":
             a, b, c, d = self.project.recipe()["roi"] or photo["analysis_roi"]
             desired_rectangle = output_rectangle(
@@ -2821,6 +2973,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             output_orientation=shown_recipe.get("output_orientation"),
             overlays=overlays, grid=grid, preserve_view=True,
         )
+        self.selection.source_photo_id = photo["id"]
         self.selection.drawing_enabled = self.geometry_role not in ("inspect", "meter_grid")
         self.selection.shape_kind = (self.shape_choice.currentData()
                                      if self.geometry_role in ("include", "exclude", "highlight_protect") else "rectangle")
@@ -2839,22 +2992,41 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 raise ValueError("请先完成源准备，并等待当前处理结束")
             if role != self.geometry_role:
                 self.selection.cancel_drawing()
+                if (self.geometry_role in ("highlight", "highlight_effect", "highlight_protect")
+                        and getattr(self, "highlight_full_source", False)):
+                    self.cancel_highlight_locator()
             if role == "crop":
                 from .workflow_crop_preview import begin_crop_selection
 
-                begin_crop_selection(self)
+                try:
+                    begin_crop_selection(self)
+                except Exception as error:
+                    self.preview_failed(self.token, str(error))
                 return
+            if role in ("highlight", "highlight_effect", "highlight_protect"):
+                self.highlight_full_source = False
             previous_role, self.geometry_role = self.geometry_role, role
             if self.refresh_selection_preview():
                 self.canvas_stack.setCurrentWidget(self.selection)
                 self.show_region_exit()
                 self.status_message("格内为 RGB 平均光密度；悬停查看 RGB 分量、范围及有效样本。"
                                     if role == "meter_grid" else
-                                    "框选高光作用区。橙色为作用区，青色为参考区，绿色为保护区。"
+                                    "框选需要找回高光的区域。橙色为作用区，青色为参考区，绿色为保护区。"
                                     if role == "highlight_effect" else
                                     "在画面上绘制高光参考。青色为参考区，绿色为保护区。"
                                     if role == "highlight" else
                                     "在当前正像上绘制；选区和异常策略自动更新预览，可连续绘制。")
+                return
+            if role in ("highlight", "highlight_effect", "highlight_protect"):
+                self.highlight_full_source = True
+                self.canvas_stack.setCurrentWidget(self.canvas)
+                self.show_region_exit()
+                from .workflow_crop_preview import request_crop_frame
+
+                try:
+                    request_crop_frame(self)
+                except Exception as error:
+                    self.preview_failed(self.token, str(error))
                 return
             self.geometry_role = previous_role
             source_job = self.project.source_job()
@@ -2903,7 +3075,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.status_message(
                 "完整源分区网格；点击选择分区，悬停查看 RGB 光密度。"
                 if role == "meter_grid" else
-                "在完整源画面框选高光作用区。橙色为作用区，青色为参考区，绿色为保护区。"
+                "在完整源画面框选需要找回高光的区域。橙色为作用区，青色为参考区，绿色为保护区。"
                 if role == "highlight_effect" else
                 "在完整源画面绘制高光参考。青色为参考区，绿色为保护区。"
                 if role == "highlight" else
@@ -2912,13 +3084,57 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         except Exception as error:
             self.error(error)
 
+    def toggle_highlight_frame(self):
+        if self.geometry_role not in ("highlight", "highlight_effect", "highlight_protect"):
+            return
+        self.selection.cancel_drawing()
+        if not getattr(self, "highlight_full_source", False):
+            self.highlight_full_source = True
+            self.canvas_stack.setCurrentWidget(self.canvas)
+            self.show_region_exit()
+            from .workflow_crop_preview import request_crop_frame
+
+            try:
+                request_crop_frame(self)
+            except Exception as error:
+                self.preview_failed(self.token, str(error))
+            return
+        self.highlight_full_source = False
+        if not self.refresh_selection_preview():
+            self.highlight_full_source = True
+            self.show_region_exit()
+            self.status_message("当前画面的几何变换不能精确映射选区，请使用完整源画面。")
+            return
+        self.cancel_highlight_locator()
+        self.canvas_stack.setCurrentWidget(self.selection)
+        self.show_region_exit()
+        shown, desired = self.shown_context or {}, self.preview_context() or {}
+        if any(shown.get(key) != desired.get(key) for key in ("photo", "engine", "recipe_sha256")):
+            self.preview_timer.start()
+
+    def cancel_highlight_locator(self):
+        pending = getattr(self, "crop_locator_pending", None)
+        self.crop_locator_pending = None
+        if pending and pending.get("token") == self.token:
+            self.token += 1
+            self.live.invalidate(self.token)
+            if self.preview_activity.active and self.preview_activity.token == pending["token"]:
+                self.preview_activity.finish(pending["token"], message="已取消完整画面预览")
+            self.set_preview_updating(False)
+
     def show_region_exit(self):
+        self.sync_drawing_hint()
         self.region_done.setText({
             "crop": "完成裁切",
             "meter_grid": "关闭分区网格",
             "import_roi": "退出导入画面定位",
         }.get(self.geometry_role, "退出绘制"))
         self.region_done.show()
+        highlight_role = self.geometry_role in ("highlight", "highlight_effect", "highlight_protect")
+        self.highlight_frame_toggle.setVisible(highlight_role)
+        self.highlight_frame_toggle.setText(
+            "返回当前画面" if getattr(self, "highlight_full_source", False) else "显示完整源画面"
+        )
         self.region_done.set_attention(True)
         self.zone_note.setVisible(self.geometry_role == "meter_grid")
         self.meter_grid_button.setText(
@@ -2942,6 +3158,11 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
 
     def finish_selection(self):
         was_crop = self.geometry_role == "crop"
+        was_full_highlight = (self.geometry_role in ("highlight", "highlight_effect", "highlight_protect")
+                              and getattr(self, "highlight_full_source", False))
+        if was_full_highlight:
+            self.cancel_highlight_locator()
+        self.highlight_full_source = False
         self.__dict__.pop("_import_roi_context", None)
         self.geometry_role = None
         if hasattr(self, "canvas_stack"):
@@ -2950,14 +3171,16 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             if self._straighten_panel is not None:
                 self._exit_straighten_draw(message=None)
             self.canvas_stack.setCurrentWidget(self.canvas)
+            self.sync_drawing_hint()
             self.region_done.set_attention(False)
             self.region_done.setText("退出绘制")
             self.meter_grid_button.setText("显示分区网格与数值")
             self.region_done.hide()
+            self.highlight_frame_toggle.hide()
             self.zone_note.hide()
             self.zone_menu.close()
             self.selection.selected_zone = None
-        if was_crop:
+        if was_crop or was_full_highlight:
             self.crop_locator_pending = None
             photo = self.current_photo()
             shown, desired = self.shown_context or {}, self.preview_context() or {}
@@ -3246,9 +3469,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.probe_next()
                 return
             if action == "render":
+                binding = self.project.data["jobs"][request["id"]]
+                first_import = self.project.photo(binding["photo"])["initial_job"] is None
                 sample, manifest = self.project.completed(request["id"])
                 self.flatfield_rendered(request, manifest)
-                binding = self.project.data["jobs"][request["id"]]
                 if request.get("import_stage") is not None:
                     failed_id = getattr(self, "failed_request", {}).get("id")
                     failed_binding = self.project.data["jobs"].get(failed_id, {})
@@ -3268,6 +3492,22 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.status_message(
                     "完整分辨率版本已保存，RGB16／ICC 已通过现有输出核对。"
                 )
+                if (first_import and request.get("import_stage") is not None and self.step == 2
+                        and binding["photo"] == self.project.data["current"]
+                        and manifest.get("density_window")):
+                    from .picture import AUTO_PICTURE_INSET
+
+                    region = manifest.get("picture_region") or {}
+                    inset = region.get("inset_per_side") if isinstance(region, dict) else None
+                    automatic_80 = (request["recipe"].get("roi") is None
+                                    and type(inset) in (int, float)
+                                    and abs(inset - AUTO_PICTURE_INSET) < 1e-12)
+                    prefix = ("已自动测量中心约 80% 画面。" if automatic_80
+                              else "密度测量已完成。")
+                    self._measurement_hint_photo = binding["photo"]
+                    self._measurement_hint_text = prefix + "可直接进入转换调色，也可手动重选区域。"
+                    self._measurement_hint_timer.start(5000)
+                    self.sync_drawing_hint()
                 self.job_saved.emit(request["id"])
             elif action == "export_batch":
                 report = result["report"]
@@ -3468,6 +3708,44 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.preview_activity.finish(self.token, state="failed", message="高清预览失败：" + str(error))
             self.status_message("高清预览未更新：" + str(error))
 
+    def _start_display_work(self, work, current, abandon, failed):
+        """Wait for decode prewarm without losing ownership of display inputs."""
+        pending = getattr(self, "_deferred_display_work", None)
+        if pending is None:
+            pending = self._deferred_display_work = {}
+        marker = object()
+
+        def cancel():
+            if pending.pop(marker, None) is not None:
+                try:
+                    abandon()
+                except OSError as error:
+                    from .diagnostics import failure
+
+                    failure("deferred_display_cleanup_failed", error)
+
+        def start(check_current=True):
+            if marker not in pending:
+                return
+            if check_current and (self.closing or not current()):
+                cancel()
+                return
+            self.pool.start(work)
+            pending.pop(marker, None)
+
+        def on_error(error):
+            cancel()
+            failed(str(error))
+
+        pending[marker] = cancel
+        try:
+            gate = getattr(self, "prewarm_gate", None)
+            if gate is None or not gate.defer(start, on_error):
+                start(check_current=False)
+        except Exception:
+            cancel()
+            raise
+
     def load_detail_records(self, event):
         token = event["token"]
         context = self.detail_contexts.get(token)
@@ -3520,10 +3798,18 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.preview_activity.finish(result_token, state="failed", message="高清预览失败：" + str(message))
                 self.status_message("高清预览未更新：" + str(message))
         work.signals.failed.connect(failed)
-        self.pool.start(work)
+        WorkflowWindow._start_display_work(
+            self,
+            work,
+            lambda: self._detail_context_matches(context, token),
+            lambda: self.live.discard(event),
+            lambda message: failed(token, message),
+        )
 
     def request_preview(self, full=False):
-        if self.geometry_role == "crop":
+        if (self.geometry_role == "crop"
+                or (self.geometry_role in ("highlight", "highlight_effect", "highlight_protect")
+                    and getattr(self, "highlight_full_source", False))):
             from .workflow_crop_preview import request_crop_frame
 
             try:
@@ -3847,10 +4133,34 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                     and owns_activity()):
                 self.base_display_failed(result_token, message)
         work.signals.failed.connect(failed)
-        self.pool.start(work)
+        def abandon():
+            if self.base_display_pending == (display_serial, token):
+                self.base_display_pending = None
+            try:
+                if lease is not None:
+                    lease.release()
+            finally:
+                if temporary:
+                    self.live.discard(temporary)
+
+        def current_display():
+            photo = self.current_photo()
+            return bool(photo and context and context.get("photo") == photo["id"]
+                        and (not display_only or (
+                            display_serial == self.display_serial
+                            and display_revision == self.display_revision
+                        ))
+                        and (display_only or token == self.token))
+
+        WorkflowWindow._start_display_work(
+            self, work, current_display, abandon, lambda message: failed(token, message),
+        )
 
     def base_display_failed(self, token, message):
         if token == self.token:
+            pending = getattr(self, "crop_locator_pending", None)
+            if pending and pending.get("token") == token:
+                self.crop_locator_pending = None
             activity = getattr(self, "preview_activity", None)
             diagnostic_event("preview_failed", token=token, message=str(message))
             self.session_events.append(dict(event="preview_failed", token=token, status="failed"))
@@ -3890,6 +4200,19 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         try:
             destination = Path(self.export_directory.text()).expanduser().resolve()
             request = self.project.export_request(destination)
+            destination.mkdir(parents=True, exist_ok=True)
+            self.stop_preview()
+            self.tasks.start(request)
+            self.sync_controls()
+        except Exception as error:
+            self.error(error)
+
+    def export_previous_highlight(self):
+        if self.tasks.busy or not self.current_photo():
+            return
+        try:
+            destination = Path(self.export_directory.text()).expanduser().resolve()
+            request = self.project.export_previous_highlight_request(destination)
             destination.mkdir(parents=True, exist_ok=True)
             self.stop_preview()
             self.tasks.start(request)
@@ -4059,26 +4382,26 @@ def main():
     app.setWindowIcon(application_icon())
     # Frost every dialog, alert, menu and combo popup with native vibrancy.
     install_glass_surfaces(app)
+    from .workflow_startup import choose_workspace
+
+    choice = choose_workspace(
+        ROOT, explicit_workspace=args.workspace, ready_report=args.ready_report
+    )
+    if choice.project is None:
+        from .workflow_shutdown import dispose_application
+
+        dispose_application(app, None)
+        return 0
     splash = create_splash()
     splash.show()
     app.processEvents()
     preferences = ROOT / "outputs/workflow-ui-state/preferences.json"
-    previous = (
-        json.loads(preferences.read_text()).get("workspace")
-        if preferences.exists()
-        else None
-    )
-    if previous and not (Path(previous) / "workspace.json").exists():
-        previous = None
-    project = args.workspace or (
-        Path(previous)
-        if previous
-        else ROOT / "outputs/ui-projects" / ("v35-" + uuid.uuid4().hex[:10])
-    )
+    project = choice.project
     window = WorkflowWindow(project, srgb=args.srgb)
     if args.stage is not None:
         window.set_stage(args.stage)
-    write_json(preferences, dict(workspace=str(project)))
+    if choice.preferences is not None:
+        write_json(preferences, choice.preferences)
     window.showMaximized()
     window.update_notice.schedule()
     if args.settings:

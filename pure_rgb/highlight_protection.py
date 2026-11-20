@@ -21,6 +21,11 @@ VERSION = 1
 RULE = "explicit region=1; outside distance/feather smoothstep to0; no inward erosion"
 
 
+def automatic_highlight_feather(source_shape):
+    """Use a source-sized transition in addition to the user feather."""
+    return min(256.0, min(source_shape[:2]) * 0.02)
+
+
 def _canonical(document):
     return json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -64,7 +69,8 @@ def _feather(selection, feather_pixels, dtype):
 
 
 def build_highlight_protection(source_shape, source_key, *, include,
-                               feather_pixels=64., dtype="float32"):
+                               feather_pixels=64., dtype="float32",
+                               automatic_feather_pixels=0.):
     """Build a full-source shared RGB mask from explicit vector annotations."""
     source_key = _source_key(source_key)
     if not isinstance(include, (list, tuple)) or not include:
@@ -77,13 +83,21 @@ def build_highlight_protection(source_shape, source_key, *, include,
         raise ValueError("Protection feather must be finite original-source pixels in [0,512]") from error
     if not math.isfinite(feather_pixels) or not 0 <= feather_pixels <= 512:
         raise ValueError("Protection feather must be finite original-source pixels in [0,512]")
+    if type(automatic_feather_pixels) not in (int, float):
+        raise ValueError("Automatic feather must be finite original-source pixels in [0,256]")
+    try:
+        automatic_feather_pixels = float(automatic_feather_pixels)
+    except OverflowError as error:
+        raise ValueError("Automatic feather must be finite original-source pixels in [0,256]") from error
+    if not math.isfinite(automatic_feather_pixels) or not 0 <= automatic_feather_pixels <= 256:
+        raise ValueError("Automatic feather must be finite original-source pixels in [0,256]")
     if dtype not in ("float32", "float64"):
         raise ValueError("Protection mask dtype must match float32/64 positive RGB")
     if not isinstance(source_shape, (tuple, list)) or len(source_shape) != 3 or source_shape[-1] != 3:
         raise ValueError("Protection requires the explicit full HWC RGB source shape")
     # Original vector rasterizer validates all shape integers and coordinates.
     selection = build_metering_mask(source_shape, (0, 0, source_shape[1], source_shape[0]), include=include)
-    mask = _feather(selection, float(feather_pixels), dtype)
+    mask = _feather(selection, float(feather_pixels) + automatic_feather_pixels, dtype)
     receipt = {
         "schema": SCHEMA, "version": VERSION, "source_shape": list(selection.source_shape),
         "source_key": source_key, "coordinate_space": "full oriented merged source pixel centres",
@@ -94,6 +108,8 @@ def build_highlight_protection(source_shape, source_key, *, include,
         "RGB_support_shared": True, "source_pixels_read_or_modified": False,
         "external_source_authenticity_certified": False,
     }
+    if automatic_feather_pixels:
+        receipt["automatic_feather_pixels"] = float(automatic_feather_pixels)
     receipt["receipt_sha256"] = hashlib.sha256(_canonical(receipt).encode()).hexdigest()
     return HighlightProtection(mask, _canonical(receipt))
 
@@ -118,7 +134,8 @@ def restore_highlight_protection(document, *, source_shape, source_key):
             raise ValueError("Protection must remain a full-source explicit inclusion")
         result = build_highlight_protection(
             source_shape, source_key, include=vector.spec["include"],
-            feather_pixels=receipt["feather_pixels"], dtype=receipt["dtype"])
+            feather_pixels=receipt["feather_pixels"], dtype=receipt["dtype"],
+            automatic_feather_pixels=receipt.get("automatic_feather_pixels", 0.))
         if result.canonical_receipt != encoded:
             raise ValueError("Protection receipt, vector raster or feather implementation differs")
         return result

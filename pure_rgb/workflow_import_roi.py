@@ -1,5 +1,6 @@
 """Recover a failed first picture detection using its existing source locator."""
 
+from copy import deepcopy
 import json
 from pathlib import Path
 
@@ -23,11 +24,17 @@ def offer_import_roi(window, request, message):
             or any(type(geometry.get(key)) is not int or geometry[key] < 16
                    for key in ("width", "height"))):
         raise ValueError("首次导入正像定位图不可用，请重试导入")
-    if window.step != 0:
-        window.set_stage(0)
-        if window.step != 0:
+    # Detection failure is recoverable in the same frame-and-measurement
+    # stage where the user expects to inspect the picture.  Enter it before
+    # activating the locator because set_stage() clears the previous tool.
+    if window.step != 2:
+        window.set_stage(2)
+        if window.step != 2:
             return False
     window.selection.set_geometry(geometry, source_id=photo["id"], positive=True)
+    # Keep a source-bound retry so exiting the tool does not strand a photo
+    # when the user later clicks the next stage.
+    window._import_roi_retry = deepcopy(request)
     window._import_roi_context = dict(photo=photo["id"], geometry=geometry,
                                       source_key=source)
     window.geometry_role = "import_roi"
@@ -37,7 +44,7 @@ def offer_import_roi(window, request, message):
     window.canvas_stack.setCurrentWidget(window.selection)
     window.show_region_exit()
     window.sync_controls()
-    window.status_message("自动画面定位未通过。请在正像上拖框圈出有效画面，松开后自动继续导入。")
+    window.status_message("自动画面定位未通过。请在正像上拖框圈出有效画面，松开后自动继续导入与密度测量。")
     return True
 
 
@@ -55,6 +62,7 @@ def accept_import_roi(window, bounds):
     recipe = window.project.recipe()
     recipe["roi"] = list(bounds)
     window.project.set_recipe(recipe, label="首次导入手动画面范围")
+    window.__dict__.pop("_import_roi_retry", None)
     window.finish_selection()
     window.sync_controls()
     window.confirm_import()

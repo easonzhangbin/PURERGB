@@ -44,7 +44,12 @@ class ImmutableSourceCertificate:
             raise ValueError("Preview source requires original C-order float32 RGB")
         backing = source.tobytes(order="C")
         frozen = np.frombuffer(backing, dtype=source.dtype).reshape(source.shape)
-        if not np.isfinite(frozen).all():
+        flat = frozen.reshape(-1)
+        chunk_size = 4 * 1024 * 1024
+        if not all(
+            np.isfinite(flat[start : start + chunk_size]).all()
+            for start in range(0, flat.size, chunk_size)
+        ):
             raise ValueError("Preview source contains nonfinite values")
         instance = cls.__new__(cls)
         instance.source, instance._backing = frozen, backing

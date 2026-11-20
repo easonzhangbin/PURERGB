@@ -84,8 +84,9 @@ def compute_scopes(pixels, *, max_pixels=1_048_576):
     parade = np.stack([density(values[..., channel] >> 8) for channel in range(3)])
     histogram = np.concatenate((parade.sum(axis=2, dtype=np.uint32),
                                 waveform.sum(axis=1, dtype=np.uint32)[None]), axis=0)
-    clipped = np.stack(((sampled == 0).sum(axis=(0, 1)),
-                        (sampled == 65535).sum(axis=(0, 1))), axis=1).astype(np.uint32)
+    clipped = np.array([[np.count_nonzero(sampled[..., channel] == endpoint)
+                         for endpoint in (0, 65535)]
+                        for channel in range(3)], dtype=np.uint32)
     for array in (waveform, parade, histogram, clipped):
         array.setflags(write=False)
     return ScopeData(waveform=waveform, parade=parade, histogram=histogram,

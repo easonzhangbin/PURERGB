@@ -34,6 +34,8 @@ class LivePreview(QObject):
         self.cache_report = {}
         self.cached_source_context = None
         self.performance = None
+        self.prewarm_gate = None
+        self._gate_waiting = False
         self.restarting = False
         self.superseded_token = None
         self.supersession_timer = QTimer(self)
@@ -102,9 +104,32 @@ class LivePreview(QObject):
         self._notify_superseded()
         self.pump()
 
-    def pump(self):
+    def pump(self, gate_checked=False):
         if self.active or not self.pending or self.stopping or self.restarting:
             return
+        if self._gate_waiting:
+            return
+        if self.prewarm_gate is not None and not gate_checked:
+            def resume():
+                self._gate_waiting = False
+                self.pump(gate_checked=True)
+
+            def resume_failed(error):
+                self._gate_waiting = False
+                self.pending = None
+                self.active = None
+                if self.process is not None:
+                    if self.process.state() == QProcess.ProcessState.NotRunning:
+                        self.process.deleteLater()
+                        self.process = None
+                    else:
+                        self.process.kill()
+                if not self.stopping:
+                    self.failed.emit(self.latest, "无法启动画面预览：" + str(error))
+
+            if self.prewarm_gate.defer(resume, resume_failed):
+                self._gate_waiting = True
+                return
         if self.process is None:
             self.buffer, self.errors = b"", ""
             self.cache_report = {}

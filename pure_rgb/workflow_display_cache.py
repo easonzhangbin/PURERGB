@@ -42,6 +42,7 @@ class _SourceEntry:
 
 
 _MAX_SOURCE_ITEM_BYTES = 32 * 1024**2
+_DISPLAY_CODE_CHUNK_ELEMENTS = 2_000_000
 
 
 def _scope_data(pixels, orientation):
@@ -69,10 +70,22 @@ def _file_identity(path):
 def _display_codes(pixels):
     # With odd divisor 257 no uint16 value lies on a half-code tie. This is
     # identical to rint(pixels / 257), without a full-frame float64 temporary.
-    codes = pixels.astype(np.uint32)
-    codes += 128
-    codes //= 257
-    return codes.astype(np.uint8)
+    # Bound the uint32 working copy for a full-resolution display image. This
+    # keeps the common small preview on the direct path and works with strided
+    # source grids without first making a full contiguous copy.
+    if pixels.ndim == 0 or pixels.size <= _DISPLAY_CODE_CHUNK_ELEMENTS:
+        codes = pixels.astype(np.uint32)
+        codes += 128
+        codes //= 257
+        return codes.astype(np.uint8)
+    rows = max(1, _DISPLAY_CODE_CHUNK_ELEMENTS // (pixels.size // pixels.shape[0]))
+    result = np.empty(pixels.shape, dtype=np.uint8)
+    for start in range(0, pixels.shape[0], rows):
+        codes = pixels[start:start + rows].astype(np.uint32)
+        codes += 128
+        codes //= 257
+        result[start:start + rows] = codes
+    return result
 
 
 def _converted_image(pixels, source_icc, target, proof, full, max_edge, workers=1):

@@ -6,7 +6,7 @@ from PIL import Image
 from .workspace import write_json
 
 
-def write_geometry_previews(source, directory):
+def write_geometry_previews(source, directory, *, monochrome=False):
     height, width = source.shape[:2]
     step = max(1, max(height, width) // 1600)
     sample = source[::step, ::step]
@@ -18,8 +18,10 @@ def write_geometry_previews(source, directory):
     diagnostic = directory / "geometry-preview.png"
     _save_preview(transmission, diagnostic)
 
-    # Estimate each channel from inside the film so the rebate does not set
-    # the display endpoints. This image is for positioning, not output.
+    # Estimate each displayed channel from inside the film so the rebate does
+    # not set the display endpoints. This image is for positioning, not output.
+    if monochrome:
+        sample = gray[..., None]
     h, w = sample.shape[:2]
     center = sample[h // 8:h - h // 8, w // 8:w - w // 8]
     low, high = np.quantile(center[::2, ::2], [0.01, 0.99], axis=(0, 1)).astype(np.float32)
@@ -31,7 +33,11 @@ def write_geometry_previews(source, directory):
         "positive_preview": str(positive_path),
         "width": width,
         "height": height,
-        "domain": "Oriented merged transmission; grayscale diagnostic and positive locator",
+        "domain": (
+            "Oriented single RAW transmission; grayscale diagnostic and monochrome positive locator"
+            if monochrome
+            else "Oriented merged transmission; grayscale diagnostic and positive locator"
+        ),
     }
     write_json(directory / "geometry.json", geometry)
     return geometry

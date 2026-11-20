@@ -3,6 +3,12 @@
 import math
 
 
+# Scaling both dimensions by sqrt(0.8) leaves the central 80% of the
+# detected picture area while retaining its aspect ratio (subject to pixels).
+AUTO_PICTURE_AREA_FRACTION = 0.8
+AUTO_PICTURE_INSET = (1.0 - math.sqrt(AUTO_PICTURE_AREA_FRACTION)) / 2.0
+
+
 class NoReliablePictureRectangle(ValueError):
     """NegPy could not identify the film box for automatic metering."""
 
@@ -11,25 +17,23 @@ def normalized_box(rect, shape, inset):
     h, w = shape[:2]
     if not 0 <= inset < 0.2:
         raise ValueError("Picture inset must be between 0 and 0.2")
-    if rect is None:
+    if rect is None or len(rect) != 4 or not all(math.isfinite(v) for v in rect):
         raise NoReliablePictureRectangle(
             "No reliable picture rectangle; provide --roi explicitly"
         )
-    if len(rect) != 4 or not all(math.isfinite(v) for v in rect):
-        raise ValueError("No reliable picture rectangle; provide --roi explicitly")
     x0, y0, x1, y1 = rect
     if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
-        raise ValueError("Invalid detected picture rectangle")
+        raise NoReliablePictureRectangle("No reliable picture rectangle; detected bounds are invalid")
     box = (math.ceil(x0 * w), math.ceil(y0 * h), math.floor(x1 * w), math.floor(y1 * h))
     dx = math.ceil((box[2] - box[0]) * inset)
     dy = math.ceil((box[3] - box[1]) * inset)
     inner = (box[0] + dx, box[1] + dy, box[2] - dx, box[3] - dy)
     if inner[2] - inner[0] < 16 or inner[3] - inner[1] < 16:
-        raise ValueError("Detected picture is too small for metering")
+        raise NoReliablePictureRectangle("No reliable picture rectangle; detected region is too small for metering")
     return box, inner
 
 
-def detect_picture(image, inset=0.02):
+def detect_picture(image, inset=AUTO_PICTURE_INSET):
     from negpy.features.geometry.logic import resolve_meter_rect
     from negpy.features.geometry.models import GeometryConfig
     from negpy.kernel.system.config import APP_CONFIG
@@ -47,13 +51,14 @@ def detect_picture(image, inset=0.02):
     }
 
 
-def _coherent_picture_bounds(gray, polarity):
+def _coherent_picture_bounds(gray, polarity, *, minimum_change=0.08, max_weak_edges=0):
     """Find four rebate-to-picture transitions, measured from outside in."""
     import cv2
     import numpy as np
 
     height, width = gray.shape
     depths, rebate_levels = [], []
+    weak_edges = 0
     for image in (gray, gray.T, gray[:, ::-1], gray[::-1, :].T):
         breadth, extent = image.shape
         line = image[breadth // 4 : breadth - breadth // 4]
@@ -68,7 +73,7 @@ def _coherent_picture_bounds(gray, polarity):
         # A rebate leaves a quiet band and a transition with the right polarity
         # across most of the line, including on frames with sparse lettering.
         scores = np.where(
-            (change >= 0.08) & (coherent >= 0.025) & (quiet_high - quiet_low <= 0.15),
+            (change >= minimum_change) & (coherent >= 0.025) & (quiet_high - quiet_low <= 0.15),
             change * coherent,
             0,
         )
@@ -76,6 +81,10 @@ def _coherent_picture_bounds(gray, polarity):
         score = scores[peak]
         if not score:
             return None
+        if change[peak] < 0.08:
+            weak_edges += 1
+            if weak_edges > max_weak_edges:
+                return None
         scores[max(0, peak - 2 * radius) : peak + 2 * radius + 1] = 0
         if scores.max() >= 0.65 * score:
             return None
@@ -101,7 +110,7 @@ def _coherent_picture_bounds(gray, polarity):
     return left, top, x1, y1
 
 
-def detect_picture_from_locators(geometry, shape, inset=0.02):
+def detect_picture_from_locators(geometry, shape, inset=AUTO_PICTURE_INSET):
     """Accept a fallback only when both full-source locators agree on the frame."""
     from PIL import Image
 
@@ -124,6 +133,14 @@ def detect_picture_from_locators(geometry, shape, inset=0.02):
         return None
     first = _coherent_picture_bounds(transmission, -1)
     second = _coherent_picture_bounds(positive, 1)
+    if first is None and second is not None:
+        # A bright film edge can have less contrast in the compressed
+        # transmission locator than in the positive. Permit one weak edge
+        # only; the positive still has to pass all four strict edge tests and
+        # the two independent locator candidates must agree below.
+        first = _coherent_picture_bounds(
+            transmission, -1, minimum_change=0.055, max_weak_edges=1
+        )
     if first is None or second is None:
         return None
     dimensions = (pw, ph, pw, ph)

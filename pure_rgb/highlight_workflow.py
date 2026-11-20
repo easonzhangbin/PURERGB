@@ -41,7 +41,7 @@ from .native_float_stream import (
 from .positive_float import (
     GAMMA,
     ICC_SHA256,
-    adapt_positive_float,
+    decode_working_oetf_pixels,
     apply_positive_float,
     positive_domain,
     working_icc_bytes,
@@ -448,9 +448,13 @@ def render_highlight_workflow(
             _shape(
                 entry, source.shape
             )  # All source geometry fails before engine calls.
+    from .highlight_protection import automatic_highlight_feather
+
+    automatic_feather = automatic_highlight_feather(source.shape)
     protection = (
         build_highlight_protection(
-            source.shape, source_key, dtype="float64", **recipe["protection"]
+            source.shape, source_key, dtype="float64", **recipe["protection"],
+            automatic_feather_pixels=automatic_feather,
         )
         if recipe["protection"]
         else None
@@ -458,7 +462,8 @@ def render_highlight_workflow(
     protection_layout = _layout(protection.mask) if protection else None
     effect_area = (
         build_highlight_protection(
-            source.shape, source_key, dtype="float64", **recipe["effect_area"]
+            source.shape, source_key, dtype="float64", **recipe["effect_area"],
+            automatic_feather_pixels=automatic_feather,
         )
         if recipe.get("effect_area")
         else None
@@ -553,12 +558,8 @@ def render_highlight_workflow(
     for start in range(0, len(source), block_rows):
         base_part = base[start : start + block_rows]
         ref_part = reference[start : start + block_rows]
-        base_linear = adapt_positive_float(
-            base_part, domain=encoded_domain, icc_bytes=icc
-        ).image
-        ref_linear = adapt_positive_float(
-            ref_part, domain=encoded_domain, icc_bytes=icc
-        ).image
+        base_linear = decode_working_oetf_pixels(base_part, icc_bytes=icc)
+        ref_linear = decode_working_oetf_pixels(ref_part, icc_bytes=icc)
         mask = protection.mask[start : start + len(base_part)] if protection else None
         high, observation = apply_highlight_reference_guarded(
             base_linear,

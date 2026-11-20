@@ -48,6 +48,7 @@ def open_triplet(
         create_processor,
         probe_for_policy,
         STANDARD_DNG_IMPORT,
+        STANDARD_MONO_IMPORT,
         IMPORT_POLICIES,
         checked_registration_check,
     )
@@ -55,27 +56,33 @@ def open_triplet(
     check_baseline()
     if raw_import not in IMPORT_POLICIES:
         raise ValueError("Unknown RAW import policy")
+    if raw_import == STANDARD_MONO_IMPORT and lens_correction:
+        raise ValueError("单色 RGB 暂不支持 RAW 内嵌镜头矫正")
     registration_check = checked_registration_check(raw_import, registration_check)
     paths = [Path(p).resolve(strict=True) for p in paths]
     if (
         len(paths) != 3
         or len(set(paths)) != 3
-        or any(
+        or (raw_import != STANDARD_MONO_IMPORT and any(
             p.suffix.lower()
             != (".dng" if raw_import == STANDARD_DNG_IMPORT else ".rw2")
             for p in paths
-        )
+        ))
     ):
         raise ValueError(
             "Select three distinct files with the explicit import policy's RAW suffix"
         )
-    probe = probe_for_policy(raw_import)
-    triplet, reason = place_triplet({str(p): probe(str(p)) for p in paths})
-    if triplet is None:
-        raise ValueError(f"Triplet classification failed: {reason}")
+    if raw_import == STANDARD_MONO_IMPORT:
+        red, green, blue = map(str, paths)
+    else:
+        probe = probe_for_policy(raw_import)
+        triplet, reason = place_triplet({str(p): probe(str(p)) for p in paths})
+        if triplet is None:
+            raise ValueError(f"Triplet classification failed: {reason}")
+        red, green, blue = triplet.red, triplet.green, triplet.blue
     records = [
         {"role": role, "path": p, "sha256": sha256(p)}
-        for role, p in zip("RGB", (triplet.red, triplet.green, triplet.blue))
+        for role, p in zip("RGB", (red, green, blue))
     ]
     config = replace(
         DEFAULT_WORKSPACE_CONFIG,
@@ -85,7 +92,7 @@ def open_triplet(
             highlight_reconstruction=0,
         ),
         rgbscan=RgbScanConfig(
-            enabled=True, green_path=triplet.green, blue_path=triplet.blue
+            enabled=True, green_path=green, blue_path=blue
         ),
         retouch=RetouchConfig(),
     )
@@ -101,13 +108,13 @@ def open_triplet(
         if configure_source is not None:
             config = configure_source(processor, config, records)
         if decode_cache is not None and decode_cache.records == records:
-            image = decode_cache.restore(processor, document, triplet.red, config)
+            image = decode_cache.restore(processor, document, red, config)
             if image is not None:
                 return processor, config, image, records
-        image, ir, color_space = processor._load_source_f32(triplet.red, config)
+        image, ir, color_space = processor._load_source_f32(red, config)
         if decode_cache is not None and decode_cache.records == records:
             decode_cache.store(
-                processor, document, triplet.red, image, ir, color_space
+                processor, document, red, image, ir, color_space
             )
     except BaseException:
         processor.cleanup()

@@ -351,8 +351,9 @@ def analyze_native_masked_meters(source, config, density_bundle_json, current_id
                 last = min(gh, first + row_group)
                 selected = np.repeat(np.repeat(valid[first:last], b, axis=0), b, axis=1)
                 pixels = sensor_source[y0 + first*b:y0 + last*b, x0:x0+wb]
-                clipped = pixels >= EXPOSURE_CONSTANTS["scan_clip_level"]
-                counts += np.count_nonzero(clipped & selected[:, :, None], axis=(0, 1))
+                for channel in range(3):
+                    clipped = pixels[..., channel] >= EXPOSURE_CONSTANTS["scan_clip_level"]
+                    counts[channel] += np.count_nonzero(clipped & selected)
             clip = counts.astype(np.float64) / retained
         else:
             pixels = np.asarray(sensor_source[y0 : y0 + hb, x0 : x0 + wb], dtype=np.float32)

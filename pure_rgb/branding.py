@@ -173,3 +173,4 @@ def splash_pixmap(width=360):
     )
     scaled.setDevicePixelRatio(ratio)
     return scaled
+

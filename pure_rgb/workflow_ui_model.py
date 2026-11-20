@@ -88,11 +88,13 @@ def base_recipe(paths, source_mode):
     )
     if source_mode == "bw":
         recipe.update(source_mode="bw-single-v1", raw_import="legacy-v1")
-    elif source_mode == "rgb":
+    elif source_mode in ("rgb", "mono_rgb"):
         recipe.update(
-            raw_import="standard-cfa-dng-v1"
-            if all(Path(p).suffix.lower() == ".dng" for p in raw)
-            else "standard-crop-v1",
+            raw_import=(
+                "standard-mono-v1" if source_mode == "mono_rgb"
+                else "standard-cfa-dng-v1" if all(Path(p).suffix.lower() == ".dng" for p in raw)
+                else "standard-crop-v1"
+            ),
             cool_tone="conservative",
         )
     else:
@@ -325,10 +327,15 @@ class WorkflowProject:
         self.data["stage"] = canonical_stage(self.data.get("stage", 0))
         self.photos = self.data["photos"]
         self.preview_metering = {}
+        self._highlight_policy_cache = {}
         self.orientation_migrations = []
         # Resolve old per-engine directions in memory only. Opening a project
         # does not rewrite its UI metadata, saved jobs or image manifests.
         for photo in self.photos:
+            # A short-lived development build required an extra drawn density
+            # selection after successful automatic measurement. It must not
+            # block existing projects from continuing with that measurement.
+            photo.pop("requires_drawn_density", None)
             self._shared_orientation(photo)
             self._color_engine(photo)
             self._restore_shared_crop(photo)
@@ -671,7 +678,7 @@ class WorkflowProject:
             else:
                 old = dict(
                 id=key,
-                source_mode=source_mode,
+                source_mode="rgb" if source_mode == "mono_rgb" else source_mode,
                 engine="native",
                 color_engine="native",
                 base=recipe,
@@ -1013,7 +1020,37 @@ class WorkflowProject:
         current = self.recipe(photo)
         # Saved jobs are already checked. Legacy aliases only need metadata
         # normalization when their representation differs from the draft.
-        return old != current and checked_recipe(old, verify_resources=False) != current
+        if old != current and checked_recipe(old, verify_resources=False) != current:
+            return True
+        return self.highlight_reprocess_required(photo, saved=job)
+
+    def highlight_reprocess_required(self, photo=None, *, saved=None):
+        """Identify saved local-highlight results produced by an older algorithm."""
+        photo = photo or self.photo()
+        if not photo or photo["engine"] != "native":
+            return False
+        job = saved if saved is not None else self.saved_job(photo)
+        if not job:
+            return False
+        highlight = job["recipe"].get("highlight_controls") or {}
+        if not highlight.get("effect_area") and not highlight.get("protection"):
+            return False
+        path = self.workspace.root / "runs" / job["id"] / "manifest.json"
+        try:
+            stat = path.stat()
+            identity = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            cached = self._highlight_policy_cache.get(job["id"])
+            if cached and cached[0] == identity:
+                return cached[1]
+            manifest = json.loads(path.read_text())
+            spatial = manifest.get("native_spatial_processing") or {}
+            direct = manifest.get("highlight_processing") or {}
+            processing = spatial.get("high_processing") or direct.get("highlight_processing") or {}
+            stale = processing.get("local_selection_policy") != "highlight-luminance-soft-v2"
+            self._highlight_policy_cache[job["id"]] = (identity, stale)
+            return stale
+        except (OSError, ValueError, TypeError, AttributeError):
+            return True
 
     def source_job(self, photo=None):
         """Find a completed source with the current decode/gain identity."""
@@ -1198,4 +1235,21 @@ class WorkflowProject:
             action="export_batch",
             directory=str(self.workspace.root / "exports" / uuid.uuid4().hex),
             items=self.export_items(destination),
+        )
+
+    def export_previous_highlight_request(self, destination):
+        """Export the current photo's explicitly requested saved legacy result."""
+        photo = self.photo()
+        job = self.saved_job(photo)
+        if not job or not self.highlight_reprocess_required(photo, saved=job):
+            raise ValueError("当前照片没有需要更新的旧版高光成片")
+        mode = RESULT_MODES[photo["engine"]]
+        sample = self.workspace.sample(job)
+        record = self.confirmed_record(sample.record(mode, "baseline"), photo)
+        name = f"{Path(photo['base']['raw'][0]).stem}_{photo['engine']}_{job['id'][:8]}.tif"
+        return dict(
+            action="export_batch",
+            directory=str(self.workspace.root / "exports" / uuid.uuid4().hex),
+            items=[dict(id=photo["id"], mode=mode,
+                        destination=str(Path(destination) / name), record=deepcopy(record))],
         )

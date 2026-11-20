@@ -521,6 +521,7 @@ def _load_snapshot(snapshot, source, config, roi, document, source_key, highligh
     previous_runtimes = [
         {**runtime, "spatial_workflow_v31.py": digest}
         for digest in (
+            "4ea280794496a50e1daac16561ae53e5f62dcbe02b4643e4a60cc21f209c8302",
             "f6888eb0012f29858d477404da5d8d28daca7dcc58e3cd686640348d62b134bd",
             "965bd641dd471f5cff599536f7e899c8b862c35bf26d4bdd5fe1aad52cd8555c",
             "fa2cddb2e52f153c89153352640e7f9b5e9ef6a9e4653f6cdbd352de4f1892e7",
@@ -611,7 +612,8 @@ def validate_spatial_replay(
 
 
 def _highlight_mask_blocks(
-    source_shape, source_key, document, block_rows=64, *, tile_pixel_limit=4_194_304
+    source_shape, source_key, document, block_rows=64, *, tile_pixel_limit=4_194_304,
+    automatic_feather_pixels=0.,
 ):
     """Yield exact full-source masks in bounded row blocks for one-shot exports."""
     height, width = source_shape[:2]
@@ -627,7 +629,8 @@ def _highlight_mask_blocks(
         from .highlight_protection import build_highlight_protection
 
         mask = build_highlight_protection(
-            source_shape, source_key, dtype="float64", **document
+            source_shape, source_key, dtype="float64", **document,
+            automatic_feather_pixels=automatic_feather_pixels,
         ).mask
         for first in range(0, height, block_rows):
             yield mask[first:first + block_rows]
@@ -641,7 +644,7 @@ def _highlight_mask_blocks(
         tile = sample_highlight_protection(
             list(source_shape), source_key, **document,
             rectangle=[0, tile_start, width, tile_end],
-            sample_step=1, dtype="float64",
+            sample_step=1, dtype="float64", automatic_feather_pixels=automatic_feather_pixels,
         ).mask
         for offset in range(0, len(tile), block_rows):
             yield tile[offset:offset + block_rows]
@@ -672,8 +675,8 @@ def encode_spatial_workflow(
     from .highlight_workflow import _merge_highlight
     from .native_float import checked_native_float
     from .positive_float import (
-        adapt_positive_float,
         apply_positive_float,
+        decode_working_oetf_pixels,
         positive_domain,
         working_icc_bytes,
     )
@@ -719,25 +722,25 @@ def encode_spatial_workflow(
     high_receipt = None
     if highlight or point["values"]:
         icc = working_icc_bytes()
-        encoded_domain = positive_domain("working-oetf", icc)
         linear_domain = positive_domain("linear", icc)
+        from .highlight_protection import automatic_highlight_feather
+
+        automatic_feather = automatic_highlight_feather(source.shape)
         protection_masks = _highlight_mask_blocks(
-            source.shape, source_key, highlight["protection"] if highlight else None
+            source.shape, source_key, highlight["protection"] if highlight else None,
+            automatic_feather_pixels=automatic_feather,
         )
         effect_masks = _highlight_mask_blocks(
-            source.shape, source_key, highlight.get("effect_area") if highlight else None
+            source.shape, source_key, highlight.get("effect_area") if highlight else None,
+            automatic_feather_pixels=automatic_feather,
         )
         final_image = np.empty(source.shape, dtype=np.float32)
         for start in range(0, len(image), 64):
             part = image[start : start + 64]
-            linear = adapt_positive_float(
-                part, domain=encoded_domain, icc_bytes=icc
-            ).image
+            linear = decode_working_oetf_pixels(part, icc_bytes=icc)
             output = linear
             if highlight:
-                ref = adapt_positive_float(
-                    ref_image[start : start + 64], domain=encoded_domain, icc_bytes=icc
-                ).image
+                ref = decode_working_oetf_pixels(ref_image[start : start + 64], icc_bytes=icc)
                 output, observation = apply_highlight_reference_guarded(
                     linear,
                     ref,

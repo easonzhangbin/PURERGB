@@ -2,11 +2,17 @@
 
 **PURE RGB 0.1.1** 是基于 [NegPy 0.68](https://github.com/marcinz606/NegPy/tree/d8123a9b2a18fdaab5941347a91e402fa936d3dc) 的 macOS 胶片数字化工作台。面向同一帧分别以红、绿、蓝光拍摄的 RAW，将三路信号配准合成，在同一测量结果上比较色彩呈现，然后输出带 ICC 的 RGB16 TIFF。
 
-[中文操作手册](docs/OPERATING_MANUAL.zh-CN.md) · [GitHub Releases](https://github.com/easonzhangbin/PURERGB/releases) · [捐赠支持 StudioPURE](https://github.com/easonzhangbin/PURENeg/blob/main/SUPPORT.md)
+[0.1.1 新特性与修复](docs/releases/0.1.1.md) · [中文操作手册](docs/OPERATING_MANUAL.zh-CN.md) · [GitHub Releases](https://github.com/easonzhangbin/PURERGB/releases) · [捐赠支持 StudioPURE](https://github.com/easonzhangbin/PURENeg/blob/main/SUPPORT.md)
 
 ![PURE RGB 的五步工作台、正像预览与分析图](docs/images/workbench.png)
 
 界面截图使用实拍建筑底片。桌面壁纸由 Milad Fakurian 创作。 [Unsplash 原作](https://unsplash.com/photos/red-and-black-horizontal-striped-abstract-background-WlFOb5WgWvY)
+
+## 0.1.1 更新
+
+本次正式包为 **0.1.1 build 7**，替换此前撤回的安装包。新增拜耳 RGB／单色 RGB 分流、导入后自动选取有效画面中心约 80% 面积测量密度、启动时恢复或新建任务；修复高光绘制负像、裁切与旋转坐标，以及局部高光矩形痕迹。持久解码缓存、空闲预热、测量复用和按可用内存调度导出用于减少重复计算。完整回归 5,287 项通过，实际单色 DNG 完整流程及安装包签名检查通过。
+
+正式更新通道使用 GitHub Releases latest。0.1.1 启动后和每隔 24 小时后台检查，设置中可手动检查；发现新版后提示下载，安装由用户完成。已装过旧 0.1.1 的用户需手动下载本次 build 7 替换。详细变化、实测条件和限制见 [发行说明](docs/releases/0.1.1.md)。
 
 ## 工作台设计
 
@@ -24,7 +30,7 @@
 | Nikon CMS · 仅 CMS | 将中性 RGB16 正像送入 CML4 研究链，可选固定曲线。需要本机自备且有权使用的匹配研究资源。 |
 | FlexColor · 演算 | 默认以共享密度窗口与公开重建的曲线算法做中性演算。经过验证的本机资源配方可启用原曲线与六色校正。 |
 
-三种引擎的彩色工作流使用同一底片的三次分光拍摄，适用于经验证的 RGB RAW 组。单张彩色翻拍的 Bayer RAW 使用不同的采集域，本版没有对应转换入口。单张黑白负片可走 NegPy 原生流程。Nikon 与 FlexColor 路线用于比较逆向研究所得的处理阶段，色彩输出以相机采集与当前的工作域假设为基础。
+三种引擎的彩色工作流使用同一底片的三次分光拍摄，输入可选择「拜耳 RGB · 三张 RAW」或「单色 RGB · 三张 RAW」，并核对 R、G、B 通道顺序。单色流程直接读取传感器样本，使用文件记录的黑白位归一化。单张彩色翻拍的 Bayer RAW 使用不同的采集域，本版没有对应转换入口。单张黑白负片可走 NegPy 原生流程。Nikon 与 FlexColor 路线用于比较逆向研究所得的处理阶段，色彩输出以相机采集与当前的工作域假设为基础。
 
 ## 安装与启动
 
@@ -58,6 +64,14 @@ vendor/negpy/.venv/bin/python -m pure_rgb.nikon_resource_probe
 ```
 
 缺少资源时可使用 NegPy 和 FlexColor 路线。Nikon 的预扫描原始特性数据、扫描仪厂商配置与实验捕获数据保留在其各自的权利范围内。
+
+## 0.1.2 功能计划
+
+| 功能 | 状态 |
+| --- | --- |
+| 目录管理 | 待开发 |
+| 图片库管理 | 待开发 |
+| PURE Neg 观片器 | 待引入 |
 
 ## 许可与致谢
 

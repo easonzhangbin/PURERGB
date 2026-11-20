@@ -158,7 +158,9 @@ def apply_highlight_reference_guarded(
         effect_range = _inspect(effect_mask, mask=True)
         if effect_mask.shape != base_linear.shape[:2] or effect_mask.dtype != base_linear.dtype:
             raise ValueError("Effect area must be HW with the base shape and dtype")
-    tau = _tau(controls["range_start"], controls["budget_reference"])
+    local_start = max(controls["range_start"], 0.35) if effect_mask is not None else controls["range_start"]
+    local_reference = max(controls["budget_reference"], 0.75) if effect_mask is not None else controls["budget_reference"]
+    tau = _tau(local_start, local_reference)
     count = base_linear.shape[0] * base_linear.shape[1]
     receipt = {
         "schema": SCHEMA,
@@ -191,6 +193,13 @@ def apply_highlight_reference_guarded(
     }
     if effect_mask is not None:
         receipt.update(effect_mask_present=True, effect_mask_range=effect_range)
+        receipt["formula"] += "; local budget uses the recorded local start and reference; burn*=effect_mask"
+        receipt["local_highlight_start"] = local_start
+        receipt["local_highlight_reference"] = local_reference
+        receipt["budget_reference_role"] = "local_highlight_reference sets the local budget curvature"
+        receipt["ordering_guarantee"] += "; the effect mask must also be constant"
+    if effect_mask is not None or protection_mask is not None:
+        receipt["local_selection_policy"] = "highlight-luminance-soft-v2"
     if (
         controls["strength"] == 0
         or controls["max_burn_ev"] == 0
@@ -218,9 +227,7 @@ def apply_highlight_reference_guarded(
         )
         y_base = np.einsum("...c,c->...", base, LUMA)
         y_reference = np.einsum("...c,c->...", reference, LUMA)
-        budget = _budget(
-            y_base, controls["range_start"], tau, controls["min_log_slope"]
-        )
+        budget = _budget(y_base, local_start, tau, controls["min_log_slope"])
         desired = controls["strength"] * np.clip(
             np.log2(
                 np.maximum(y_base, LUMINANCE_EPSILON)

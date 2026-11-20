@@ -61,10 +61,10 @@ def _index_entry_matches(directory, document):
         return False
 
 
-def prewarm(manifest_path, cancelled):
+def prewarm(manifest_path, cancelled, *, start_guard=None, end_guard=None):
     """Populate disk cache in a disposable process, stopping for foreground work."""
     from .workflow_exports import _available_memory
-    from .decoded_cache import _budget_bytes, _directory, _enabled
+    from .decoded_cache import _budget_bytes, _directory, _enabled, _has_write_space
 
     try:
         manifest = json.loads(Path(manifest_path).read_text())
@@ -76,8 +76,10 @@ def prewarm(manifest_path, cancelled):
         if not _enabled() or _budget_bytes() < shape[0] * shape[1] * shape[2] * 4 + 4096:
             return
         directory = _directory()
+        if directory is None:
+            return
         fingerprint = _fingerprint(manifest_path, manifest)
-        index = directory / ("prewarm-" + fingerprint + ".json") if directory and fingerprint else None
+        index = directory / ("prewarm-" + fingerprint + ".json") if fingerprint else None
         if index and index.is_file() and not index.is_symlink():
             try:
                 if _index_entry_matches(directory, json.loads(index.read_text())):
@@ -85,6 +87,9 @@ def prewarm(manifest_path, cancelled):
                     return
             except (OSError, ValueError, TypeError):
                 pass
+        if not _has_write_space(directory, shape[0] * shape[1] * shape[2] * 4 + 4096):
+            event("decoded_prewarm_skipped", reason="insufficient_space")
+            return
         # Account for decoding, alignment and certificate copies while reserving
         # memory for the foreground application. Unknown memory stays idle.
         required = max(6 * _GIB, shape[0] * shape[1] * shape[2] * 4 * 15 + 4 * _GIB)
@@ -101,34 +106,40 @@ def prewarm(manifest_path, cancelled):
             command.append(scratch)
             result_path = Path(scratch) / "decoded-result.json"
             environment["PURE_RGB_PREWARM_RESULT"] = str(result_path)
-            process = subprocess.Popen(command, cwd=str(Path(__file__).resolve().parent.parent),
-                                       env=environment, stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL)
+            if start_guard is not None and not start_guard():
+                return
             try:
-                next_memory_check = time.monotonic() + 1
-                stopped = False
-                while process.poll() is None:
-                    if cancelled():
-                        process.terminate()
-                        stopped = True
-                        break
-                    time.sleep(0.25)
-                    if time.monotonic() >= next_memory_check:
-                        available = _available_memory()
-                        if available is None or available < 3 * _GIB:
+                process = subprocess.Popen(command, cwd=str(Path(__file__).resolve().parent.parent),
+                                           env=environment, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL)
+                try:
+                    next_memory_check = time.monotonic() + 1
+                    stopped = False
+                    while process.poll() is None:
+                        if cancelled():
                             process.terminate()
                             stopped = True
                             break
-                        next_memory_check = time.monotonic() + 1
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+                        time.sleep(0.25)
+                        if time.monotonic() >= next_memory_check:
+                            available = _available_memory()
+                            if available is None or available < 3 * _GIB:
+                                process.terminate()
+                                stopped = True
+                                break
+                            next_memory_check = time.monotonic() + 1
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
             finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait()
+                if start_guard is not None and end_guard is not None:
+                    end_guard()
             event("decoded_prewarm_finished", code=process.returncode)
             if (not stopped and process.returncode == 0 and index and result_path.is_file()
                     and fingerprint == _fingerprint(manifest_path, manifest)):

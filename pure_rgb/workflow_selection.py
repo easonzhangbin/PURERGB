@@ -29,6 +29,7 @@ class SelectionView(QGraphicsView):
     selected = pyqtSignal(object)
     zone_selected = pyqtSignal(object, object)
     crop_rotated = pyqtSignal(float)
+    stroke_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -81,11 +82,14 @@ class SelectionView(QGraphicsView):
 
     def cancel_drawing(self):
         """Discard an uncommitted stroke without changing saved overlays."""
+        had_stroke = bool(self.points)
         self.points = []
         self.temporary_shape = None
         if self.temporary is not None:
             self.scene().removeItem(self.temporary)
             self.temporary = None
+        if had_stroke:
+            self.stroke_changed.emit()
 
     def set_preview(self, image, source_shape, output_roi=None, output_orientation=None,
                     overlays=None, grid=_UNCHANGED, preserve_view=True, *, crop_locator=False):
@@ -119,6 +123,7 @@ class SelectionView(QGraphicsView):
             previous_center = self.mapping.preview_to_source(
                 (center.x(), center.y()), (self.pixmap.width(), self.pixmap.height()))
             previous_scale = self.transform().m11() * self.pixmap.width() / self.mapping.output_size[0]
+        had_stroke = bool(self.points)
         points = self.points if preserve_view else []
         temporary_shape = self.temporary_shape if preserve_view else None
         self.geometry_info, self.pixmap, self.mapping = geometry, pixmap, mapping
@@ -195,6 +200,8 @@ class SelectionView(QGraphicsView):
         else:
             self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
             self._fit_mode = True
+        if had_stroke and not self.points:
+            self.stroke_changed.emit()
 
     def drawForeground(self, painter, rect):
         super().drawForeground(painter, rect)
@@ -395,6 +402,7 @@ class SelectionView(QGraphicsView):
             if self.temporary is not None:
                 self.scene().removeItem(self.temporary)
                 self.temporary = None
+            self.stroke_changed.emit()
             event.accept()
         else:
             super().mousePressEvent(event)
@@ -441,6 +449,7 @@ class SelectionView(QGraphicsView):
                 self.temporary_shape = deepcopy(shape)
                 self._paint_temporary(shape)
                 self.selected.emit(shape)
+            self.stroke_changed.emit()
             event.accept()
         else:
             super().mouseReleaseEvent(event)

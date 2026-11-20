@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import pickle
+import shutil
 import tempfile
 import time
 
@@ -19,7 +20,7 @@ import numpy as np
 
 from . import WORKSPACE_ROOT as ROOT
 from .diagnostics import event, failure
-from .raw_import import LEGACY_IMPORT, file_identity
+from .raw_import import LEGACY_IMPORT, STANDARD_MONO_IMPORT, file_identity
 
 _FORMAT = 1
 _DEFAULT_BUDGET_BYTES = 16 * 1024**3
@@ -42,6 +43,17 @@ def _directory():
     if outputs.is_symlink() or cache.is_symlink():
         return None
     return cache
+
+
+def _has_write_space(directory, required):
+    """Skip optional writes only when the target volume is known to be too full."""
+    path = directory
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    try:
+        return shutil.disk_usage(path).free >= required
+    except OSError:
+        return True
 
 
 def _decoder_stamp():
@@ -78,9 +90,34 @@ def cache_key(manifest, recipe, config_document, reference_shape):
         "flatfield_reference_shape": list(reference_shape) if reference_shape else None,
         "rawpy": stamp,
     }
+    if recipe.get("raw_import") == STANDARD_MONO_IMPORT:
+        from .raw_mono_import import MONO_NORMALIZATION_VERSION
+
+        material["mono_normalization"] = MONO_NORMALIZATION_VERSION
     return hashlib.sha256(
         json.dumps(material, sort_keys=True, allow_nan=False).encode()
     ).hexdigest()
+
+
+def _mono_receipt_current(receipt):
+    from .raw_mono_import import MONO_NORMALIZATION_VERSION
+
+    if not isinstance(receipt, dict) or receipt.get("policy") != STANDARD_MONO_IMPORT:
+        return False
+    decode = receipt.get("decode")
+    bands = receipt.get("bands")
+    return (
+        isinstance(decode, dict)
+        and decode.get("normalization") == MONO_NORMALIZATION_VERSION
+        and isinstance(bands, list)
+        and len(bands) == 3
+        and all(
+            isinstance(band, dict)
+            and isinstance(band.get("monochrome_sensor"), dict)
+            and band["monochrome_sensor"].get("normalization") == MONO_NORMALIZATION_VERSION
+            for band in bands
+        )
+    )
 
 
 def _entry_paths(directory, key):
@@ -192,6 +229,9 @@ def restore_source(
             if (
                 expected.get("source_pixels_sha256") != digest
                 or expected.get("geometry_token") != receipt.get("geometry_token")
+                or (recipe.get("raw_import") == STANDARD_MONO_IMPORT
+                    and (not _mono_receipt_current(expected)
+                         or not _mono_receipt_current(receipt)))
             ):
                 raise ValueError("decoded cache import receipt differs")
         _rebind(processor, meta, source, file_path, params)
@@ -235,6 +275,9 @@ def store_source(
             return
         data_path, meta_path = _entry_paths(directory, key)
         if data_path.exists() and meta_path.exists():
+            return
+        if not _has_write_space(directory, source.nbytes + 4096):
+            event("decoded_cache_store_skipped", reason="insufficient_space")
             return
         standard = recipe.get("raw_import", LEGACY_IMPORT) != LEGACY_IMPORT
         meta = {
@@ -374,6 +417,8 @@ def render_decode_context(request, recipe, anchor):
     else:
         reference = None
     policy = recipe.get("raw_import", LEGACY_IMPORT)
+    if policy == STANDARD_MONO_IMPORT and not _mono_receipt_current(receipt):
+        return None
     if policy != LEGACY_IMPORT and (
         not isinstance(receipt, dict)
         or not isinstance(receipt.get("source_pixels_sha256"), str)
