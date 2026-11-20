@@ -524,6 +524,7 @@ def _load_snapshot(snapshot, source, config, roi, document, source_key, highligh
             "f6888eb0012f29858d477404da5d8d28daca7dcc58e3cd686640348d62b134bd",
             "965bd641dd471f5cff599536f7e899c8b862c35bf26d4bdd5fe1aad52cd8555c",
             "fa2cddb2e52f153c89153352640e7f9b5e9ef6a9e4653f6cdbd352de4f1892e7",
+            "1ead28c792134e14e94635301daabf65bfb5e30f0805248e21340226ff68199f",
         )
     ]
     # These exact packets predate the runtime compatibility fix. All other
@@ -609,6 +610,43 @@ def validate_spatial_replay(
     )
 
 
+def _highlight_mask_blocks(
+    source_shape, source_key, document, block_rows=64, *, tile_pixel_limit=4_194_304
+):
+    """Yield exact full-source masks in bounded row blocks for one-shot exports."""
+    height, width = source_shape[:2]
+    if not document:
+        for _ in range(0, height, block_rows):
+            yield None
+        return
+
+    # Extremely wide images exceed the sampled-mask pixel limit even for one
+    # rendering block. Keep the prior full-frame implementation for them.
+    limit = tile_pixel_limit
+    if width * block_rows > limit:
+        from .highlight_protection import build_highlight_protection
+
+        mask = build_highlight_protection(
+            source_shape, source_key, dtype="float64", **document
+        ).mask
+        for first in range(0, height, block_rows):
+            yield mask[first:first + block_rows]
+        return
+
+    from .highlight_sample_v46 import sample_highlight_protection
+
+    tile_rows = max(block_rows, (limit // width // block_rows) * block_rows)
+    for tile_start in range(0, height, tile_rows):
+        tile_end = min(height, tile_start + tile_rows)
+        tile = sample_highlight_protection(
+            list(source_shape), source_key, **document,
+            rectangle=[0, tile_start, width, tile_end],
+            sample_step=1, dtype="float64",
+        ).mask
+        for offset in range(0, len(tile), block_rows):
+            yield tile[offset:offset + block_rows]
+
+
 def encode_spatial_workflow(
     processor,
     source,
@@ -630,7 +668,6 @@ def encode_spatial_workflow(
         return encode_film_spatial(processor, source, config, records, roi, document,
                                   film=film, source_key=source_key, snapshot=snapshot,
                                   highlight=highlight, point=point)
-    from .highlight_protection import build_highlight_protection
     from .highlight_reference_guarded import apply_highlight_reference_guarded
     from .highlight_workflow import _merge_highlight
     from .native_float import checked_native_float
@@ -684,21 +721,12 @@ def encode_spatial_workflow(
         icc = working_icc_bytes()
         encoded_domain = positive_domain("working-oetf", icc)
         linear_domain = positive_domain("linear", icc)
-        protection = (
-            build_highlight_protection(
-                source.shape, source_key, dtype="float64", **highlight["protection"]
-            )
-            if highlight and highlight["protection"]
-            else None
+        protection_masks = _highlight_mask_blocks(
+            source.shape, source_key, highlight["protection"] if highlight else None
         )
-        effect_document = highlight.get("effect_area") if highlight else None
-        effect_area = None
-        effect_block = None
-        effect_start = effect_end = 0
-        if effect_document and source.shape[1] * 64 > 4_194_304:
-            effect_area = build_highlight_protection(
-                source.shape, source_key, dtype="float64", **effect_document
-            )
+        effect_masks = _highlight_mask_blocks(
+            source.shape, source_key, highlight.get("effect_area") if highlight else None
+        )
         final_image = np.empty(source.shape, dtype=np.float32)
         for start in range(0, len(image), 64):
             part = image[start : start + 64]
@@ -707,22 +735,6 @@ def encode_spatial_workflow(
             ).image
             output = linear
             if highlight:
-                effect_mask = None
-                if effect_area is not None:
-                    effect_mask = effect_area.mask[start : start + len(part)]
-                elif effect_document:
-                    if effect_block is None or start >= effect_end:
-                        from .highlight_sample_v46 import sample_highlight_protection
-
-                        rows = max(64, (4_194_304 // source.shape[1] // 64) * 64)
-                        effect_start = start
-                        effect_end = min(source.shape[0], start + rows)
-                        effect_block = sample_highlight_protection(
-                            list(source.shape), source_key, **effect_document,
-                            rectangle=[0, effect_start, source.shape[1], effect_end],
-                            sample_step=1, dtype="float64",
-                        ).mask
-                    effect_mask = effect_block[start - effect_start : start - effect_start + len(part)]
                 ref = adapt_positive_float(
                     ref_image[start : start + 64], domain=encoded_domain, icc_bytes=icc
                 ).image
@@ -731,10 +743,8 @@ def encode_spatial_workflow(
                     ref,
                     highlight["controls"],
                     domain=linear_domain,
-                    protection_mask=protection.mask[start : start + len(part)]
-                    if protection
-                    else None,
-                    effect_mask=effect_mask,
+                    protection_mask=next(protection_masks),
+                    effect_mask=next(effect_masks),
                 )
                 high_receipt = _merge_highlight(high_receipt, observation)
             if point["values"]:
