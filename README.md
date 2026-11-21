@@ -1,31 +1,31 @@
 # PURE RGB
 
-**上游项目：[marcinz606/NegPy](https://github.com/marcinz606/NegPy)。** PURE RGB 是基于 NegPy 的派生开发版本，感谢原作者 marcinz606 及 NegPy 贡献者；保留原项目署名与 GPL-3.0 许可。当前采用的 NegPy 基线为 0.68.0（[`d8123a9`](https://github.com/marcinz606/NegPy/tree/d8123a9b2a18fdaab5941347a91e402fa936d3dc)）。
+PURE RGB 基于 [NegPy](https://github.com/marcinz606/NegPy) 开发，感谢 marcinz606 与上游贡献者。
 
-**PURE RGB 0.2.0** 是一款 macOS 胶片数字化工作台。它将同一帧底片在红、绿、蓝光下拍摄的三张 RAW 合成为正像，支持分区密度测量、调色、除尘审核和独立观片，最终输出带 ICC 的 16 位 TIFF。
+**PURE RGB 0.2.0** 是 StudioPURE 为 Apple 芯片 Mac 开发的胶片数字化工作台。它把同一帧底片在红、绿、蓝光下拍摄的三张 RAW 合成为彩色正像，从密度测量、转换调色、除尘审核到选片导出，都在同一套工作流内完成。
 
-[下载 macOS 版](https://github.com/easonzhangbin/PURERGB/releases/tag/v0.2.0) · [中文使用指南](docs/OPERATING_MANUAL.zh-CN.md) · [0.2.0 发行说明](docs/releases/0.2.0.md) · [捐赠 PURE Studio 项目](SUPPORT.md)
+[下载 0.2.0](https://github.com/easonzhangbin/PURERGB/releases/tag/v0.2.0) · [中文使用指南](docs/OPERATING_MANUAL.zh-CN.md) · [本版修复](docs/releases/0.2.0.md) · [捐赠 StudioPURE 项目](SUPPORT.md)
 
-![PURE RGB 原生观片台，展示建筑胶片样片与当前屏幕的观片提示](docs/images/light-table.png)
+![PURE RGB 转换调色工作台。中央的 3 倍放大镜显示石雕纹理，左侧调节参数，右侧查看输出波形。](docs/images/color-workbench.png)
 
-## 0.2.0 新功能与修复
+## 工作台与观片台
 
-- **观片台从第五步打开。** 检查当前照片、挑选整卷，或直接打开 TIFF、JPEG、PNG、HEIF。单张模式可点亮灯板、拖动放大镜，整卷选片同步至导出列表。
-- **按显示器打开观片台。** 从内建 XDR 屏打开会进入全屏，Esc 可退出。外接 SDR 屏默认使用窗口，跨屏移动时会更新 HDR 提示。完整 HDR 观片体验需要 XDR、合适的显示模式及 macOS 26 或更新版本。
-- **工作台放大镜和滑块。** 镜片默认直径 288 点、倍率 3×，蓝点调大小，绿点或滚轮调倍率，最高 8×。参数轨道可以点选、拖动或用方向键微调。选中步骤和主要操作用明亮橙红色标示。
-- **启动与除尘。** 修正旧插件缓存导致的启动闪退，以及选择新建任务后窗口未显示的问题。确认除尘后可继续调色，保存与导出会在新成片上应用已审核的修补蒙版。
-- **帮助与支持。** 直接从 macOS 的 PURE RGB 菜单打开「关于 PURE RGB」「使用指南」「捐赠 PURE Studio 项目」或「检查更新」。0.1.1 用户可通过原有的启动更新提示或设置中的手动检查取得 0.2.0。[完整发行说明](docs/releases/0.2.0.md)
+- **六步工作流。** 顶部依次为「导入归组」「画幅与测量」「转换调色」「修整审核」「观片台」「导出」。半透明磨砂玻璃面板透出底色，明亮的橙红色标示当前步骤和主要操作。照片、调节参数和输出示波器可同时查看。
+- **检查照片细节。** 点「100%」旁的放大镜，再点照片定位。镜片默认 3×、直径 288 点，拖动可沿画面检查颗粒与锐度。蓝点调整镜片大小，绿点或滚轮调整倍率，最高 8×。
+- **精调参数。** 曝光、色温和高光强度等工作台参数采用 Scrubber 滑块。点选刻度、沿轨道拖动或用方向键逐格调整，当前值随操作显示。
+- **单张观片与整卷挑片。** 第五步打开独立原生观片台，可以点亮灯板、拖动放大镜，也能挑选整卷并将结果带回导出列表。支持直接打开已有的 TIFF、JPEG、PNG 或 HEIF。
+- **XDR 与全屏。** 从 Mac 内建 XDR 屏打开观片台时默认全屏，按 Esc 回到窗口。外接 SDR 屏以窗口打开。跨屏移动会更新 HDR 提示。完整 HDR 观片体验需要 XDR 屏、合适的显示模式及 macOS 26 或更新版本。
 
-## 六步工作流
-
-| 页面 | 用途 |
+| 分区密度测量 | 独立观片台 |
 | --- | --- |
-| 1 导入归组 | 选择输入方式，核对 RGB 通道，导入时自动定位片框。 |
-| 2 画幅与测量 | 默认取有效画面中心约 80% 面积测量密度，可手绘选区、排除或恢复网格中的区域。 |
-| 3 转换调色 | 比较引擎，调整正像与高光。局部高光作用区支持亮度筛选与羽化。 |
-| 4 修整审核 | 用独立安装的 PURE Neg 后端检测与修复尘点，确认后返回工作台。 |
-| 5 观片台 | 在原生灯板上检查细节，挑选要导出的照片。 |
-| 6 导出 | 生成当前或勾选照片的全尺寸 RGB16 TIFF，并嵌入实际使用的 ICC。 |
+| [![建筑样片的分区密度网格与实测数值](docs/images/zonal-density.png)](docs/images/zonal-density.png) | [![独立观片台的灯板、胶片与显示器提示](docs/images/light-table.png)](docs/images/light-table.png) |
+| 在有效画面内逐格查看密度，点击可排除或恢复该区域。 | 将转换后的正像放在灯板上，检查细节或挑选整卷。 |
+
+## 0.2.0 工作流程改进
+
+- 导入时自动寻找有效片框，用中央约 80% 的面积测量密度。定位失败时，画面中央会提示手绘区域的下一步操作。
+- 在高光作用区内按亮度筛选像素，并可调节羽化半径。确认除尘后再调整曝光、白平衡等颜色参数，重新生成的成片会应用已审核的修补蒙版。
+- 修复旧插件缓存造成的启动闪退，以及选择新建空白任务后工作台未显示的问题。可从 macOS 的 PURE RGB 菜单打开「关于 PURE RGB」「使用指南」「捐赠 StudioPURE 项目」和「检查更新」。[完整发行说明](docs/releases/0.2.0.md)
 
 ## 色彩引擎与输入
 
@@ -39,7 +39,7 @@
 
 ## 安装与启动
 
-**Apple 芯片 Mac 下载，要求 macOS 14 或更新版本**。打开 PKG 后按 macOS 安装助手指引安装到「应用程序」。也可用访达解压 ZIP，双击同目录的「打开 PURE RGB.command」校验应用，然后选择在访达中安装或直接打开。两种方式都包含运行环境。PKG 没有 Developer ID Installer 签名，应用使用本机临时签名，尚未通过 Apple 公证。若首次打开时 macOS 提示无法验证开发者，先核对发布页上的 SHA-256。如确定来自本项目，可在「系统设置 → 隐私与安全性」中选择「仍要打开」，按当时的系统提示确认。 [下载 PKG 安装助手](https://github.com/easonzhangbin/PURERGB/releases/download/v0.2.0/PURE-RGB-0.2.0-macos-arm64.pkg) · [下载 ZIP](https://github.com/easonzhangbin/PURERGB/releases/download/v0.2.0/PURE-RGB-0.2.0-macos-arm64.zip) · [Apple 官方说明](https://support.apple.com/zh-cn/102445)
+**Apple 芯片 Mac 下载，要求 macOS 14 或更新版本**。打开 PKG 后按 macOS 安装助手指引安装到「应用程序」。也可用访达解压 ZIP，双击同目录的「打开 PURE RGB.command」。助手会校验应用，随后可选择复制到「应用程序」或在当前位置打开。两种方式都包含运行环境。PKG 没有 Developer ID Installer 签名，应用使用本机临时签名，尚未通过 Apple 公证。若首次打开时 macOS 提示无法验证开发者，先核对发布页上的 SHA-256。如确定来自本项目，可在「系统设置 → 隐私与安全性」中选择「仍要打开」，按当时的系统提示确认。 [下载 PKG 安装助手](https://github.com/easonzhangbin/PURERGB/releases/download/v0.2.0/PURE-RGB-0.2.0-macos-arm64.pkg) · [下载 ZIP](https://github.com/easonzhangbin/PURERGB/releases/download/v0.2.0/PURE-RGB-0.2.0-macos-arm64.zip) · [Apple 官方说明](https://support.apple.com/zh-cn/102445)
 
 ### 从源码运行
 
@@ -74,15 +74,17 @@ vendor/negpy/.venv/bin/python -m pure_rgb.nikon_resource_probe
 
 目录管理和图片库管理待开发。本版的整卷挑选使用当前项目的照片列表。
 
-## 捐赠 PURE Studio 项目
+## 捐赠 StudioPURE 项目
 
 感谢捐助者 **nothing老庄、J3RRYK33PF1T、熊小默、基岩、一笑而过**。欢迎使用支付宝扫描项目收款码，自愿支持后续开发。
 
-<img src="docs/images/SupportAlipay.jpg" alt="PURE Studio 项目支付宝捐赠收款码" width="240">
+<img src="docs/images/SupportAlipay.jpg" alt="StudioPURE 项目支付宝捐赠收款码" width="240">
 
-应用内也可在「PURE RGB → 捐赠 PURE Studio 项目」查看同一张二维码。[捐赠说明](SUPPORT.md)
+应用内也可在「PURE RGB → 捐赠 StudioPURE 项目」查看同一张二维码。[捐赠说明](SUPPORT.md)
 
 ## 许可与致谢
+
+**上游项目：[marcinz606/NegPy](https://github.com/marcinz606/NegPy)。** PURE RGB 是基于 NegPy 的派生开发版本，感谢原作者 marcinz606 及 NegPy 贡献者；保留原项目署名与 GPL-3.0 许可。当前采用的 NegPy 基线为 0.68.0（[`d8123a9`](https://github.com/marcinz606/NegPy/tree/d8123a9b2a18fdaab5941347a91e402fa936d3dc)）。
 
 软件源码采用 [GPL-3.0](LICENSE)。项目由 NegPy 的开源工作发展而来，并参考 cool-colors、flexcolor-tool 与 nkscan。品牌图标和字标保留各自权利。详见 [第三方来源与许可](THIRD_PARTY_NOTICES.md)。
 

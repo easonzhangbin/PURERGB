@@ -463,7 +463,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
 
         GlassMessageBox.about(
             self, "关于 PURE RGB",
-            f"PURE RGB {APP_VERSION}\n\n三色负片与黑白影像工作流。\n"
+            f"PURE RGB {APP_VERSION}\n\nStudioPURE 出品\n三色负片与黑白影像工作流。\n"
             "导入归组、画幅与测量、转换调色、修整审核、观片台与 RGB16／ICC 导出。\n\n"
             f"感谢以下捐助者\n{DONORS}",
         )
@@ -735,7 +735,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.application_menu.addAction(self.about_action)
         for title, slot in (
             ("使用指南", lambda: self._settings().open_manual()),
-            ("捐赠 PURE Studio 项目", lambda: self._settings().open_donation()),
+            ("捐赠 StudioPURE 项目", lambda: self._settings().open_donation()),
             ("检查更新", self.check_updates),
         ):
             action = QAction(title, self)

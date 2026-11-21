@@ -1,4 +1,4 @@
-"""Credits and the offline PURE Studio donation page."""
+"""Credits and the offline StudioPURE donation page."""
 
 from pathlib import Path
 
@@ -19,7 +19,7 @@ def donation_dialog(parent):
     prepare_glass(dialog)
     dialog.setObjectName("workflowRoot")
     dialog.setStyleSheet(stylesheet(False))
-    dialog.setWindowTitle("捐赠 PURE Studio 项目")
+    dialog.setWindowTitle("捐赠 StudioPURE 项目")
     layout = QVBoxLayout(dialog)
     layout.setContentsMargins(24, 20, 24, 18)
     layout.setSpacing(12)

@@ -65,6 +65,8 @@ Apple 芯片 Mac 可在 GitHub 发行页下载 PKG，双击并跟随安装助手
 
 ### 3. 转换调色
 
+![转换调色工作台在已载入的建筑样片上使用 3 倍放大镜，左右分列参数和输出波形](images/color-workbench.png)
+
 在「转换引擎」菜单切换路线。参数滑块可在刻度轨道上点选或拖动，拖动时显示读数，聚焦后用方向键逐步微调。「复位」只还原旁边的参数。先用同一画幅、同一测量范围比较正像，再调整选定引擎的曝光、色温、色相、色彩平衡及可用的高级参数。引擎各有独立的调色草稿，测量结果和输出几何属于整张照片。
 
 中央画布支持滚轮缩放、适应和 100% 查看。画面双击在 100% 与适应之间切换。点「100%」右侧的放大镜，再点照片定位。镜片默认直径 288 点，按画布当前比例放大 3 倍。拖动镜面或按方向键移动，按住镜面可临时提高倍率。蓝点调镜片大小，绿点、镜内滚轮或触控板捏合调倍率（1.5× 至 8×）。键盘 + / − 调倍率，配合 Option 调大小。按 Esc 退出。右侧波形图、RGB 分量图和直方图取自输出 RGB 预览，采用显示器 ICC 转换前的信号值。画布中的 A/B 用于对照当前正像和参照版本。
@@ -152,12 +154,12 @@ Hasselblad／Imacon FlexColor 的公开研究资料记录了独立的胶片与�
 | --- | --- |
 | 关于 PURE RGB | 查看当前版本、项目说明和捐助者名单。 |
 | 使用指南 | 打开随应用提供的中文图文指南，离线也可阅读。 |
-| 捐赠 PURE Studio 项目 | 查看项目二维码及捐助者名单，用支付宝自愿支持项目。 |
+| 捐赠 StudioPURE 项目 | 查看项目二维码及捐助者名单，用支付宝自愿支持项目。 |
 | 检查更新 | 立即查询 GitHub 正式发布通道，查看可用版本。 |
 
 应用启动后会在后台检查新版，持续运行时每 24 小时再查一次。出现「查看更新」时，点击进入 GitHub 发布页，阅读本次变化并下载安装包。0.1.1 用户也可从「设置 → 通用 → 检查更新」主动查询。[GitHub Releases](https://github.com/easonzhangbin/PURERGB/releases)
 
-感谢捐助者 **nothing老庄、J3RRYK33PF1T、熊小默、基岩、一笑而过**。[捐赠 PURE Studio 项目](https://github.com/easonzhangbin/PURERGB/blob/main/SUPPORT.md)
+感谢捐助者 **nothing老庄、J3RRYK33PF1T、熊小默、基岩、一笑而过**。[捐赠 StudioPURE 项目](https://github.com/easonzhangbin/PURERGB/blob/main/SUPPORT.md)
 
 提交问题时，附上应用版本、macOS 版本、输入方式、引擎和复现步骤。可在「设置 → 维护」保存诊断报告，分享前请检查截图和报告中的个人信息。[GitHub Issues](https://github.com/easonzhangbin/PURERGB/issues)
 

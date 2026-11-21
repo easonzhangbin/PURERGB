@@ -121,7 +121,7 @@ class SettingsPanel(QWidget):
         )
         column.addWidget(QLabel(f"PURE RGB {APP_VERSION}"))
         self.manual_button = QPushButton("使用指南")
-        self.donation_button = QPushButton("捐赠 PURE Studio 项目")
+        self.donation_button = QPushButton("捐赠 StudioPURE 项目")
         self.donation_button.setToolTip("查看支付宝捐赠二维码和捐助者名单")
         self.update_button = QPushButton("检查更新")
         for button in (self.manual_button, self.donation_button, self.update_button):
