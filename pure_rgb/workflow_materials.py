@@ -11,6 +11,9 @@ import math
 import sys
 import weakref
 
+from .workflow_ultrathin import make_material, set_material_radius
+from .workflow_glass import WORKFLOW_ACCENT, system_dark
+
 from PyQt6.QtCore import QEvent, QObject, QPoint, QRect, QTimer, pyqtSlot
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
@@ -50,6 +53,10 @@ def _role(widget):
     if isinstance(widget, QFrame) and widget.objectName() in _PANEL_NAMES:
         return "panel"
     if isinstance(widget, QSlider):
+        # These controls paint their moving thumb and liquid/drop geometry.
+        # A second Cocoa handle would use the old QStyle handle rectangle.
+        if widget.property("motionPaintedSlider"):
+            return None
         return "slider-thumb"
     if isinstance(widget, QPushButton):
         ancestor = widget.parentWidget()
@@ -136,6 +143,7 @@ class MaterialBinder(QObject):
         self.settle_timer.timeout.connect(self.request_frame)
         self.native_observers = []
         self._observe_native_geometry()
+        QApplication.styleHints().colorSchemeChanged.connect(self.schedule)
         window.destroyed.connect(self._dispose_native)
         self.sync()
 
@@ -163,6 +171,22 @@ class MaterialBinder(QObject):
         self._appearance_dirty.add(key)
         if not self.timer.isActive():
             self.timer.start()
+
+    def update_floating_card(self, card):
+        """A native child resizes without issuing an UpdateRequest on the main window."""
+        if self.disposed or self._syncing:
+            return
+        from Quartz import CATransaction
+
+        CATransaction.begin()
+        CATransaction.setDisableActions_(True)
+        try:
+            for widget in (card, *card.findChildren(QWidget)):
+                entry = self.entries.get(id(widget))
+                if entry is not None:
+                    self._update(entry)
+        finally:
+            CATransaction.commit()
 
     @pyqtSlot(bool)
     def _button_toggled(self, checked):
@@ -387,40 +411,37 @@ class MaterialBinder(QObject):
 
     def _create(self, widget, role):
         A = self.api
+        reference, container = self.view, self.container
+        card = widget if widget.objectName() == "rubberDockCard" else widget.nativeParentWidget()
+        if card is not None and card.objectName() == "rubberDockCard":
+            import objc
+            card_view = objc.objc_object(c_void_p=int(card.winId()))
+            if card_view.superview() is not None:
+                reference, container = card_view, card_view.superview()
         wrapper = self.clip_class.alloc().initWithFrame_(((0, 0), (0, 0)))
-        wrapper.workflow_flipped = bool(self.container.isFlipped())
+        wrapper.workflow_flipped = bool(container.isFlipped())
         # Cocoa's unflipped parent anchors children from the bottom.  Preserve
         # their top edge while Cocoa and Qt settle on the new content height.
         wrapper.setAutoresizingMask_(
-            0 if self.container.isFlipped() else A.NSViewMinYMargin
+            0 if container.isFlipped() else A.NSViewMinYMargin
         )
         wrapper.setWantsLayer_(True)
         wrapper.layer().setMasksToBounds_(True)
-        use_glass = (role in {"control", "slider-thumb"}
-                     or widget.objectName() in {"workflowStages", "previewToolbar"}) and hasattr(A, "NSGlassEffectView")
-        if use_glass:
-            effect = A.NSGlassEffectView.alloc().initWithFrame_(((0, 0), (0, 0)))
-            effect.setStyle_(A.NSGlassEffectViewStyleRegular)
+        if role == "hud":
+            fallback = A.NSVisualEffectMaterialHUDWindow
+        elif role == "menu-strip":
+            fallback = A.NSVisualEffectMaterialMenu
+        elif role in {"control", "slider-thumb"}:
+            fallback = A.NSVisualEffectMaterialPopover
+        elif role == "scroll-edge" or widget.objectName() in _HEADER_NAMES:
+            fallback = A.NSVisualEffectMaterialHeaderView
         else:
-            effect = A.NSVisualEffectView.alloc().initWithFrame_(((0, 0), (0, 0)))
-            if role == "hud":
-                material = A.NSVisualEffectMaterialHUDWindow
-            elif role == "menu-strip":
-                material = A.NSVisualEffectMaterialMenu
-            elif role in {"control", "slider-thumb"}:
-                material = A.NSVisualEffectMaterialPopover
-            elif role == "scroll-edge" or widget.objectName() in _HEADER_NAMES:
-                material = A.NSVisualEffectMaterialHeaderView
-            else:
-                material = A.NSVisualEffectMaterialSidebar
-            effect.setMaterial_(material)
-            effect.setBlendingMode_(A.NSVisualEffectBlendingModeWithinWindow)
-            effect.setState_(A.NSVisualEffectStateActive if role == "hud"
-                             else A.NSVisualEffectStateFollowsWindowActiveState)
-            effect.setWantsLayer_(True)
-            effect.layer().setMasksToBounds_(True)
-            if role != "scroll-edge":
-                effect.layer().setBorderWidth_(1.0)
+            fallback = A.NSVisualEffectMaterialSidebar
+        effect, material, _ = make_material(A, ((0, 0), (0, 0)), fallback)
+        use_glass = material == "clear"
+        effect.setWantsLayer_(True)
+        if not use_glass and role != "scroll-edge":
+            effect.layer().setBorderWidth_(1.0)
         wrapper.addSubview_(effect)
         scroll_mask = None
         if role == "scroll-edge":
@@ -460,9 +481,17 @@ class MaterialBinder(QObject):
                 native_text.setMaximumNumberOfLines_(0 if widget.wordWrap() else 1)
             if hasattr(native_text, "setAccessibilityElement_"):
                 native_text.setAccessibilityElement_(False)
-            effect.addSubview_(native_text)
-        self.container.addSubview_positioned_relativeTo_(
-            wrapper, A.NSWindowAbove if role in {"hud", "scroll-edge"} else A.NSWindowBelow, self.view
+            shadow = A.NSShadow.alloc().init()
+            shadow.setShadowColor_(A.NSColor.blackColor().colorWithAlphaComponent_(0.9))
+            shadow.setShadowBlurRadius_(2)
+            shadow.setShadowOffset_((0, -1))
+            native_text.setShadow_(shadow)
+            if use_glass:
+                effect.setContentView_(native_text)
+            else:
+                effect.addSubview_(native_text)
+        container.addSubview_positioned_relativeTo_(
+            wrapper, A.NSWindowAbove if role in {"hud", "scroll-edge"} else A.NSWindowBelow, reference
         )
         # Dynamic QSS selectors need one polish after this property is installed.
         if role != "scroll-edge":
@@ -472,14 +501,14 @@ class MaterialBinder(QObject):
             role=role,
             wrapper=wrapper,
             effect=effect,
-            glass=use_glass,
+            glass=use_glass, material=material,
             tint=tint_view,
             gradient=gradient,
             native_text=native_text,
             scroll_mask=scroll_mask,
         )
 
-    def _to_native(self, rectangle):
+    def _to_native(self, rectangle, container):
         bounds = self.view.bounds()
         x = float(bounds.origin.x + rectangle.x())
         y = float(rectangle.y())
@@ -487,7 +516,7 @@ class MaterialBinder(QObject):
             y = float(bounds.size.height - rectangle.y() - rectangle.height())
         y += float(bounds.origin.y)
         return self.view.convertRect_toView_(
-            ((x, y), (rectangle.width(), rectangle.height())), self.container
+            ((x, y), (rectangle.width(), rectangle.height())), container
         )
 
     def _update(self, entry, *, appearance_only=False):
@@ -514,7 +543,7 @@ class MaterialBinder(QObject):
                 wrapper.setHidden_(True)
                 entry["hidden"] = True
             return
-        full, clip = (self._to_native(rect) for rect in geometry)
+        full, clip = (self._to_native(rect, wrapper.superview()) for rect in geometry)
         frame = ((full.origin.x - clip.origin.x, full.origin.y - clip.origin.y),
                  (full.size.width, full.size.height))
         radius = (
@@ -543,10 +572,7 @@ class MaterialBinder(QObject):
         if geometry_changed:
             wrapper.setFrame_(clip)
             effect.setFrame_(frame)
-            if entry["glass"]:
-                effect.setCornerRadius_(radius)
-            else:
-                effect.layer().setCornerRadius_(radius)
+            set_material_radius(effect, entry["material"], radius)
             if entry["tint"] is not None:
                 entry["tint"].setFrame_(effect.bounds())
                 entry["tint"].layer().setCornerRadius_(radius)
@@ -563,16 +589,29 @@ class MaterialBinder(QObject):
             and (name in {"primary", "reviewPrimary"} or widget.isChecked())
         )
         tint_name = widget.property("glassTint")
-        appearance = (slider_panel, interaction, selected, widget.isEnabled(), tint_name, self._increase_contrast)
+        custom_accent = widget.property("glassAccent")
+        accent = self._clear_accent if entry["glass"] else WORKFLOW_ACCENT
+        solid = self._reduce_transparency or self._increase_contrast
+        appearance = (slider_panel, interaction, selected, widget.isEnabled(), tint_name, custom_accent, accent,
+                      solid, self._increase_contrast)
         appearance_changed = appearance != entry.get("appearance_state")
         if appearance_changed:
+            if role != "scroll-edge":
+                backing = self.api.NSColor.clearColor()
+                if solid:
+                    backing = (self.api.NSColor.blackColor() if role == "hud"
+                               else self.api.NSColor.windowBackgroundColor())
+                effect.layer().setBackgroundColor_(backing.CGColor())
             tint = None
             if widget.isEnabled():
                 if tint_name or selected:
-                    color = QColor(tint_name or widget.property("glassAccent") or "#ff3c1d")
+                    color = QColor(tint_name or custom_accent or accent)
                     red, green, blue, alpha = color.getRgbF()
+                    if custom_accent and not tint_name:
+                        # The repair editor supplies its own translucent amber selection.
+                        alpha = 0.68 if self._increase_contrast else 0.34
                     tint = self.api.NSColor.colorWithSRGBRed_green_blue_alpha_(
-                        red, green, blue, alpha if tint_name else 0.68,
+                        red, green, blue, alpha,
                     )
                 elif slider_panel and interaction > 0:
                     tint = self.api.NSColor.whiteColor().colorWithAlphaComponent_(0.045 * interaction)
@@ -640,6 +679,18 @@ class MaterialBinder(QObject):
             workspace = A.NSWorkspace.sharedWorkspace()
             self._reduce_transparency = bool(workspace.accessibilityDisplayShouldReduceTransparency())
             self._increase_contrast = bool(workspace.accessibilityDisplayShouldIncreaseContrast())
+            # Clear glass darkens its tint in Dark Aqua and brightens it in Aqua.
+            # Both recipes render close to the opaque workflow accent.
+            self._clear_accent = "#ec594b" if system_dark() else "#cf392d"
+            base = getattr(self.window, "_native_glass", None)
+            if base is not None:
+                # A system preference change reaches the observer even if the Qt
+                # layout has not moved. Use a solid base for accessible contrast.
+                backing = (A.NSColor.windowBackgroundColor() if self._reduce_transparency or self._increase_contrast
+                           else A.NSColor.clearColor())
+                native_window = self.view.window()
+                if native_window is not None and native_window.backgroundColor() != backing:
+                    native_window.setBackgroundColor_(backing)
             widgets = [widget for widget in (self.window, *self.window.findChildren(QWidget))
                        if widget.window() is self.window]
             active = set()
@@ -657,6 +708,8 @@ class MaterialBinder(QObject):
                     continue
                 active.add(key)
                 if key not in self.entries:
+                    if not widget.isVisibleTo(self.window):
+                        continue
                     self.entries[key] = self._create(widget, role)
                 self._update(self.entries[key])
             for key in set(self.entries) - active:

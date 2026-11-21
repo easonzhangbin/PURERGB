@@ -52,11 +52,14 @@ def locator_context(window):
     if not photo or not photo.get("initial_job"):
         return None
     recipe = full_source_recipe(window.project.recipe(), photo["engine"])
+    repair = window.project.repair_context(recipe=recipe)
+    source_view = bool(not repair and window.project.repair_context())
     digest = hashlib.sha256(json.dumps(recipe, sort_keys=True, allow_nan=False).encode()).hexdigest()
     role = _locator_role(window)
     return dict(photo=photo["id"], engine=photo["engine"], recipe=recipe,
-                key=(photo["id"], photo["engine"], digest, window.display_revision, window.proof_space, role),
-                locator_role=role, crop_locator=True)
+                key=(photo["id"], photo["engine"], digest, window.display_revision, window.proof_space, role,
+                     repair["receipt_sha256"] if repair else None),
+                locator_role=role, crop_locator=True, repair_plan=repair, repair_source_view=source_view)
 
 
 def _matches(window, context):
@@ -140,10 +143,12 @@ def _finished(window, token):
     has_geometry = any(key.startswith("geometry.") for key in values)
     name = "完整正像" if window.current_photo()["source_mode"] == "bw" else "完整彩色正像"
     if window.geometry_role == "crop":
-        window.show_preview_notice(name + (" · 拉直前裁切定位" if has_geometry else " · 源画幅裁切定位"))
+        window.show_preview_notice(name + (" · 未除尘源视图" if window.crop_locator_context.get("repair_source_view") else "")
+                                   + (" · 拉直前裁切定位" if has_geometry else " · 源画幅裁切定位"))
         window.status_message("拖动四角调整画幅，拖动圆形把手旋转。")
     else:
-        window.show_preview_notice(name + (" · 拉直前完整画面" if has_geometry else " · 完整画面"))
+        window.show_preview_notice(name + (" · 未除尘源视图" if window.crop_locator_context.get("repair_source_view") else "")
+                                   + (" · 拉直前完整画面" if has_geometry else " · 完整画面"))
         window.status_message("在完整正像上绘制高光区域。" + (" 当前显示拉直前的画面。" if has_geometry else ""))
 
 
@@ -184,7 +189,7 @@ def request_crop_frame(window):
     # A historic render with the same recipe can predate the highlight mask
     # algorithm. Recompute highlights rather than silently displaying it.
     saved = (saved_full_source_record(window, context["recipe"])
-             if context["locator_role"] == "crop" else None)
+             if context["locator_role"] == "crop" and not context["repair_plan"] else None)
     window.preview_timer.stop()
     window._failed_preview = False
     window.token += 1
@@ -211,7 +216,7 @@ def request_crop_frame(window):
     window.live.submit(dict(token=token, manifest=str(manifest), manifest_sha256=sha256(manifest),
                             mode=RESULT_MODES[context["engine"]], draft_recipe=context["recipe"],
                             controls=_controls(context["recipe"], RESULT_MODES[context["engine"]]),
-                            full_resolution=False, crop_locator=True))
+                            full_resolution=False, crop_locator=True, repair_plan=context["repair_plan"]))
     window.status_message("正在按当前 " + ENGINES[context["engine"]] + " 调色准备完整正像…")
     return True
 

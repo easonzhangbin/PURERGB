@@ -2,7 +2,7 @@
 
 import math
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QSignalBlocker, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
@@ -11,7 +11,6 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPushButton,
     QScrollArea,
-    QSlider,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -27,6 +26,7 @@ from .professional_controls import (
     checked_engines,
 )
 from .workflow_combo import WorkflowComboBox as QComboBox
+from .motion_sliders import ScrubberSlider
 from .preview_data import MODES
 
 
@@ -38,9 +38,11 @@ class NumericControl(QWidget):
         self.spec = spec
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setRange(0, round((spec.high - spec.low) / spec.step))
+        self.slider = ScrubberSlider(
+            self, show_labels=False, readout=lambda: f"{spec.low + self.slider.value() * spec.step:g}"
+        )
         self.slider.setAccessibleName(spec.title)
+        self.slider.setRange(0, round((spec.high - spec.low) / spec.step))
         self.spin = QDoubleSpinBox()
         self.spin.setRange(spec.low, spec.high)
         self.spin.setDecimals(max(0, -math.floor(math.log10(spec.step))))
@@ -63,14 +65,14 @@ class NumericControl(QWidget):
         self.spin.setValue(round(self.spec.low + value * self.spec.step, 6))
 
     def spin_changed(self, value):
-        self.slider.blockSignals(True)
-        self.slider.setValue(round((value - self.spec.low) / self.spec.step))
-        self.slider.blockSignals(False)
+        with QSignalBlocker(self.slider):
+            self.slider.setValue(round((value - self.spec.low) / self.spec.step))
         self.changed.emit()
 
     def set_value(self, value):
-        self.spin.setValue(value)
-        self.spin_changed(value)
+        with QSignalBlocker(self.spin):
+            self.spin.setValue(value)
+        self.spin_changed(self.spin.value())
 
     def value(self):
         return self.spin.value()

@@ -1,0 +1,57 @@
+#!/bin/zsh -f
+# The build tool binds this helper to the signed application in this release.
+set -u
+source_app="${0:A:h}/PURE RGB.app"
+installed_app='/Applications/PURE RGB.app'
+requirement='identifier "io.github.easonzhangbin.purergb" and cdhash H"@CDHASH@"'
+
+verify_app() {
+    [[ -d "$1" ]] && /usr/bin/codesign --verify --deep --strict --all-architectures -R="$requirement" "$1"
+}
+
+if ! verify_app "$source_app"; then
+    print -u2 '找不到匹配的 PURE RGB.app 或签名校验失败。请从 GitHub 正式发布页重新下载并核对 SHA-256。'
+    if [[ "${1:-}" != '--verify-only' ]]; then
+        /usr/bin/osascript -e 'display alert "应用完整性校验失败" message "请将助手与同一版本的 PURE RGB.app 放在一起，从 GitHub 正式发布页核对下载文件的 SHA-256，然后重试。" as critical'
+    fi
+    exit 1
+fi
+print 'PURE RGB @VERSION@ 的应用签名和构建标识已核对。'
+[[ "${1:-}" == '--verify-only' ]] && exit 0
+
+choice=$(/usr/bin/osascript <<'APPLESCRIPT'
+try
+    set resultDialog to display dialog "请选择直接打开，或在访达中将应用复制到「应用程序」。如果 macOS 无法验证开发者，请先核对 GitHub Releases 的 SHA-256，再根据系统提示决定是否在「隐私与安全性」中允许打开。" with title "PURE RGB @VERSION@ 安装助手" buttons {"取消", "直接打开", "在访达中安装"} default button "在访达中安装" cancel button "取消"
+    return button returned of resultDialog
+on error number -128
+    return "取消"
+end try
+APPLESCRIPT
+) || exit 1
+
+case "$choice" in
+    '直接打开')
+        /usr/bin/open "$source_app"
+        ;;
+    '在访达中安装')
+        if ! verify_app "$installed_app" 2>/dev/null; then
+            /usr/bin/open -R "$source_app" || exit 1
+            /usr/bin/open /Applications || exit 1
+            result=$(/usr/bin/osascript <<'APPLESCRIPT'
+try
+    set resultDialog to display dialog "请先退出正在运行的旧版，将 PURE RGB.app 拖到「应用程序」，按访达提示确认替换。复制完成后点击「打开」。" with title "安装 PURE RGB" buttons {"取消", "打开"} default button "打开" cancel button "取消"
+    return button returned of resultDialog
+on error number -128
+    return "取消"
+end try
+APPLESCRIPT
+            ) || exit 1
+            [[ "$result" == '打开' ]] || exit 0
+        fi
+        if ! verify_app "$installed_app"; then
+            /usr/bin/osascript -e 'display alert "尚未找到完整的本版应用" message "请检查「应用程序」中的 PURE RGB.app，并在复制完成后重新运行助手。"'
+            exit 1
+        fi
+        /usr/bin/open "$installed_app"
+        ;;
+esac

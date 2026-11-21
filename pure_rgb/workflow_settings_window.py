@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 
 from .branding import application_icon
 from .release import (
-    APP_VERSION, DONATION_URL, OPERATING_MANUAL_PATH, OPERATING_MANUAL_URL, RELEASES_URL,
+    APP_VERSION, OPERATING_MANUAL_PATH, OPERATING_MANUAL_URL, RELEASES_URL,
     check_newer_release,
 )
 from .workflow_branding import header_logo
@@ -24,6 +24,7 @@ from .workflow_glass import (
 )
 from .workflow_materials import attach_materials
 from .workflow_settings_ui import SettingsPanel
+from .workflow_support import donation_dialog
 
 
 class SettingsWindow(QWidget):
@@ -55,6 +56,7 @@ class SettingsWindow(QWidget):
         self._material_timer.timeout.connect(self._install_materials)
         self._update_pending = False
         self._manual_dialog = None
+        self._donation_dialog = None
         prepare_glass(self)
         self._apply_style(False)
 
@@ -127,12 +129,14 @@ class SettingsWindow(QWidget):
             text = manual.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             if not QDesktopServices.openUrl(QUrl(OPERATING_MANUAL_URL)):
-                self._release_status("无法打开操作手册。")
+                self.present()
+                self._release_status("无法打开使用指南。")
             return
-        dialog = QDialog(self)
+        dialog = QDialog(self if self.isVisible() else self.parentWidget())
+        prepare_glass(dialog)
         dialog.setObjectName("workflowRoot")
         dialog.setStyleSheet(stylesheet(False))
-        dialog.setWindowTitle("PURE RGB · 操作手册")
+        dialog.setWindowTitle("PURE RGB · 使用指南")
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.resize(760, 680)
         layout = QVBoxLayout(dialog)
@@ -161,8 +165,15 @@ class SettingsWindow(QWidget):
         dialog.show()
 
     def open_donation(self):
-        if not QDesktopServices.openUrl(QUrl(DONATION_URL)):
-            self._release_status("无法打开 StudioPURE 支持页面。")
+        if self._donation_dialog is not None:
+            self._donation_dialog.raise_()
+            self._donation_dialog.activateWindow()
+            return
+        dialog = donation_dialog(self if self.isVisible() else self.parentWidget())
+        self._donation_dialog = dialog
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.finished.connect(lambda _: setattr(self, "_donation_dialog", None))
+        dialog.show()
 
     def open_releases(self):
         if not QDesktopServices.openUrl(QUrl(RELEASES_URL)):
@@ -235,9 +246,6 @@ class SettingsWindow(QWidget):
     def _install_materials(self):
         if self.closing or self.disposed or not self.isVisible() or self._surface_installed:
             return
-        # Standard macOS frosted-window material without the brand veil, so the
-        # desktop visibly frosts through like System Settings instead of the
-        # main workspace's charcoal HUD.
         self.glass_report = attach_glass(self, base="under", veil=None)
         self._apply_style(self.glass_report["attached"])
         if self.glass_report["attached"]:

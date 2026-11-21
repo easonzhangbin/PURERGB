@@ -634,6 +634,7 @@ def render(request, *, emit_callback=None, prepared_source=None):
                 actual, ai = read_rgb(path)
                 if ai != icc or not np.array_equal(actual, px):
                     raise ValueError("RGB16/ICC 输出核验失败")
+                del actual, ai
             report["results"][mode] = {
                 "path": str(path),
                 "sha256": sha256(path),
@@ -641,6 +642,15 @@ def render(request, *, emit_callback=None, prepared_source=None):
                 "icc_sha256": report["icc_sha256"],
                 **meta,
             }
+            if request.get("repair_plan") is not None:
+                from .repair_pipeline import render_repair
+
+                with span("confirmed_repair_replay", mode=mode):
+                    render_repair(
+                        request, report, report["results"][mode], mode,
+                        directory=out / (mode + "-repair"),
+                        on_progress=lambda progress: emit_event(**progress),
+                    )
             preview(px, icc, (520, 440)).save(
                 out / (mode + "-preview.png"), icc_profile=srgb
             )

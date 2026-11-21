@@ -1,17 +1,17 @@
 import AppKit
 import SwiftUI
 
-// The desktop wallpaper is supplied by the AppKit behind-window effect below
-// this view. SwiftUI's material itself only blurs content within the app.
 @available(macOS 12.0, *)
-private struct UltraThinSurface: View {
+private struct GlassSurface: View {
+    let material: Material
+
     var body: some View {
-        Rectangle().fill(.ultraThinMaterial).ignoresSafeArea().allowsHitTesting(false)
+        Rectangle().fill(material).ignoresSafeArea().allowsHitTesting(false)
     }
 }
 
 @available(macOS 12.0, *)
-private final class PassiveMaterialView: NSHostingView<UltraThinSurface> {
+private final class PassiveMaterialView: NSHostingView<GlassSurface> {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
     override var isOpaque: Bool { false }
 }
@@ -20,7 +20,15 @@ private final class PassiveMaterialView: NSHostingView<UltraThinSurface> {
 @objc(PUREUltraThinBridge)
 final class PUREUltraThinBridge: NSObject {
     @objc @MainActor static func makeView() -> NSView {
-        let view = PassiveMaterialView(rootView: UltraThinSurface())
+        return makeSurface(.ultraThinMaterial)
+    }
+
+    @objc @MainActor static func makeThickView() -> NSView {
+        return makeSurface(.thickMaterial)
+    }
+
+    @MainActor private static func makeSurface(_ material: Material) -> NSView {
+        let view = PassiveMaterialView(rootView: GlassSurface(material: material))
         view.autoresizingMask = [.width, .height]
         return view
     }

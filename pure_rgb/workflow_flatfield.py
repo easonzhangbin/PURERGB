@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 from .flatfield import FILE_FILTER, RAW_EXTENSIONS
 from .native import sha256
 from .workflow_combo import WorkflowComboBox as QComboBox
-from .workflow_slider import SliderControl
+from .motion_sliders import ScrubberControl
 
 
 def flatfield_support(photo):
@@ -64,7 +64,7 @@ class FlatfieldUI:
         self.flatfield_remove.clicked.connect(self.remove_library_flatfield)
         library_row.addWidget(self.flatfield_remove)
         column.addLayout(library_row)
-        self.flatfield_strength = SliderControl("平场强度（%）", 0, 200, 1, 100)
+        self.flatfield_strength = ScrubberControl("平场强度（%）", 0, 200, 1, 100)
         self.flatfield_strength.label.setToolTip(
             "0 为旁路，100 为 NegPy 完整校正，200 为两倍曝光校正量"
         )

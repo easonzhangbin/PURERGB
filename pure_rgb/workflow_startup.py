@@ -68,24 +68,48 @@ def inspect_workspace(path):
 
 def ask_restore(summary):
     """Present the decision before a splash or workspace/RAW is opened."""
+    from PyQt6.QtCore import QSize, Qt
     from PyQt6.QtWidgets import QMessageBox
 
-    from .workflow_glass import GlassMessageBox
+    from .branding import application_icon
+    from .workflow_glass import GlassMessageBox, stylesheet
 
+    box = GlassMessageBox()
+    # A native NSAlert before the first main window can leave that window
+    # off screen. Keep the decision and its keyboard handling inside Qt.
+    box.setOption(QMessageBox.Option.DontUseNativeDialog)
+    box.setWindowTitle("载入上次工作区？")
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    box.setText("是否继续上次任务？")
     detail = "检测到上次工作区。"
     if summary.photo_count:
         detail = f"上次工作区有 {summary.photo_count} 张照片。"
         if summary.latest_photo:
             detail += f"\n当前照片：{summary.latest_photo}"
-    answer = GlassMessageBox.question(
-        None, "载入上次工作区？", detail + "\n是否继续上次任务？",
-        buttons=(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                 | QMessageBox.StandardButton.Cancel),
-        default=QMessageBox.StandardButton.Yes,
-        button_labels={QMessageBox.StandardButton.Yes: "是，载入上次任务",
-                       QMessageBox.StandardButton.No: "否，新建空白项目",
-                       QMessageBox.StandardButton.Cancel: "取消启动"},
-    )
+    box.setInformativeText(detail)
+    box.setIconPixmap(application_icon().pixmap(QSize(48, 48), box.devicePixelRatioF()))
+    choices = QMessageBox.StandardButton
+    box.setStandardButtons(choices.Yes | choices.No | choices.Cancel)
+    for standard, label in ((choices.Yes, "是，载入上次任务"), (choices.No, "否，新建空白项目"),
+                            (choices.Cancel, "取消启动")):
+        button = box.button(standard)
+        button.setText(label)
+        button.setAttribute(Qt.WidgetAttribute.WA_MacShowFocusRect, False)
+    box.button(choices.Yes).setObjectName("primary")
+    box.setDefaultButton(choices.Yes)
+    box.setEscapeButton(choices.Cancel)
+    # The main window's stylesheet is not installed on this top-level prompt.
+    # Give Qt the same transparent control faces over the native glass.
+    box.setStyleSheet(stylesheet() + """
+        QLabel#qt_msgbox_label { font-size:16px; font-weight:600; }
+        QPushButton, QPushButton#primary { border-width:2px; }
+        QPushButton:focus, QPushButton[nativeMaterial="true"]:focus,
+        QPushButton#primary:focus, QPushButton#primary[nativeMaterial="true"]:focus {
+            border:2px solid palette(highlight);
+        }
+    """)
+    box.exec()
+    answer = box.standardButton(box.clickedButton())
     if answer == QMessageBox.StandardButton.Yes:
         return True
     if answer == QMessageBox.StandardButton.No:

@@ -54,10 +54,9 @@ class SliderControl(QWidget):
         self.label.setMinimumWidth(0)
         self.label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.label.setToolTip(name)
-        self.slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.slider = self._create_slider()
         self.slider.setAccessibleName(name)
         self.slider.setMinimumWidth(50)
-        self.slider.setFixedHeight(22)
         self.slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.slider.installEventFilter(self)
         self.setFocusProxy(self.slider)
@@ -88,14 +87,22 @@ class SliderControl(QWidget):
             'QToolButton#sliderReset[nativeMaterial="true"] {background:transparent;border-color:transparent;}'
         )
         self.reset_button.clicked.connect(self.reset)
-        row.addWidget(self.label, 1)
-        row.addWidget(self.readout)
-        row.addWidget(self.reset_button, 0, Qt.AlignmentFlag.AlignTop)
-        column.addLayout(row)
-        column.addWidget(self.slider)
+        self._layout_controls()
         self.slider.valueChanged.connect(self._moved)
         self._sync()
         self._update_text_height()
+
+    def _create_slider(self):
+        slider = QSlider(Qt.Orientation.Horizontal, self)
+        slider.setFixedHeight(22)
+        return slider
+
+    def _layout_controls(self):
+        self._header.addWidget(self.label, 1)
+        self._header.addWidget(self.readout)
+        self._header.addWidget(self.reset_button, 0, Qt.AlignmentFlag.AlignTop)
+        self._column.addLayout(self._header)
+        self._column.addWidget(self.slider)
 
     def _header_height(self, width):
         margins = self._column.contentsMargins()

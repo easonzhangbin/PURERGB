@@ -32,7 +32,7 @@ def run(output, study=DEFAULT_STUDY):
     report = {
         "state": "running",
         "scope": "Encoded RGB presentation only; not source density recovery, not validated Nikon 9000 ED reproduction",
-        "user_reference": "/Users/easonzhang/Desktop/截屏2026-11-12 22.51.05.png",
+        "user_reference": "191 to 255 reference curve",
         "gain": GAIN,
         "soft_gain": SOFT_GAIN,
         "soft_pivot": PIVOT,

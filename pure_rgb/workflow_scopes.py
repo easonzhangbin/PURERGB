@@ -14,6 +14,7 @@ from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import QButtonGroup, QHBoxLayout, QLabel, QSizePolicy, QToolButton, QVBoxLayout, QWidget
 
 from .preview_alpha_clip_v45 import rounded_preview_path
+from .workflow_glass import WORKFLOW_ACCENT
 
 
 SCOPE_MODES = {"waveform": "波形图", "parade": "RGB分量图", "histogram": "直方图"}
@@ -278,13 +279,13 @@ class ScopePanel(QWidget):
             self.mode_buttons[mode] = control
             row.addWidget(control, 1)
         self.mode_buttons[self._mode].setChecked(True)
-        self.setStyleSheet("""
-            QWidget#scopeModeRow {background:rgba(255,255,255,16);border-radius:8px;}
-            QToolButton {font-size:11px;border:0;border-radius:6px;padding:0 3px;color:#d3d9df;background:transparent;}
-            QToolButton:hover {background:rgba(255,255,255,22);}
-            QToolButton:checked {color:#fff4ed;background:rgba(244,82,41,180);}
-            QToolButton:focus {border:1px solid rgba(255,194,158,200);}
-            QToolButton[nativeMaterial="true"] {background:transparent;}
+        self.setStyleSheet(f"""
+            QWidget#scopeModeRow {{background:rgba(255,255,255,16);border-radius:8px;}}
+            QToolButton {{font-size:11px;border:0;border-radius:6px;padding:0 3px;color:#d3d9df;background:transparent;}}
+            QToolButton:hover {{background:rgba(255,255,255,22);}}
+            QToolButton:checked {{color:white;background:{WORKFLOW_ACCENT};}}
+            QToolButton:focus {{border:1px solid rgba(255,194,158,200);}}
+            QToolButton[nativeMaterial="true"] {{background:transparent;}}
         """)
         column.addWidget(self.mode_row)
         self.plot = ScopePlot(self)

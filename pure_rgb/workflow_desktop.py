@@ -63,6 +63,7 @@ from .workflow_ui_model import (  # noqa: E402
     ENGINES,
     RESULT_MODES,
     STAGES,
+    LIGHT_TABLE_STAGE,
     VISIBLE_STAGE_INDICES,
     VISIBLE_STAGE_LABELS,
     canonical_stage,
@@ -80,7 +81,7 @@ from .workflow_advanced import advanced_groups  # noqa: E402
 from .workflow_advanced_ui import AdvancedPanel  # noqa: E402
 from .workflow_disclosure import DisclosureButton  # noqa: E402
 from .workflow_scroll import WorkflowScrollArea  # noqa: E402
-from .workflow_slider import SliderControl  # noqa: E402
+from .motion_sliders import ScrubberControl  # noqa: E402
 from .workflow_branding import create_splash, header_logo  # noqa: E402
 from .workflow_materials import attach_materials  # noqa: E402
 from .workflow_canvas import RoundedPreviewStack  # noqa: E402
@@ -88,6 +89,7 @@ from .workflow_attention import AttentionButton  # noqa: E402
 from .workflow_history_ui import EditHistoryUI, PreviewToolbar  # noqa: E402
 from .workflow_flatfield import FlatfieldUI  # noqa: E402
 from .workflow_combo import WorkflowComboBox as QComboBox  # noqa: E402
+from .motion_menus import SpringComboBox  # noqa: E402
 from .workflow_display import DisplayTracker  # noqa: E402
 from .workflow_performance import (  # noqa: E402
     load_performance_settings, save_performance_settings, resolve_performance,
@@ -171,6 +173,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
 
     def __init__(self, directory, *, srgb=False):
         super().__init__()
+        # A Qt event filter can outlive Python attributes briefly during GC.
+        # Enable it only after build(), and disable before detaching filters.
+        self._event_filters_active = False
         setup("workflow-ui")
         self.project = WorkflowProject(
             directory, create=not (Path(directory) / "workspace.json").exists()
@@ -280,10 +285,12 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         import hashlib
 
         recipe = self.project.recipe()
+        repair = self.project.repair_context(recipe=recipe)
         return dict(
             photo=photo["id"], engine=photo["engine"],
             recipe_sha256=hashlib.sha256(json.dumps(recipe, sort_keys=True, allow_nan=False).encode()).hexdigest(),
             recipe=deepcopy(recipe),
+            repair_plan_sha256=repair["receipt_sha256"] if repair else None,
             generation=self.token,
         )
 
@@ -368,6 +375,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
     def show_preview_notice(self, message=None):
         if not hasattr(self, "preview_notice"):
             return
+        if message is None and self.current_photo():
+            repair = self.project.repair_status()
+            if repair["state"] == "incompatible":
+                message = repair["message"]
         self.preview_notice.setText(message or "")
         self.preview_notice.setMaximumWidth(max(150, self.canvas_stack.width() - 32))
         self.preview_notice.adjustSize()
@@ -448,16 +459,16 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
 
     def show_about(self):
         from .release import APP_VERSION
+        from .workflow_support import DONORS
 
         GlassMessageBox.about(
             self, "关于 PURE RGB",
             f"PURE RGB {APP_VERSION}\n\n三色负片与黑白影像工作流。\n"
-            "导入素材、测量密度、转换调色、修整审核与 RGB16／ICC 导出。",
+            "导入归组、画幅与测量、转换调色、修整审核、观片台与 RGB16／ICC 导出。\n\n"
+            f"感谢以下捐助者\n{DONORS}",
         )
 
-    def open_settings(self):
-        if not self.flush_advanced():
-            return
+    def _settings(self):
         if not hasattr(self, "settings_panel"):
             from .workflow_settings_window import SettingsWindow
 
@@ -473,8 +484,19 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.settings_panel.release_memory_requested.connect(self.release_preview_memory)
             self.settings_panel.set_display_status(self.display_description)
             self.settings_panel.set_proof(self.proof_space)
-        self.settings_window.present()
+        return self.settings_window
+
+    def open_settings(self):
+        if not self.flush_advanced():
+            return
+        self._settings().present()
         self.refresh_runtime_status()
+
+    def check_updates(self):
+        settings = self._settings()
+        settings.panel.tabs.setCurrentIndex(0)
+        settings.present()
+        settings.check_updates()
 
     def performance_changed(self, settings):
         self.performance = save_performance_settings(self.performance_path, settings)
@@ -584,6 +606,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.tasks.prewarm_gate = self.prewarm_gate
         self.live.prewarm_gate = self.prewarm_gate
         self.idle_scheduler.set_enabled(self.performance["idle_previews"])
+        self._event_filters_active = True
         QApplication.instance().installEventFilter(self)
         self.maintenance_timer = QTimer(self)
         self.maintenance_timer.setInterval(2000)
@@ -591,6 +614,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.maintenance_timer.start()
 
     def eventFilter(self, watched, event):
+        if not getattr(self, "_event_filters_active", False) or getattr(self, "closing", True):
+            return False
         if (
             watched is self.canvas
             and self._straighten_panel is not None
@@ -708,6 +733,15 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.about_action.setMenuRole(QAction.MenuRole.AboutRole)
         self.about_action.triggered.connect(self.show_about)
         self.application_menu.addAction(self.about_action)
+        for title, slot in (
+            ("使用指南", lambda: self._settings().open_manual()),
+            ("捐赠 PURE Studio 项目", lambda: self._settings().open_donation()),
+            ("检查更新", self.check_updates),
+        ):
+            action = QAction(title, self)
+            action.setMenuRole(QAction.MenuRole.ApplicationSpecificRole)
+            action.triggered.connect(slot)
+            self.application_menu.addAction(action)
         self.settings_action = QAction("设置…", self)
         self.settings_action.setShortcut(QKeySequence.StandardKey.Preferences)
         self.settings_action.setMenuRole(QAction.MenuRole.PreferencesRole)
@@ -763,12 +797,12 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             item.setCheckable(True)
             item.setAccessibleName(visible_name)
             self.stage_group.addButton(item, index)
-            if index in VISIBLE_STAGE_INDICES:
-                stages.addWidget(item, 1)
-            else:
+            if index not in VISIBLE_STAGE_INDICES:
                 item.setParent(stage_bar)
                 item.hide()
             self.stage_buttons.append(item)
+        for index in VISIBLE_STAGE_INDICES:
+            stages.addWidget(self.stage_buttons[index], 1)
         self.stage_group.idToggled.connect(self.stage_toggled)
         from .workflow_stage_navigation import StageNavigation
 
@@ -793,7 +827,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         engine_layout = QVBoxLayout(self.engine_box)
         engine_layout.setContentsMargins(0, 4, 0, 8)
         engine_layout.addWidget(text("转换引擎"))
-        self.engine_choice = QComboBox()
+        self.engine_choice = SpringComboBox()
         self.engine_choice.setAccessibleName("转换引擎")
         for key, name in ENGINES.items():
             self.engine_choice.addItem(name, key)
@@ -806,7 +840,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.advanced_contexts = {}
         self.advanced_applying = False
         left.addWidget(self.pages, 1)
-        for index in range(6):
+        for index in range(len(STAGES)):
             host = QWidget()
             layout = QVBoxLayout(host)
             layout.setContentsMargins(0, 6, 0, 8)
@@ -836,6 +870,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.save_button,
             self.retouch_save,
             self.export_button,
+            self.light_table_current,
         ):
             self.primary_stack.addWidget(action)
         left.addWidget(self.primary_stack)
@@ -860,6 +895,16 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.actual_button = button("100%", lambda: self.canvas.actual())
         self.actual_button.setAccessibleName("100% 原始像素")
         bar.addWidget(self.actual_button)
+        self.loupe_button = QPushButton()
+        self.loupe_button.setObjectName("photoLoupe")
+        self.loupe_button.setAccessibleName("照片放大镜")
+        self.loupe_button.setToolTip("放大镜 · 点击照片定位，拖动镜面移动，按住临时放大。蓝点调大小，绿点或滚轮调倍率。方向键移动，Esc 退出。")
+        self.loupe_button.setCheckable(True)
+        self.loupe_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.loupe_button.setIcon(QIcon(str(Path(__file__).resolve().parents[1] / "assets/ui/loupe.svg")))
+        self.loupe_button.setIconSize(QSize(20, 20))
+        self.loupe_button.setFixedSize(32, 30)
+        bar.addWidget(self.loupe_button)
         self.compare = button("A/B", self.toggle_compare)
         self.compare.setCheckable(True)
         bar.addWidget(self.compare)
@@ -882,12 +927,16 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             control.setObjectName("orientation_" + action)
             control.setAccessibleName(title)
             control.setToolTip(title + "；仅改变照片输出方向")
+            control.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             self.orientation_buttons[action] = control
             bar.addWidget(control)
         middle.addWidget(preview_toolbar)
         self.canvas_stack = RoundedPreviewStack()
         self.canvas = Canvas()
         self.canvas.empty_message = "选择 RAW 文件或素材文件夹开始"
+        from .motion_lens import PhotoLens
+
+        self.canvas.photo_lens = PhotoLens(self.canvas, self.loupe_button)
         self.canvas.set_detail_enabled(True)
         self.canvas.installEventFilter(self)
         self._straighten_panel = None
@@ -902,6 +951,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.selection.crop_rotated.connect(self.crop_post_changed)
         self.selection.zone_selected.connect(self.open_meter_zone_menu)
         self.canvas_stack.addWidget(self.selection)
+        self.canvas_stack.currentChanged.connect(lambda _: self.sync_loupe_button())
         self.preview_overlay = QLabel("正在更新预览…", self.canvas_stack)
         self.preview_overlay.setObjectName("previewUpdateHUD")
         self.preview_overlay.setProperty("nativeHUD", True)
@@ -1072,6 +1122,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         photo = self.current_photo()
         if self.tasks.busy or not photo or not photo["initial_job"]:
             return
+        self.end_history_gesture()
         if not self.flush_advanced():
             return
         if self.geometry_role != "crop":
@@ -1165,14 +1216,15 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.meter_apply = button("刷新测量预览", self.apply_metering, True)
         layout.addWidget(self.meter_apply)
 
-    def spin(self, layout, name, low, high, step, value, callback):
-        control = SliderControl(name, low, high, step, value)
+    def spin(self, layout, name, low, high, step, value, callback, *, control_type=ScrubberControl):
+        control = control_type(name, low, high, step, value)
         control.valueChanged.connect(callback)
         layout.addWidget(control)
         return control
 
     def build_stage_3(self, layout):
         from .film_ui import NativeFilmSelector
+        from .motion_sliders import JellySliderControl
         from .workflow_parameter_reset import add_parameter_reset
 
         spec = TEMPERATURE_SPEC
@@ -1196,7 +1248,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.exposure = self.spin(
             layout, "曝光（EV）", -4, 4, 0.1, 0, self.tone_changed
         )
-        self.contrast = SliderControl("反差", 50, 180, 1, 115)
+        self.contrast = ScrubberControl("反差", 50, 180, 1, 115)
         self.contrast_label = self.contrast.label
         self.contrast.valueChanged.connect(self.tone_changed)
         layout.addWidget(self.contrast)
@@ -1245,7 +1297,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.highlight.toggled.connect(self.tone_changed)
         self.highlight_reset = add_parameter_reset(high, self.highlight, False, "高光找回")
         self.highlight_strength = self.spin(
-            high, "高光找回强度（%）", 0, 100, 5, 50, self.tone_changed
+            high, "高光找回强度（%）", 0, 100, 5, 50, self.tone_changed, control_type=JellySliderControl
         )
         high.addWidget(
             button("绘制高光参考区", lambda: self.begin_selection("highlight"))
@@ -1290,6 +1342,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.repair_button = button("PURE Neg 除尘与审核…", self.start_repair, True)
         layout.addWidget(self.repair_button)
         layout.addWidget(button("恢复已有除尘审核", self.resume_repair))
+        self.repair_status_note = text("", True)
+        layout.addWidget(self.repair_status_note)
         layout.addWidget(
             text("调整参数自动保存；打开除尘时自动准备当前完整版本，确认后回到工作台。", True)
         )
@@ -1317,6 +1371,18 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.export_old_highlight_button.hide()
         layout.addWidget(self.export_old_highlight_button)
         layout.addWidget(text("参数自动保存；导出时自动生成当前配方的完整 TIFF，同名文件不会覆盖。", True))
+
+    def build_stage_6(self, layout):
+        from .workflow_light_table import ProjectLightTable
+
+        self.light_table = ProjectLightTable(self)
+        self.light_table_current = button("查看当前照片", self.light_table.open_current, True)
+        self.light_table_roll = button("整卷观片", self.light_table.open_roll)
+        self.light_table_files = button("打开图像文件…", self.light_table.open_files)
+        layout.addWidget(self.light_table_roll)
+        layout.addWidget(self.light_table_files)
+        self.light_table_note = text("单张可用放大镜检查细节。整卷可挑选要导出的照片。", True)
+        layout.addWidget(self.light_table_note)
 
     def current_photo(self):
         return self.project.photo() if self.project.data["current"] else None
@@ -1459,7 +1525,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         photo = self.current_photo()
         if index == self.step and (self.geometry_role or self._straighten_panel is not None):
             return
-        if index > 2 and photo and not photo["initial_job"] and not self.tasks.busy:
+        if index != LIGHT_TABLE_STAGE and index > 2 and photo and not photo["initial_job"] and not self.tasks.busy:
             # An undetected first frame must be explicitly located before
             # its density can be measured. Reopen the same source-bound
             # locator if the user exited it and then tries to continue.
@@ -1480,10 +1546,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.sync_drawing_hint()
                 self.status_message("请在有效画面内拖出矩形密度检测区域，完成测量后才能进入下一步")
                 return
-        if index > self.step and self.remind_pending_drawing():
+        if stage_presentation(index)[0] > stage_presentation(self.step)[0] and self.remind_pending_drawing():
             self.stage_buttons[self.step].setChecked(True)
             return
-        if index > 0 and photo and not photo["initial_job"]:
+        if index not in (0, LIGHT_TABLE_STAGE) and photo and not photo["initial_job"]:
             if self.tasks.busy:
                 self.stage_buttons[self.step].setChecked(True)
                 self.status_message("请等待当前任务完成。")
@@ -1591,6 +1657,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         photo = self.current_photo()
         busy = self.tasks.busy
         try:
+            self.light_table.sync_buttons()
             self.input_choice.setEnabled(not busy)
             self.pages.widget(3).setEnabled(
                 bool(photo and photo["initial_job"]) and not busy
@@ -1626,6 +1693,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.import_button.set_attention(False)
                 self.import_attention_photo = attention_photo
                 self.import_button.set_attention(attention_photo is not None)
+            self.sync_loupe_button()
             self.actual_button.setEnabled(ready)
             self.compare.setEnabled(ready)
             self.lens_correction_button.setEnabled(
@@ -1842,10 +1910,15 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             )
             self.canvas_title.setToolTip(self.canvas_title.text())
             self.repair_button.setEnabled(ready and not busy)
+            repair_status = self.project.repair_status(photo)
+            self.repair_status_note.setText(repair_status["message"])
+            if repair_status["state"] == "incompatible":
+                self.canvas_title.setText(self.canvas_title.text() + " · 除尘需重新审核")
+                self.canvas_title.setToolTip(repair_status["message"])
             self.repair_button.setText(
                 "保存并打开 PURE Neg…" if self.project.dirty() else "PURE Neg 除尘与审核…")
             self.repair_button.setToolTip(
-                "高光算法已更新。生成新版后需要重新审核除尘；原版本与审核保留。"
+                "高光算法已更新。生成新版时保留同来源、同画幅的已确认除尘选区；原版本与审核保留。"
                 if highlight_refresh else
                 "保存当前完整分辨率版本后自动打开除尘审核。" if self.project.dirty()
                 else "使用当前保存版本进入 PURE Neg 检测、画笔修整及审核。")
@@ -1854,7 +1927,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.export_old_highlight_button.setVisible(bool(highlight_refresh))
             self.export_old_highlight_button.setEnabled(bool(highlight_refresh) and not busy)
             self.export_note.setText(
-                "高光算法已更新，导出会生成新版；原版本除尘保留，需重新审核。"
+                "高光算法已更新，导出会生成新版；同来源、同画幅的已确认除尘选区继续应用。"
                 if export_refresh else
                 f"已勾选 {len(self.project.data['checked'])} 张；按各照片自动保存的当前参数导出"
                 if self.project.data["checked"]
@@ -1912,6 +1985,14 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.photo_list.blockSignals(False)
         self.queue_idle_previews(saved_jobs)
 
+    def sync_loupe_button(self):
+        photo = self.current_photo()
+        available = bool(photo and photo["initial_job"] and self.canvas_stack.currentWidget() is self.canvas
+                         and self._straighten_panel is None)
+        self.loupe_button.setEnabled(available)
+        if not available:
+            self.loupe_button.setChecked(False)
+
     def begin_straighten_draw(self, panel):
         """进入画布画线拉直模式；激活时按钮保持高亮，再次点击退出。"""
         if self.tasks.busy:
@@ -1925,6 +2006,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         if self.geometry_role is not None:
             self.finish_selection()
         self._straighten_panel = panel
+        self.sync_loupe_button()
         self._straighten_anchor = None
         panel.draw_straighten.setChecked(True)
         panel.draw_straighten.setText("退出画线拉直")
@@ -1937,6 +2019,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
 
     def _exit_straighten_draw(self, message="已退出画线拉直。"):
         panel, self._straighten_panel = self._straighten_panel, None
+        self.sync_loupe_button()
         self._straighten_anchor = None
         if self._straighten_line is not None:
             self._straighten_line.clear_line()
@@ -2168,7 +2251,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.show_preview_notice()
         self.project.data["current"] = identifier
         photo = self.project.photo()
-        if not photo["initial_job"] and not self.tasks.busy and self.step != 0:
+        if not photo["initial_job"] and not self.tasks.busy and self.step not in (0, LIGHT_TABLE_STAGE):
             self.set_stage(0)
         self.project.enter_stage(self.step)
         self.finish_selection()
@@ -3109,7 +3192,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.canvas_stack.setCurrentWidget(self.selection)
         self.show_region_exit()
         shown, desired = self.shown_context or {}, self.preview_context() or {}
-        if any(shown.get(key) != desired.get(key) for key in ("photo", "engine", "recipe_sha256")):
+        if any(shown.get(key) != desired.get(key) for key in ("photo", "engine", "recipe_sha256", "repair_plan_sha256")):
             self.preview_timer.start()
 
     def cancel_highlight_locator(self):
@@ -3186,7 +3269,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             shown, desired = self.shown_context or {}, self.preview_context() or {}
             if (not self.closing and photo and photo.get("initial_job")
                     and any(shown.get(key) != desired.get(key)
-                            for key in ("photo", "engine", "recipe_sha256"))):
+                            for key in ("photo", "engine", "recipe_sha256", "repair_plan_sha256"))):
                 self.preview_timer.start()
 
     def shape_selected(self, shape):
@@ -3432,6 +3515,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 # Prior completed decode lets the renderer reuse the
                 # decoded-RAW cache instead of re-decoding the triplet.
                 decode_anchor=self.project.decode_anchor(recipe=job["recipe"]),
+                repair_plan=self.project.repair_context(recipe=job["recipe"]),
             )
             if import_stage is not None:
                 request["import_stage"] = import_stage
@@ -3658,7 +3742,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         current = self.preview_context()
         return bool(current and current["photo"] == context["photo"]
                     and current["engine"] == context["engine"]
-                    and current["recipe_sha256"] == context["recipe_sha256"])
+                    and current["recipe_sha256"] == context["recipe_sha256"]
+                    and current.get("repair_plan_sha256") == context.get("repair_plan_sha256"))
 
     def request_detail_preview(self, view):
         request_id = view["request_id"]
@@ -3673,7 +3758,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 or (display_pending is not None and display_pending[1] == self.token)
                 or self.canvas_stack.currentWidget() is not self.canvas
                 or any(shown.get(key) != current.get(key)
-                       for key in ("photo", "engine", "recipe_sha256"))):
+                       for key in ("photo", "engine", "recipe_sha256", "repair_plan_sha256"))):
             # A changed recipe needs its matching base frame first. set_images
             # schedules the viewport again while preserving the current view.
             self.canvas.detail_failed(request_id)
@@ -3698,6 +3783,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 controls={key: value for key, value in recipe.items()
                           if key in (*EDITING_DOCUMENT_KEYS, "exposure_ev", "cool_tone")},
                 full_resolution=False, viewport=viewport, detail_id=request_id,
+                repair_plan=self.project.repair_context(recipe=recipe),
             ))
             self.begin_preview_activity(self.token, "正在加载当前区域的清晰预览…", stage="detail")
             self.status_message("正在加载当前区域的清晰预览…")
@@ -3852,6 +3938,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                     controls=controls,
                     draft_recipe=recipe,
                     full_resolution=bool(full),
+                    repair_plan=self.project.repair_context(recipe=recipe),
                 )
             )
             self.status_message("正在更新真实处理预览…")
@@ -3939,7 +4026,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
 
         def context_key(value):
             return tuple((value or {}).get(key) for key in (
-                "photo", "engine", "recipe_sha256", "generation",
+                "photo", "engine", "recipe_sha256", "repair_plan_sha256", "generation",
             ))
 
         desired_context = context_key(self.preview_context())
@@ -4313,10 +4400,23 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 receipt.get("source", {}).get("sha256") == source["sha256"]
                 and receipt.get("state") == "confirmed"
             ):
-                self.load_records(self.project.confirmed_record(source), source)
-                self.status_message("已确认除尘；导出将使用此版本的已核验修复结果。")
+                self._show_confirmed_repair(source)
         except Exception as error:
             self.error(error)
+
+    def _show_confirmed_repair(self, source):
+        """Invalidate every older frame, including the same recipe before review."""
+        current = self.project.confirmed_record(source)
+        self.stop_preview()
+        self.detail_contexts.clear()
+        self.preview_contexts.clear()
+        self.canvas.clear_detail()
+        self.crop_locator_cache = None
+        self.display_cache.clear()
+        self.snapshot_store.clear()
+        self.load_records(current, source)
+        self.sync_controls()
+        self.status_message("已确认除尘；导出将使用此版本的已核验修复结果。")
 
     def resume_repair(self):
         if self.tasks.busy or not self.current_photo() or self.project.dirty():
@@ -4332,6 +4432,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             source = self.project.workspace.sample(job).record(
                 RESULT_MODES[self.project.photo()["engine"]], "baseline"
             )
+            confirmed = self.project.confirmed_record(source)
+            if confirmed["sha256"] != source["sha256"]:
+                self._show_confirmed_repair(source)
+                return
             for path in reversed(self.project.repair_paths(photo)):
                 receipt = json.loads(Path(path).read_text())
                 if receipt.get("source", {}).get("sha256") != source["sha256"]:
@@ -4368,7 +4472,7 @@ def main():
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--srgb", action="store_true")
     parser.add_argument("--ready-report", type=Path)
-    parser.add_argument("--stage", type=int, choices=range(6))
+    parser.add_argument("--stage", type=int, choices=range(len(STAGES)))
     parser.add_argument("--settings", choices=("general", "display", "performance", "maintenance"))
     args = parser.parse_args()
     from .workflow_application import prepare_application_identity

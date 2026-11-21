@@ -6,3 +6,10 @@
 - activexray/nkscan, commit f971cfd8efe89f6e02507c80b0945206fdaf0bcd, MIT OR Apache-2.0; the MIT option is used for the independent prescan exposure/thumbnail metering port in pure_rgb/nikon_metering.py and shared analyzer arithmetic in pure_rgb/nikon_parameters.py. Source paths and provenance are recorded in those modules, outputs/nikon-metering-v1 and outputs/nikon-parameter-study-v1. See licenses/nkscan-MIT.txt. Matching the public implementation is distinct from complete Nikon Scan reproduction; original resource/distribution constraints remain separate.
 
 All reference checkouts remain separate from the PURE RGB source. This research checkout is not a release bundle. Refer to docs/pure_rgb/LICENSE_RISKS.md before preparing a distribution.
+
+- The Qt scrubber controls adapt the interaction and timing of [SmoothUI Scrubber](https://smoothui.dev/docs/components/scrubber). SmoothUI is MIT licensed. See [its license](licenses/SmoothUI-MIT.txt).
+- The native Spring dropdown, Jelly slider, Rubber dock and Glass lens use the interaction designs and spring parameters published by [DesignBookmark Motion](https://designbookmark.com/motion).
+
+## PURE Neg 观片台
+
+原生灯板和胶片放大镜改编自 PURE Neg 的 BatchLightTable.swift 与 FilmLoupe.swift，版权归 Film Dust for PhotoCraft contributors 所有，采用 MIT 许可。[原项目](https://github.com/easonzhangbin/PURENeg) · [许可全文](licenses/PURENeg-MIT.txt)

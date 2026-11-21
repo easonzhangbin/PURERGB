@@ -7,7 +7,6 @@ from PyQt6.QtGui import QColor, QPainter, QPalette, QPen
 from PyQt6.QtWidgets import (
     QCheckBox,
     QFrame,
-    QHBoxLayout,
     QLabel,
     QPushButton,
     QTabBar,
@@ -27,7 +26,7 @@ from .workflow_performance import (
     backend_status,
 )
 from .workflow_scroll import WorkflowScrollArea
-from .workflow_slider import SliderControl
+from .motion_sliders import ScrubberControl
 
 
 def _note(caption):
@@ -121,14 +120,12 @@ class SettingsPanel(QWidget):
             _note("停止操作 4 秒后，在后台准备其他照片的显示预览。继续操作时优先处理当前照片。")
         )
         column.addWidget(QLabel(f"PURE RGB {APP_VERSION}"))
-        release_actions = QHBoxLayout()
-        self.manual_button = QPushButton("操作手册")
-        self.donation_button = QPushButton("捐赠支持")
-        self.donation_button.setToolTip("打开 StudioPURE 的支持说明")
+        self.manual_button = QPushButton("使用指南")
+        self.donation_button = QPushButton("捐赠 PURE Studio 项目")
+        self.donation_button.setToolTip("查看支付宝捐赠二维码和捐助者名单")
         self.update_button = QPushButton("检查更新")
         for button in (self.manual_button, self.donation_button, self.update_button):
-            release_actions.addWidget(button)
-        column.addLayout(release_actions)
+            column.addWidget(button)
         self.release_status = _note("")
         self.release_status.setTextFormat(Qt.TextFormat.PlainText)
         self.release_status.hide()
@@ -187,7 +184,7 @@ class SettingsPanel(QWidget):
             ("GPU 用于适用的正像预览调整；分区测量、高光分析及保存继续使用精确处理。自动模式优先保持逐码一致；显式GPU的饱和度预览可能有微小舍入差异。"
              if status["gpu_available"] else "GPU 预览不可用，当前使用 CPU。")
         ))
-        self.cpu_threads = SliderControl(
+        self.cpu_threads = ScrubberControl(
             "CPU 线程", 0, min(256, self.hardware["cpu_count"]), 1, 0
         )
         self.cpu_threads.setDefaultValue(0, description="自动线程数")
@@ -195,7 +192,7 @@ class SettingsPanel(QWidget):
             lambda value: self._change("cpu_threads", int(value))
         )
         column.addWidget(self.cpu_threads)
-        self.cache_mb = SliderControl("预览缓存（MiB）", 0, 65536, 256, 0)
+        self.cache_mb = ScrubberControl("预览缓存（MiB）", 0, 65536, 256, 0)
         self.cache_mb.setDefaultValue(0, description="自动缓存预算")
         self.cache_mb.valueChanged.connect(
             lambda value: self._change("cache_mb", int(value))

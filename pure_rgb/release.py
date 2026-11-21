@@ -6,14 +6,14 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.2.0"
 GITHUB_REPOSITORY = "easonzhangbin/PURERGB"
 GITHUB_URL = f"https://github.com/{GITHUB_REPOSITORY}"
 RELEASES_URL = f"{GITHUB_URL}/releases"
 LATEST_RELEASE_URL = f"{RELEASES_URL}/latest"
 OPERATING_MANUAL_PATH = "docs/OPERATING_MANUAL.zh-CN.md"
 OPERATING_MANUAL_URL = f"{GITHUB_URL}/blob/v{APP_VERSION}/{OPERATING_MANUAL_PATH}"
-DONATION_URL = "https://github.com/easonzhangbin/PURENeg/blob/main/SUPPORT.md"
+DONATION_URL = f"{GITHUB_URL}/blob/main/SUPPORT.md"
 
 _VERSION = re.compile(r"v?(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})")
 

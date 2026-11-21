@@ -3,7 +3,7 @@
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
-from .workflow_slider import SliderControl
+from .motion_sliders import ScrubberControl
 from .workflow_attention import AttentionButton
 from .workflow_parameter_reset import add_parameter_reset
 from .workflow_ui_model import RESULT_MODES, with_straighten
@@ -65,7 +65,7 @@ class CropGeometryPanel(QWidget):
             control.clicked.connect(lambda checked=False, action=action: self.rotation_requested.emit(action))
             rotation.addWidget(control)
         column.addLayout(rotation)
-        self.straighten = SliderControl("拉直角度（°）", -45, 45, 0.05, 0)
+        self.straighten = ScrubberControl("拉直角度（°）", -45, 45, 0.05, 0)
         self.straighten.setAccessibleName("裁切拉直角度")
         self.straighten.valueChanged.connect(self._changed)
         column.addWidget(self.straighten)

@@ -31,7 +31,6 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
-    QSlider,
     QSizePolicy,
     QToolButton,
     QVBoxLayout,
@@ -48,7 +47,7 @@ from .workflow_glass import GlassMessageBox, NATIVE_SLIDER_QSS, system_dark
 from .workflow_attention import AttentionButton
 from .workflow_indicators import CheckIndicatorDelegate, ReviewCheckBox
 from .workflow_scroll import WorkflowScrollArea
-from .workflow_slider import SliderControl
+from .motion_sliders import ScrubberControl, ScrubberSlider
 from .workspace import write_json
 
 # PURE Neg 原版设计系统（PURENeg.swift · StudioStyle）
@@ -714,12 +713,14 @@ class ThresholdRow(QWidget):
         self.title = QLabel(title)
         self.title.setObjectName("reviewRowTitle")
         self.title.setFixedWidth(84)
-        self.slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.slider = ScrubberSlider(
+            self, show_labels=False, readout=lambda: f"{self.slider.value()}{self._suffix}"
+        )
+        self.slider.setAccessibleName(title)
         self.slider.setRange(low, high)
         self.slider.setSingleStep(step)
         self.slider.setPageStep(step * 10)
         self.slider.setValue(value)
-        self.slider.setAccessibleName(title)
         self.value_label = QLabel()
         self.value_label.setObjectName("reviewValue")
         self.value_label.setFont(_mono_font(11))
@@ -1044,7 +1045,7 @@ class RepairDialog(QDialog):
         legend.setObjectName("reviewLegend")
         bottom.addWidget(legend)
         bottom.addStretch(1)
-        self.divider = SliderControl("分割对比位置（%）", 5, 95, 1, 50)
+        self.divider = ScrubberControl("分割对比位置（%）", 5, 95, 1, 50)
         self.divider.setToolTip("移动修复后／原图的分割位置，范围为 5%–95%。")
         self.divider.slider.setToolTip(self.divider.toolTip())
         self.divider.slider.setPageStep(10)

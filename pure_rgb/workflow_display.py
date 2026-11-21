@@ -79,8 +79,7 @@ class DisplayTarget:
         )
 
 
-def _cocoa_window_profiles(window):
-    """Read only this window; never substitute CGMainDisplayID for its screen."""
+def _cocoa_view_and_screen(window):
     import objc
 
     view = objc.objc_object(c_void_p=int(window.winId()))
@@ -88,6 +87,23 @@ def _cocoa_window_profiles(window):
     screen = native_window.screen() if native_window else None
     if screen is None:
         raise ValueError("窗口尚未关联实际屏幕")
+    return view, screen
+
+
+def window_display_id(window):
+    """Locate the requesting window even during a pending ICC refresh."""
+    if sys.platform == "darwin" and QApplication.platformName() == "cocoa":
+        try:
+            _, screen = _cocoa_view_and_screen(window)
+            return int(screen.deviceDescription()["NSScreenNumber"])
+        except (ValueError, KeyError, AttributeError, TypeError):
+            pass
+    return None
+
+
+def _cocoa_window_profiles(window):
+    """Read only this window; never substitute CGMainDisplayID for its screen."""
+    view, screen = _cocoa_view_and_screen(window)
     monitor = screen.colorSpace()
     surface = view.colorSpace()
     return dict(

@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
 from .film_profiles import checked_film, film_catalog, generic_film, read_film
 from .workflow_disclosure import DisclosureButton
 from .workflow_combo import WorkflowComboBox
-from .workflow_slider import SliderControl
+from .motion_sliders import ScrubberControl
 
 
 class NativeFilmSelector(QWidget):
@@ -52,7 +52,7 @@ class NativeFilmSelector(QWidget):
         row.addWidget(choose)
         row.addWidget(reset)
         column.addLayout(row)
-        self.strength = SliderControl("串扰校准强度", 0, 1, 0.01, 0)
+        self.strength = ScrubberControl("串扰校准强度", 0, 1, 0.01, 0)
         self.strength.label.setToolTip("串扰校准强度；0 为旁路")
         self.strength.slider.setToolTip("0 为旁路；更改强度后重新测量校准密度")
         column.addWidget(self.strength)
@@ -73,7 +73,7 @@ class NativeFilmSelector(QWidget):
             title.setObjectName("muted")
             group_column.addWidget(title)
             for column_index, source_channel in enumerate("RGB"):
-                cell = SliderControl(
+                cell = ScrubberControl(
                     f"{channel} ← {source_channel}", -8, 8, 0.000001, 0
                 )
                 cell.setAccessibleName(

@@ -958,6 +958,15 @@ def main():
                 span("preview_render", token=request["token"], mode=request["mode"]),
             ):
                 pixels, reference, icc = session.render(request)
+                repair_provenance = None
+                if request.get("repair_plan") is not None:
+                    from .repair_pipeline import preview_repair
+
+                    with span("confirmed_repair_preview", token=request["token"]):
+                        pixels, reference, repair_provenance = preview_repair(
+                            request, session, pixels, reference, icc,
+                            on_progress=lambda progress: emit(**progress),
+                        )
             incoming.check()
             event(
                 "preview_rendered",
@@ -969,6 +978,16 @@ def main():
             records = _write_preview_records(
                 request["directory"], request["token"], pixels, reference, icc
             )
+            quality = getattr(session, "preview_quality", None)
+            if repair_provenance is not None:
+                records[0].update(outside_mask_changed_pixels=0, repair_replay=repair_provenance)
+                quality = {
+                    **(quality or {}),
+                    "approximate": bool((quality or {}).get("approximate"))
+                        or repair_provenance["quality"] != "full-resolution",
+                    "label": "已保留确认除尘的预览；完整导出按原像素修补",
+                    "repair_replay": repair_provenance,
+                }
             metering = getattr(session, "metering_receipt", None)
             desktop = request.get("metering_transport") == "sidecar"
             metering_fields = {"metering_receipt": metering}
@@ -998,7 +1017,7 @@ def main():
                     if getattr(session, "viewport_result", None) is not None else {}
                 ),
                 reference_label=getattr(session, "reference_label", "已保存版本"),
-                preview_quality=getattr(session, "preview_quality", None),
+                preview_quality=quality,
                 **metering_fields,
                 # A retained anchor means the next edit on this session skips
                 # analysis, so the UI can shorten its debounce safely.

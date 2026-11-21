@@ -1,13 +1,16 @@
 """Build a Finder app, optionally with a relocatable runtime."""
 
 import argparse
+import os
 import platform
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
+import tomllib
 from pathlib import Path
 import runpy
 import tarfile
@@ -30,6 +33,9 @@ def ignore_packages(directory, names):
     """Omit local origin metadata and Finder-created duplicate copies."""
     ignored = set(_IGNORE_PACKAGES(directory, names))
     for name in names:
+        if name.casefold() == "crosstalk":
+            ignored.add(name)  # Includes symlinks to a developer's personal catalog.
+            continue
         if re.fullmatch(r"direct_url(?: \d+)?\.json", name):
             ignored.add(name)
             continue
@@ -37,6 +43,16 @@ def ignore_packages(directory, names):
         if original != name and original in names:
             ignored.add(name)
     return ignored
+
+
+def expose_bundled_qt_plugins(plugin_root):
+    """Qt skips macOS-hidden plugins. Normalize the staged copy before signing."""
+    if not (plugin_root / "platforms/libqcocoa.dylib").is_file():
+        raise ValueError("应用运行依赖缺少 Qt Cocoa 平台插件")
+    for path in (plugin_root, *plugin_root.rglob("*")):
+        flags = path.lstat().st_flags
+        if flags & stat.UF_HIDDEN:
+            os.chflags(path, flags & ~stat.UF_HIDDEN, follow_symlinks=False)
 
 
 def sanitize_sboms(packages, public_source):
@@ -87,6 +103,30 @@ def bundle_vendors(source, scratch):
         (destination / ".pure-rgb-revision").write_text(revision + "\n")
 
 
+def exclude_local_film_profiles(resources):
+    """Only the pinned NegPy git archive supplies distributable film matrices."""
+    bundled = resources / "Source/vendor/negpy/crosstalk"
+    for path in resources.rglob("*.[tT][oO][mM][lL]"):
+        if path.parent == bundled:
+            continue
+        if path.is_symlink() and not path.resolve().is_relative_to(resources):
+            path.unlink()
+            continue
+        if not path.is_file():
+            continue
+        if "crosstalk" in (part.casefold() for part in path.relative_to(resources).parts[:-1]):
+            path.unlink()
+            continue
+        try:
+            matrix = tomllib.loads(path.read_text(encoding="utf-8-sig")).get("matrix")
+        except (UnicodeError, tomllib.TOMLDecodeError):
+            continue
+        if isinstance(matrix, list) and len(matrix) == 3 and all(
+            isinstance(row, list) and len(row) == 3 for row in matrix
+        ):
+            path.unlink()
+
+
 def copy_file(relative, destination):
     target = destination / relative
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -135,10 +175,12 @@ def build(output, *, portable=False):
             relocate_sysconfig(runtime, version, python_base)
             bundle_vendors(source, Path(scratch))
             shutil.copytree(dependency_path, resources / "Packages", symlinks=True, ignore=ignore_packages)
+            expose_bundled_qt_plugins(resources / "Packages/PyQt6/Qt6/plugins")
             negpy_pin = runpy.run_path(str(ROOT / "bootstrap.py"))["SOURCES"][0][2]
             public_source = f"https://github.com/marcinz606/NegPy/tree/{negpy_pin}/negpy_core"
             sanitize_sboms(resources / "Packages", public_source)
             copy_file(Path("LICENSE"), source)
+        exclude_local_film_profiles(resources)
         with (contents / "Info.plist").open("wb") as stream:
             plistlib.dump({
                 "CFBundleIdentifier": "io.github.easonzhangbin.purergb",
@@ -147,7 +189,7 @@ def build(output, *, portable=False):
                 "CFBundleExecutable": executable.name,
                 "CFBundlePackageType": "APPL",
                 "CFBundleShortVersionString": release,
-                "CFBundleVersion": "7",
+                "CFBundleVersion": "14",
                 "CFBundleIconFile": "AppIcon.icns",
                 "NSHighResolutionCapable": True,
                 **({"PURE RGB Portable": True, "LSMinimumSystemVersion": "14.0"} if portable else {
@@ -169,6 +211,8 @@ def build(output, *, portable=False):
             str(ROOT / "pure_rgb/UltraThinMaterial.swift"), "-o", str(material_library),
         ], check=True)
         subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(material_library)], check=True)
+        viewer = runpy.run_path(str(ROOT / "pure_rgb/light_table_launcher.py"))
+        viewer["build_executable"](contents / "Helpers" / viewer["NAME"])
         # Finder metadata from locally copied directories prevents signing.
         subprocess.run(["/usr/bin/xattr", "-cr", str(bundle)], check=True)
         subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(bundle)], check=True)

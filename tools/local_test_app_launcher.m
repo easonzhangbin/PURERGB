@@ -18,6 +18,13 @@ static int startupError(NSString *detail, BOOL worker) {
 }
 
 int main(int argc, char **argv) {
+    int (*pythonMain)(int, char **) = NULL;
+    char **arguments = NULL;
+    char *ownedExecutable = NULL;
+    int argumentCount = 0;
+    // Finish native configuration before Python starts. Py_BytesMain finalizes
+    // the interpreter before returning; a pool spanning that call would later
+    // release PyObjC objects which can no longer enter Python safely.
     @autoreleasepool {
         BOOL worker = argc >= 3 && strcmp(argv[1], "-m") == 0 &&
             (strcmp(argv[2], "pure_rgb.workflow_worker") == 0 ||
@@ -71,30 +78,38 @@ int main(int argc, char **argv) {
         if (!python) {
             return startupError([NSString stringWithFormat:@"无法加载打包的 Python 运行时。\n%s", dlerror()], worker);
         }
-        int (*pythonMain)(int, char **) = dlsym(python, "Py_BytesMain");
+        pythonMain = dlsym(python, "Py_BytesMain");
         if (!pythonMain) {
             return startupError(@"打包的 Python 运行时缺少启动入口。", worker);
         }
-        NSString *executable __attribute__((objc_precise_lifetime)) = bundle.executablePath;
-        argv[0] = (char *)executable.fileSystemRepresentation;
-        if (worker) {
-            return pythonMain(argc, argv);
-        }
-        char **arguments = calloc((size_t)argc + 3, sizeof(char *));
-        if (!arguments) {
+        ownedExecutable = strdup(bundle.executablePath.fileSystemRepresentation);
+        arguments = calloc((size_t)argc + 3, sizeof(char *));
+        if (!ownedExecutable || !arguments) {
+            free(ownedExecutable);
+            free(arguments);
             return startupError(@"启动时无法分配内存。", worker);
         }
-        arguments[0] = argv[0];
-        arguments[1] = "-m";
-        arguments[2] = "pure_rgb.workflow_launcher";
-        int argumentCount = 3;
-        for (int i = 1; i < argc; ++i) {
-            if (strncmp(argv[i], "-psn_", 5) != 0) {
-                arguments[argumentCount++] = argv[i];
+        arguments[0] = ownedExecutable;
+        if (worker) {
+            argumentCount = argc;
+            for (int i = 1; i < argc; ++i) {
+                arguments[i] = argv[i];
+            }
+        } else {
+            arguments[1] = "-m";
+            arguments[2] = "pure_rgb.workflow_launcher";
+            argumentCount = 3;
+            for (int i = 1; i < argc; ++i) {
+                if (strncmp(argv[i], "-psn_", 5) != 0) {
+                    arguments[argumentCount++] = argv[i];
+                }
             }
         }
-        int status = pythonMain(argumentCount, arguments);
-        free(arguments);
-        return status;
     }
+    // Keep CPython's normal finally/atexit/worker cleanup. Only C-owned memory
+    // remains here; no ARC objects or host autorelease pool outlive Python.
+    int status = pythonMain(argumentCount, arguments);
+    free(ownedExecutable);
+    free(arguments);
+    return status;
 }

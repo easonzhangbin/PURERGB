@@ -13,7 +13,12 @@ def show_startup_failure(message, *, already_open=False):
 
         from .workflow_glass import GlassMessageBox
 
-        app = QApplication.instance() or QApplication(sys.argv[:1])
+        app = QApplication.instance()
+        if app is None:
+            from .preview_ui import prepare_plugins
+
+            prepare_plugins()
+            app = QApplication(sys.argv[:1])
         app.setApplicationName("PURE RGB")
         # A lock failure happens after the desktop creates its startup screen.
         # Only this new process's splash is closed; the existing app stays open.

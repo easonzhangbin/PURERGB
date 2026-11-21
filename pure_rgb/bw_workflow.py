@@ -324,6 +324,12 @@ def render_bw(request, *, emit_callback=None):
             highlight_processing=high,
         )
         report["results"]["native"] = record
+        if request.get("repair_plan") is not None:
+            from .repair_pipeline import render_repair
+
+            render_repair(request, report, record, "native",
+                          directory=out / "native-repair",
+                          on_progress=lambda progress: emit_event(**progress))
         if recipe.get("native_spatial_controls"):
             report["native_spatial_snapshot"] = processor.pure_spatial_snapshot
             report["native_spatial_processing"] = deepcopy(

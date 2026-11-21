@@ -19,11 +19,12 @@ from PyQt6.QtWidgets import (
 WORKSPACE_INSET = 16
 WORKSPACE_GAP = 12
 MENU_RADIUS = 12
+WORKFLOW_ACCENT = "#d93722"
 
 # Attribute-guarded transparency appended to every tracked surface so the
 # frosted native material shows through regardless of the active stylesheet.
 _GLASS_SURFACE_QSS = """
-QDialog[nativeMaterial="true"], QMessageBox[nativeMaterial="true"] { background:transparent; }
+QDialog#workflowRoot[nativeMaterial="true"], QDialog[nativeMaterial="true"], QMessageBox[nativeMaterial="true"] { background:transparent; }
 QMenu[nativeMaterial="true"] { background:transparent; border-color:transparent; }
 QComboBoxPrivateContainer[nativeMaterial="true"] { background:transparent; border-color:transparent; }
 QComboBox QAbstractItemView[nativeMaterial="true"] { background:transparent; border-color:transparent; }
@@ -88,13 +89,7 @@ def prepare_glass(window):
 
 
 def attach_glass(window, *, base="under", veil=None):
-    """Frost the whole window with a native NSVisualEffectView.
-
-    base selects the AppKit material: "under" is the standard macOS frosted-window material
-    (System Settings style), "menu"/"sidebar" match those native surfaces.
-    veil paints the brand's black scrim plus warm radial gradient; None shows
-    the pure Apple material.
-    """
+    """Place the high-frost background behind the Qt window and its title bar."""
     result = dict(mode="solid", attached=False)
     if getattr(window, "closing", False):
         return {**result, "reason": "window-closing"}
@@ -102,16 +97,14 @@ def attach_glass(window, *, base="under", veil=None):
         return result
     try:
         import objc
+        import AppKit
         from AppKit import (
             NSColor,
-            NSVisualEffectView,
             NSVisualEffectMaterialHUDWindow,
             NSVisualEffectMaterialUnderWindowBackground,
             NSVisualEffectMaterialMenu,
             NSVisualEffectMaterialSidebar,
-            NSVisualEffectStateActive,
             NSView,
-            NSVisualEffectBlendingModeBehindWindow,
             NSWindowBelow,
         )
 
@@ -126,23 +119,12 @@ def attach_glass(window, *, base="under", veil=None):
             "menu": NSVisualEffectMaterialMenu,
             "sidebar": NSVisualEffectMaterialSidebar,
         }
-        effect = NSVisualEffectView.alloc().initWithFrame_(view.frame())
+        from .workflow_ultrathin import make_material, set_material_radius
+        effect, material, reason = make_material(
+            AppKit, view.frame(), materials.get(base, NSVisualEffectMaterialUnderWindowBackground),
+            behind=True, window_base=True)
         effect.setAutoresizingMask_(18)
-        effect.setMaterial_(materials.get(base, NSVisualEffectMaterialHUDWindow))
-        effect.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
-        effect.setState_(NSVisualEffectStateActive)
-        # SwiftUI materials blur app content. Retain the AppKit behind-window
-        # backdrop for the desktop and layer the requested SwiftUI material on it.
-        from .workflow_ultrathin import make_ultrathin_view
-
-        swiftui_view, swiftui_reason = make_ultrathin_view()
-        if swiftui_view is not None:
-            try:
-                swiftui_view.setFrame_(effect.bounds())
-                effect.addSubview_(swiftui_view)
-            except Exception as error:
-                swiftui_view = None
-                swiftui_reason = f"swiftui-material-attach-error: {error}"
+        set_material_radius(effect, material, 0)
         brand_veil = None
         if veil:
             brand_veil = NSView.alloc().initWithFrame_(effect.bounds())
@@ -162,7 +144,6 @@ def attach_glass(window, *, base="under", veil=None):
 
         chrome = attach_chrome(ns_window, view, container, effect)
         window._native_glass = effect
-        window._native_swiftui_material = swiftui_view
         window._native_glass_veil = brand_veil
         return dict(
             mode="native-vibrancy",
@@ -172,8 +153,9 @@ def attach_glass(window, *, base="under", veil=None):
             accent_theme="orange-red" if veil else "system",
             subtle_native_gradient=bool(veil),
             base_material=base,
-            swiftui_material="ultraThinMaterial" if swiftui_view is not None else None,
-            swiftui_reason=swiftui_reason,
+            material=material,
+            swiftui_material=material if material == "thickMaterial" else None,
+            swiftui_reason=reason,
             veil_alpha=veil,
             chrome=chrome,
         )
@@ -196,13 +178,11 @@ def attach_popup_glass(popup, *, base="menu"):
         return result
     try:
         import objc
+        import AppKit
         from AppKit import (
             NSColor,
-            NSVisualEffectView,
             NSVisualEffectMaterialMenu,
             NSVisualEffectMaterialPopover,
-            NSVisualEffectStateActive,
-            NSVisualEffectBlendingModeBehindWindow,
             NSWindowAbove,
             NSWindowBelow,
         )
@@ -216,47 +196,79 @@ def attach_popup_glass(popup, *, base="menu"):
             "popover": NSVisualEffectMaterialPopover,
         }
         frame = view.frame()
-        effect = NSVisualEffectView.alloc().initWithFrame_(
-            ((0, 0), (frame.size.width, frame.size.height))
-        )
-        effect.setMaterial_(materials.get(base, NSVisualEffectMaterialMenu))
-        effect.setWantsLayer_(True)
-        layer = effect.layer()
-        layer.setCornerRadius_(MENU_RADIUS)
-        layer.setMasksToBounds_(True)
-        if hasattr(layer, "setCornerCurve_"):
-            from Quartz import kCACornerCurveContinuous
-
-            layer.setCornerCurve_(kCACornerCurveContinuous)
-
-        effect.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
-        effect.setState_(NSVisualEffectStateActive)
+        from .workflow_ultrathin import make_material, set_material_radius
+        local_frame = ((0, 0), (frame.size.width, frame.size.height))
+        # The Qt view stays a sibling of the effect. AppKit only guarantees
+        # drawing order for NSGlassEffectView.contentView, not arbitrary children.
+        backdrop = AppKit.NSView.alloc().initWithFrame_(local_frame)
+        backdrop.setAutoresizingMask_(18)
+        effect, material, reason = make_material(
+            AppKit, local_frame, materials.get(base, NSVisualEffectMaterialMenu), behind=True)
         effect.setAutoresizingMask_(18)
+        set_material_radius(effect, material, MENU_RADIUS)
+        backdrop.addSubview_(effect)
+        surfaces = [effect]
+        if hasattr(popup, "glass_regions"):
+            second, _, _ = make_material(AppKit, local_frame, AppKit.NSVisualEffectMaterialMenu, behind=True)
+            backdrop.addSubview_(second)
+            surfaces.append(second)
+        workspace = AppKit.NSWorkspace.sharedWorkspace()
+        solid = (workspace.accessibilityDisplayShouldReduceTransparency()
+                 or workspace.accessibilityDisplayShouldIncreaseContrast())
+        if solid:
+            for surface in surfaces:
+                surface.setWantsLayer_(True)
+                surface.layer().setBackgroundColor_(NSColor.windowBackgroundColor().CGColor())
         container = view.superview()
-        swapped = False
-        if container is not None:
-            container.addSubview_positioned_relativeTo_(effect, NSWindowBelow, view)
-            effect.setFrame_(frame)
+        swapped = container is None
+        if swapped:
+            backdrop.addSubview_positioned_relativeTo_(view, NSWindowAbove, None)
+            ns_window.setContentView_(backdrop)
         else:
-            effect.addSubview_positioned_relativeTo_(view, NSWindowAbove, None)
-            ns_window.setContentView_(effect)
-            swapped = True
+            container.addSubview_positioned_relativeTo_(backdrop, NSWindowBelow, view)
+            backdrop.setFrame_(frame)
         ns_window.setOpaque_(False)
         ns_window.setBackgroundColor_(NSColor.clearColor())
         popup._popup_glass = dict(
-            effect=effect, view=view, window=ns_window, swapped=swapped
+            effect=backdrop, surfaces=surfaces, material=material, view=view, window=ns_window, swapped=swapped
         )
+        sync_popup_materials(popup)
         return dict(
             mode="native-popup-vibrancy",
             attached=True,
             window_number=int(ns_window.windowNumber()),
             native_class=str(effect.className()),
             base_material=base,
+            material=material,
+            swiftui_reason=reason,
             content_view_swapped=swapped,
             corner_radius=MENU_RADIUS,
         )
     except Exception as error:
         return {**result, "reason": str(error)}
+
+
+def sync_popup_materials(popup):
+    """Follow the spring trigger and list without frosting their transparent gutters."""
+    state = getattr(popup, "_popup_glass", None)
+    if not state or not hasattr(popup, "glass_regions"):
+        return
+    regions = popup.glass_regions()
+    if state.get("regions") == regions:
+        return
+    state["regions"] = regions
+    from .workflow_ultrathin import set_material_radius
+    from Quartz import CATransaction
+    CATransaction.begin()
+    CATransaction.setDisableActions_(True)
+    try:
+        for effect, (rect, radius, alpha) in zip(state["surfaces"], regions):
+            y = rect.y() if state["effect"].isFlipped() else popup.height() - rect.bottom()
+            effect.setFrame_(((rect.x(), y), (rect.width(), rect.height())))
+            set_material_radius(effect, state["material"], radius)
+            effect.setAlphaValue_(alpha)
+    finally:
+        CATransaction.commit()
 
 
 def detach_popup_glass(popup):
@@ -289,7 +301,6 @@ def detach_glass(window):
     if effect is not None:
         effect.removeFromSuperview()
         window._native_glass = None
-        window._native_swiftui_material = None
         window._native_glass_veil = None
 
 
@@ -322,7 +333,7 @@ class GlassSurfaces(QObject):
             return None  # Native file/colour panels own their materials.
         if isinstance(surface, (QMessageBox, QDialog)):
             return "dialog"
-        if isinstance(surface, QMenu):
+        if isinstance(surface, QMenu) or surface.property("glassPopup"):
             return "popup"
         if surface.metaObject().className() == "QComboBoxPrivateContainer":
             return "popup"
@@ -470,8 +481,11 @@ class GlassMessageBox(QMessageBox):
         prepare_glass(self)
 
     @staticmethod
-    def _present(icon, parent, title, text, buttons=None, default=None, button_labels=None):
+    def _present(icon, parent, title, text, buttons=None, default=None, button_labels=None,
+                 *, use_widget_dialog=False):
         box = GlassMessageBox(parent)
+        if use_widget_dialog:
+            box.setOption(QMessageBox.Option.DontUseNativeDialog)
         box.setWindowTitle(title)
         box.setText(text)
         box.setIcon(icon)
@@ -512,12 +526,14 @@ class GlassMessageBox(QMessageBox):
                             buttons or QMessageBox.StandardButton.Ok, default)
 
     @classmethod
-    def question(cls, parent, title, text, buttons=None, default=None, *, button_labels=None):
+    def question(cls, parent, title, text, buttons=None, default=None, *, button_labels=None,
+                 use_widget_dialog=False):
         return cls._present(
             QMessageBox.Icon.Question, parent, title, text,
             buttons or (QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No),
             default,
             button_labels,
+            use_widget_dialog=use_widget_dialog,
         )
 
     @classmethod
@@ -544,9 +560,9 @@ def stylesheet(glass=False, dark=None):
     text, muted = ("#f2ede4", "#c4c4c4") if dark else ("#1d1d1f", "#60646c")
     background = "transparent" if glass else ("#242322" if dark else "#e8eaee")
     panel = (
-        "rgba(38,37,36,80)"
+        "rgba(38,37,36,30)"
         if glass and dark
-        else "rgba(249,250,253,185)"
+        else "rgba(249,250,253,48)"
         if glass
         else "#2b2927"
         if dark
@@ -556,7 +572,7 @@ def stylesheet(glass=False, dark=None):
     accent = "#ff8052" if dark else "#c93a18"
     edge = "rgba(255,255,255,36)" if dark else "rgba(32,38,48,32)"
     selected = "rgba(255,72,34,48)" if dark else "rgba(222,72,34,40)"
-    primary = "qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #ff632b,stop:0.48 #ff3b24,stop:1 #f52925)"
+    primary = f"qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #df361a,stop:0.48 {WORKFLOW_ACCENT},stop:1 #ca2415)"
     popup = "#302f2e" if dark else "#f7f8fa"
     slider_edge = "rgba(255,255,255,74)" if dark else "rgba(32,38,48,72)"
     slider_hover = "rgba(255,255,255,30)" if dark else "rgba(255,255,255,235)"
@@ -578,14 +594,14 @@ QLabel#sliderValue {{ color:{accent}; font-size:12px; }}
 QPushButton {{ background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 rgba(255,255,255,30),stop:1 rgba(255,255,255,12)); border:1px solid {edge}; border-radius:14px; padding:4px 8px; min-height:20px; }}
 QPushButton[orientationControl="true"] {{ padding:0; min-height:28px; }}
 QPushButton:hover {{ border-color:{accent}; }}
-QPushButton:checked {{ background:rgba(255,128,82,36); color:{accent};
+QPushButton:checked {{ background:{WORKFLOW_ACCENT}; color:#fff;
     border:1px solid {accent}; }}
-QPushButton#primary {{ background:{primary}; color:#24100c; font-weight:600; }}
+QPushButton#primary {{ background:{primary}; color:#fff; font-weight:600; }}
 QPushButton:disabled {{ color:{muted}; background:rgba(255,255,255,10); }}
 QPushButton#primary:disabled {{ background:rgba(255,255,255,10); color:{muted}; }}
 QFrame#workflowStages {{ background:{field}; border:1px solid {edge}; border-radius:17px; }}
 QFrame#workflowStages QPushButton {{ border:0; background:transparent; }}
-QFrame#workflowStages QPushButton:checked {{ background:transparent; color:#fff5ef; }}
+QFrame#workflowStages QPushButton:checked {{ background:transparent; color:#fff; }}
 QWidget[glassControl="true"] {{ background:{field}; border:1px solid {edge}; border-radius:14px; }}
 QWidget[sliderPanel="true"]:hover, QWidget[sliderPanel="true"][sliderHighlighted="true"] {{ background:{slider_hover}; border-color:{slider_edge}; }}
 QWidget[stageHighlight="true"] {{ background:{primary}; border:1px solid {edge}; border-radius:14px; }}
@@ -623,10 +639,10 @@ QComboBox[nativeMaterial="true"], QToolButton[nativeMaterial="true"] {{
 }}
 QWidget[sliderPanel="true"][nativeMaterial="true"]:hover,
 QWidget[sliderPanel="true"][nativeMaterial="true"][sliderHighlighted="true"] {{ background:transparent; border-color:transparent; }}
-QFrame#workflowStages QPushButton[nativeMaterial="true"]:checked {{ background:transparent; border:0; color:#fff5ef; }}
-QPushButton#primary[nativeMaterial="true"] {{ color:#fff5ef; }}
-QPushButton[nativeMaterial="true"]:checked {{ color:#fff5ef; }}
-QPushButton[nativeMaterial="true"]:checked:disabled {{ color:{muted}; }}
+QFrame#workflowStages QPushButton[nativeMaterial="true"]:checked {{ background:transparent; border:0; color:#fff; }}
+QPushButton#primary[nativeMaterial="true"] {{ color:#fff; }}
+QPushButton[nativeMaterial="true"]:checked {{ color:#fff; }}
+QPushButton[nativeMaterial="true"]:checked:disabled, QPushButton#primary[nativeMaterial="true"]:disabled {{ color:{muted}; }}
 QMenu {{ background:{popup}; border:1px solid {edge}; border-radius:{MENU_RADIUS}px; padding:6px; }}
 QMenu::item {{ padding:5px 16px; border-radius:5px; }}
 QMenu::item:selected {{ background:{selected}; color:{accent}; }}
@@ -634,7 +650,7 @@ QMenu::item:disabled {{ color:{muted}; }}
 QMenu#meterZoneMenu {{ border-radius:12px; padding:6px; }}
 QMenu#meterZoneMenu::item {{ padding:7px 14px 7px 28px; border-radius:8px; }}
 QMenu::separator {{ height:1px; background:{edge}; margin:6px 8px; }}
-QDialog[nativeMaterial="true"], QMessageBox[nativeMaterial="true"] {{ background:transparent; }}
+QDialog#workflowRoot[nativeMaterial="true"], QDialog[nativeMaterial="true"], QMessageBox[nativeMaterial="true"] {{ background:transparent; }}
 QMenu[nativeMaterial="true"], QMenu#meterZoneMenu[nativeMaterial="true"] {{ background:transparent; border-color:transparent; }}
 QComboBoxPrivateContainer[nativeMaterial="true"] {{ background:transparent; border-color:transparent; }}
 QComboBox QAbstractItemView[nativeMaterial="true"] {{ background:transparent; border-color:transparent; }}

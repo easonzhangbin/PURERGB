@@ -18,8 +18,9 @@ from .workspace import Workspace, checked_recipe, freeze_render_request, source_
 from .workflow_edit_history import PhotoEditHistory
 
 # Persisted stage IDs remain stable for existing projects and CLI arguments.
-STAGES = ("导入归组", "画幅与对齐", "画幅与测量", "转换调色", "修整审核", "导出")
-VISIBLE_STAGE_INDICES = (0, 2, 3, 4, 5)
+STAGES = ("导入归组", "画幅与对齐", "画幅与测量", "转换调色", "修整审核", "导出", "观片台")
+LIGHT_TABLE_STAGE = 6
+VISIBLE_STAGE_INDICES = (0, 2, 3, 4, LIGHT_TABLE_STAGE, 5)
 VISIBLE_STAGE_LABELS = tuple(STAGES[index] for index in VISIBLE_STAGE_INDICES)
 
 
@@ -328,6 +329,9 @@ class WorkflowProject:
         self.photos = self.data["photos"]
         self.preview_metering = {}
         self._highlight_policy_cache = {}
+        self._repair_documents = {}
+        self._repair_candidates = {}
+        self._repair_frames = {}
         self.orientation_migrations = []
         # Resolve old per-engine directions in memory only. Opening a project
         # does not rewrite its UI metadata, saved jobs or image manifests.
@@ -1127,6 +1131,7 @@ class WorkflowProject:
                 payload = dict(render={
                     **freeze_render_request(recipe), "only_mode": mode,
                     "decode_anchor": self.decode_anchor(photo, recipe),
+                    "repair_plan": self.repair_context(photo, recipe),
                 })
                 revision = uuid.uuid4().hex[:8]
             else:
@@ -1216,11 +1221,131 @@ class WorkflowProject:
         start = (photo or {}).get("repair_reset_index", 0)
         return self.workspace.data.get("repairs", [])[start:]
 
+    @staticmethod
+    def _repair_file_identity(path):
+        stat = Path(path).stat()
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    def _repair_json(self, path):
+        """Cache small documents, never RAWs or repaired pixel buffers."""
+        path = Path(path)
+        before = self._repair_file_identity(path)
+        cached = self._repair_documents.get(str(path))
+        if cached and cached[0] == before:
+            return cached[1], before
+        data = json.loads(path.read_text())
+        if before != self._repair_file_identity(path):
+            raise ValueError("除尘来源清单在读取期间改变，请重试")
+        if len(self._repair_documents) >= 512:
+            self._repair_documents.clear()
+        self._repair_documents[str(path)] = (before, data)
+        return data, before
+
+    def _repair_selection(self, photo=None, recipe=None):
+        """Resolve old reviews once; colour edits only recheck small bindings."""
+        from .repair_plan import geometry_key, make_plan, validate_frame
+
+        photo = photo or self.photo()
+        paths = tuple(self.repair_paths(photo))
+        if not paths:
+            return None, None
+        recipe = recipe or self.recipe(photo)
+        mode = RESULT_MODES[photo["engine"]]
+        identifiers = tuple(dict.fromkeys([
+            *reversed(photo["history"]), *photo["saved"].values(), photo.get("initial_job")]))
+        identities = []
+        for path in paths:
+            try:
+                identities.append((path, self._repair_file_identity(path)))
+            except OSError:
+                identities.append((path, None))
+        signature = (identifiers, tuple(identities))
+        cached = self._repair_candidates.get(photo["id"])
+        if cached is None or cached["signature"] != signature:
+            candidates = []
+            for receipt_path in reversed(paths):
+                try:
+                    receipt, _ = self._repair_json(receipt_path)
+                    if receipt.get("state") == "confirmed":
+                        candidates.append((receipt_path, receipt))
+                except (OSError, ValueError, TypeError):
+                    continue
+            manifests = []
+            if candidates:
+                for identifier in identifiers:
+                    if not identifier:
+                        continue
+                    path = self.workspace.root / "runs" / identifier / "manifest.json"
+                    try:
+                        data, identity = self._repair_json(path)
+                        if data.get("state") == "complete":
+                            manifests.append((path, data, identity))
+                    except (OSError, ValueError, TypeError):
+                        continue
+            cached = dict(signature=signature, plan=None, reason=None)
+            for receipt_path, receipt in candidates:
+                source = receipt.get("source", {})
+                anchor = next(((path, data, identity, old_mode)
+                    for path, data, identity in manifests
+                    for old_mode, record in data.get("results", {}).items()
+                    if record.get("sha256") == source.get("sha256")
+                    and Path(record.get("path", "")).resolve() == Path(source.get("path", "")).resolve()), None)
+                if anchor is None:
+                    continue
+                path, parent, identity, old_mode = anchor
+                try:
+                    cached.update(plan=make_plan(receipt_path, path, old_mode),
+                                  parent_path=path, parent_identity=identity)
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    cached["reason"] = str(error)
+                break
+            self._repair_candidates[photo["id"]] = cached
+        plan = cached["plan"]
+        if plan is None:
+            return None, cached["reason"]
+        try:
+            if self._repair_file_identity(cached["parent_path"]) != cached["parent_identity"]:
+                raise ValueError("除尘来源清单已改变，请重新进行除尘审核")
+            current_job = self.source_job(photo)
+            if current_job is None:
+                return None, "来源配置已改变，请重新进行除尘审核"
+            current_path = self.workspace.root / "runs" / current_job["id"] / "manifest.json"
+            current, current_identity = self._repair_json(current_path)
+            key = (signature, cached["parent_identity"], str(current_path), current_identity,
+                   mode, geometry_key(recipe, current, mode))
+            validated = self._repair_frames.get(photo["id"])
+            if validated is None or validated[0] != key:
+                try:
+                    validate_frame(plan, recipe, current, mode)
+                except ValueError as error:
+                    self._repair_frames[photo["id"]] = (key, str(error))
+                    raise
+                self._repair_frames[photo["id"]] = (key, None)
+            elif validated[1] is not None:
+                raise ValueError(validated[1])
+            return deepcopy(plan), None
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            return None, str(error)
+
+    def repair_context(self, photo=None, recipe=None):
+        return self._repair_selection(photo, recipe)[0]
+
+    def repair_status(self, photo=None, recipe=None):
+        plan, reason = self._repair_selection(photo, recipe)
+        return dict(state="active" if plan else "incompatible" if reason else "none",
+                    message=("已确认除尘将保留；调色后按原审核选区重新修复。" if plan else reason or ""))
+
     def confirmed_record(self, source, photo=None):
         """Only a confirmed review of these exact source bytes replaces output."""
-        for path in reversed(self.repair_paths(photo)):
-            receipt = json.loads(Path(path).read_text())
+        paths = self.repair_paths(photo)
+        if not paths:
+            return source
+        for path in reversed(paths):
+            receipt, _ = self._repair_json(path)
             if receipt.get("source", {}).get("sha256") != source["sha256"]:
+                continue
+            if (receipt.get("source", {}).get("path")
+                    and Path(receipt["source"]["path"]).resolve() != Path(source["path"]).resolve()):
                 continue
             if receipt.get("revision") != source["sha256"]:
                 raise ValueError("除尘审核来源与保存版本不一致")
@@ -1228,6 +1353,30 @@ class WorkflowProject:
                 if not receipt.get("preview", {}).get("sha256"):
                     raise ValueError("已确认审核缺少可验证输出")
                 return deepcopy(receipt["preview"])
+        # New renders retain their original colour baseline. The separately
+        # authenticated repair result is selected only for display/export.
+        from .repair_plan import validate_frame
+
+        photo = photo or self.photo()
+        mode = RESULT_MODES[photo["engine"]]
+        for identifier in dict.fromkeys([*photo["saved"].values(), *reversed(photo["history"])]):
+            path = self.workspace.root / "runs" / identifier / "manifest.json"
+            try:
+                manifest, _ = self._repair_json(path)
+            except (OSError, ValueError):
+                continue
+            original = manifest.get("results", {}).get(mode, {})
+            if (original.get("sha256") != source["sha256"]
+                    or Path(original.get("path", "")).resolve() != Path(source["path"]).resolve()):
+                continue
+            repaired = manifest.get("repair_results", {}).get(mode)
+            if repaired:
+                if repaired.get("source_sha256") != source["sha256"]:
+                    raise ValueError("派生除尘版本与计算基准不一致")
+                validate_frame(repaired["repair_plan"], manifest["recipe"], manifest, mode)
+                active = self.repair_context(photo)
+                if active and active["receipt_sha256"] == repaired["repair_plan"]["receipt_sha256"]:
+                    return deepcopy(repaired)
         return source
 
     def export_request(self, destination):

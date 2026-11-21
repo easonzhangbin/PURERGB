@@ -67,19 +67,18 @@ class _Attention(QObject):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         bounds = QRectF(button.rect()).adjusted(1, 1, -1, -1)
         gradient = QLinearGradient(bounds.topLeft(), bounds.bottomRight())
-        alpha = round(152 + 62 * level) if button.property("nativeMaterial") else 255
-        gradient.setColorAt(0, QColor(round(177 + 65 * level), round(24 + 19 * level), 15, alpha))
-        gradient.setColorAt(1, QColor(round(153 + 69 * level), round(17 + 13 * level), 12, alpha))
+        gradient.setColorAt(0, QColor(round(182 + 52 * level), round(34 + 20 * level), 22))
+        gradient.setColorAt(1, QColor(round(168 + 54 * level), round(23 + 18 * level), 16))
         painter.setBrush(gradient)
         painter.setPen(QPen(QColor(255, 164, 129, round(90 + 130 * level)), 1))
-        radius = min(14.0, bounds.height() / 2)
+        radius = bounds.height() / 2 if button.property("nativeMaterial") else min(14.0, bounds.height() / 2)
         painter.drawRoundedRect(bounds, radius, radius)
         if button.hasFocus():
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(QColor("#fff0de"), 1, Qt.PenStyle.DotLine))
             painter.drawRoundedRect(bounds.adjusted(3, 3, -3, -3), radius - 3, radius - 3)
         painter.setFont(attention_font(button))
-        painter.setPen(QColor("#fff8f0"))
+        painter.setPen(QColor("#ffffff"))
         text = bounds.adjusted(ATTENTION_TEXT_INSET, 0, -ATTENTION_TEXT_INSET, 0)
         painter.drawText(text, ATTENTION_TEXT_FLAGS, button.text())
 

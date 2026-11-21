@@ -83,6 +83,7 @@ def _render_budget(item):
     simple = (
         item.get("mode") == "native"
         and render.get("only_mode", "native") == "native"
+        and render.get("repair_plan") is None
         and not render.get("repairs")
         and not render.get("calibration")
         and set(recipe) <= allowed
@@ -262,7 +263,11 @@ def _export_item(item, index, total, root, report_progress):
         )
         if manifest["state"] != "complete":
             raise ValueError("全尺寸结果尚未完成")
-        record = manifest["results"][item["mode"]]
+        from .repair_pipeline import export_record
+
+        record = export_record(
+            manifest, item["mode"], repair_required=payload.get("repair_plan") is not None,
+        )
     with span("export_verified_copy", sample=item["id"], mode=item["mode"]):
         target = copy_verified_tiff(record, item["destination"])
     return {

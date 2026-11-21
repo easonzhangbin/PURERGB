@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
 from .workflow_disclosure import DisclosureButton
 from .workflow_combo import WorkflowComboBox as QComboBox
 
-from .workflow_slider import SliderControl
+from .motion_sliders import ScrubberControl
 from .workflow_parameter_reset import add_parameter_reset
 from .workflow_advanced import advanced_groups, advanced_values, apply_advanced
 
@@ -51,7 +51,7 @@ class FieldPage(QWidget):
                     control.addItem(title, value)
                 control.currentIndexChanged.connect(self.notify_changed)
             else:
-                control = SliderControl(
+                control = ScrubberControl(
                     spec.title,
                     spec.low,
                     spec.high,

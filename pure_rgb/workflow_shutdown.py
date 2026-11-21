@@ -11,6 +11,7 @@ def shutdown_window(window):
     """Idempotent for window-close, Cmd-Q and the application finally block."""
     if getattr(window, "_shutdown_complete", False):
         return
+    window._event_filters_active = False
     window.closing = True
     for cancel in list(getattr(window, "_deferred_display_work", {}).values()):
         try:
@@ -24,6 +25,8 @@ def shutdown_window(window):
     window.maintenance_timer.stop()
     window.idle_scheduler.stop()
     QApplication.instance().removeEventFilter(window)
+    window.canvas.removeEventFilter(window)
+    window.stage_navigation.dispose()
     window.preview_timer.stop()
     import_preview_timer = getattr(window, "import_preview_timer", None)
     if import_preview_timer is not None:
@@ -44,6 +47,7 @@ def shutdown_window(window):
     window.tasks.shutdown()
     window.pool.waitForDone()
     window.idle_pool.waitForDone()
+    window.light_table.close()
     window.snapshot_store.close(force=True)
     tracker = getattr(window, "display_tracker", None)
     if tracker is not None:

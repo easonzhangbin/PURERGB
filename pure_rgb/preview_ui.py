@@ -3,11 +3,13 @@
 import argparse
 from collections import OrderedDict
 from copy import deepcopy
+from functools import lru_cache
 import io
 import math
 import os
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 
 import numpy as np
 from PIL import Image, ImageCms
@@ -49,7 +51,6 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QScrollArea,
-    QSlider,
     QSplashScreen,
     QSplitter,
     QStackedWidget,
@@ -68,6 +69,7 @@ from .workflow_glass import (
     install_glass_surfaces, prepare_glass,
 )
 from .workflow_combo import WorkflowComboBox as QComboBox
+from .motion_sliders import ScrubberSlider
 from .workflow_materials import attach_materials
 from .preview_data import (
     DEFAULT_STUDY,
@@ -155,6 +157,9 @@ def panel(name="panel"):
 
 def about_dialog(parent=None):
     """关于页：品牌组合标 + 工作流说明。"""
+    from .release import APP_VERSION
+    from .workflow_support import DONORS
+
     dialog = QDialog(parent)
     dialog.setWindowTitle("关于 PURE RGB")
     dialog.setFixedWidth(440)
@@ -165,8 +170,8 @@ def about_dialog(parent=None):
     art.setPixmap(lockup_pixmap())
     art.setAlignment(Qt.AlignmentFlag.AlignHCenter)
     layout.addWidget(art)
-    layout.addWidget(label("RAW → 三路反演 → 除尘审核 → RGB16", "muted", True))
-    layout.addWidget(label("实验性色彩工作流 · 本机渲染", "muted", True))
+    layout.addWidget(label(f"PURE RGB {APP_VERSION} · 三色负片与黑白影像工作流", "muted", True))
+    layout.addWidget(label(f"感谢以下捐助者\n{DONORS}", "muted", True))
     close = button("关闭", dialog.accept, True)
     from .workflow_attention import attach_attention
 
@@ -228,6 +233,7 @@ class Canvas(QWidget):
         self.reference_name = "Native"
         # Opt in only in the staged workflow. Older workbenches keep their
         # existing whole-frame 100% request protocol.
+        self.photo_lens = None
         self.detail_enabled = False
         self.detail_max_pixels = 4_000_000
         self._detail_output_size = None
@@ -261,7 +267,7 @@ class Canvas(QWidget):
         if self._detail_output_size != size:
             self.clear_detail()
             self._detail_output_size = size
-        if not self.fit_mode:
+        if not self.fit_mode or (self.photo_lens and self.photo_lens.active):
             self._schedule_detail()
 
     def clear_detail(self):
@@ -278,29 +284,32 @@ class Canvas(QWidget):
         if self._detail_pending and self._detail_pending["request_id"] == request_id:
             self._detail_pending = None
 
-    def _detail_view(self, *, margin=0):
+    def _detail_view(self, *, margin=0, lens=False):
+        magnification = self.photo_lens.zoom.target if lens else 1.0
+        device_zoom = self.zoom * self.devicePixelRatioF() * magnification
         if (not self.detail_enabled or not self.current or self.sample_scale <= 1
-                or self.zoom * self.devicePixelRatioF() <= 1.02
+                or device_zoom <= 1.02
                 or not self.isVisible()):
             return None
         if self._detail_output_size is None:
             return None
         width, height = self._detail_output_size
         scale = self.sample_scale / self.zoom
-        x0 = max(0, math.floor((-margin - self.origin.x()) * scale))
-        y0 = max(0, math.floor((-margin - self.origin.y()) * scale))
-        x1 = min(width, math.ceil((self.width() + margin - self.origin.x()) * scale))
-        y1 = min(height, math.ceil((self.height() + margin - self.origin.y()) * scale))
+        bounds = self.photo_lens.sample_view() if lens else QRectF(self.rect())
+        x0 = max(0, math.floor((bounds.left() - margin - self.origin.x()) * scale))
+        y0 = max(0, math.floor((bounds.top() - margin - self.origin.y()) * scale))
+        x1 = min(width, math.ceil((bounds.right() + margin - self.origin.x()) * scale))
+        y1 = min(height, math.ceil((bounds.bottom() + margin - self.origin.y()) * scale))
         if x1 <= x0 or y1 <= y0:
             return None
-        wanted = max(1, math.floor(self.sample_scale / (self.zoom * self.devicePixelRatioF())))
+        wanted = max(1, math.floor(self.sample_scale / device_zoom))
         step = 2 ** int(math.floor(math.log2(wanted)))
         center_only = False
-        if self.zoom * self.devicePixelRatioF() / self.sample_scale >= 1 - 1e-9:
+        if device_zoom / self.sample_scale >= 1 - 1e-9:
             # Never label a step-2 tile as actual pixels. A very large viewport
             # gets a bounded central 1:1 tile, retaining the base around it.
             if (x1 - x0) * (y1 - y0) > self.detail_max_pixels and margin:
-                return self._detail_view(margin=0)
+                return self._detail_view(margin=0, lens=lens)
             if (x1 - x0) * (y1 - y0) > self.detail_max_pixels:
                 ratio = math.sqrt(self.detail_max_pixels / ((x1 - x0) * (y1 - y0)))
                 tile_width = max(1, math.floor((x1 - x0) * ratio))
@@ -336,7 +345,8 @@ class Canvas(QWidget):
             self.detail_timer.start(delay)
 
     def _request_detail(self):
-        if (self.detail_enabled and self.current and self.sample_scale > 1
+        lens = self.photo_lens is not None and self.photo_lens.active
+        if (not lens and self.detail_enabled and self.current and self.sample_scale > 1
                 and self._detail_output_size is None and not self._detail_full_requested
                 and self.zoom * self.devicePixelRatioF() > 1.02 and self.isVisible()):
             # Unknown geometry cannot be inferred from ceil-sized samples.
@@ -344,10 +354,10 @@ class Canvas(QWidget):
             self._detail_full_requested = True
             self.full_resolution_requested.emit()
             return
-        visible = self._detail_view()
+        visible = self._detail_view(lens=lens)
         if visible is None:
             return
-        request = self._detail_view(margin=48) or deepcopy(visible)
+        request = self._detail_view(margin=48, lens=lens) or deepcopy(visible)
         # The padded request may need a coarser LOD to stay under the tile
         # budget; that same accepted quality covers an unchanged viewport.
         visible["sample_step"] = request["sample_step"]
@@ -405,6 +415,8 @@ class Canvas(QWidget):
                 (self.height() - 60) / self.current.height(),
             )
             self.center()
+            if self.photo_lens and self.photo_lens.active:
+                self._schedule_detail()
 
     def center(self):
         self.origin = QPointF(
@@ -543,6 +555,20 @@ class Canvas(QWidget):
         painter.drawImage(bitmap, image)
         painter.restore()
 
+    def paint_photos(self, painter):
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        target = QRectF(self.origin, self.current.size().toSizeF() * self.zoom)
+        painter.drawImage(target, self.current)
+        self._paint_detail(painter, self._detail_current)
+        if self.split and self.reference:
+            painter.save()
+            painter.setClipRect(
+                QRectF(0, 0, self.width() * self.fraction, self.height()), Qt.ClipOperation.IntersectClip
+            )
+            painter.drawImage(target, self.reference)
+            self._paint_detail(painter, self._detail_reference)
+            painter.restore()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#141517"))
@@ -552,18 +578,8 @@ class Canvas(QWidget):
                 self.rect(), Qt.AlignmentFlag.AlignCenter, self.empty_message
             )
             return
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        target = QRectF(self.origin, self.current.size().toSizeF() * self.zoom)
-        painter.drawImage(target, self.current)
-        self._paint_detail(painter, self._detail_current)
+        self.paint_photos(painter)
         if self.split and self.reference:
-            painter.save()
-            painter.setClipRect(
-                QRectF(0, 0, self.width() * self.fraction, self.height())
-            )
-            painter.drawImage(target, self.reference)
-            self._paint_detail(painter, self._detail_reference)
-            painter.restore()
             x = self.width() * self.fraction
             painter.setPen(QPen(QColor("#F0A055"), 2))
             painter.drawLine(QPointF(x, 0), QPointF(x, self.height()))
@@ -589,6 +605,8 @@ class Canvas(QWidget):
             painter.setPen(QColor("#F2EDE4"))
             painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, shown)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        if self.photo_lens is not None:
+            self.photo_lens.paint(painter)
 
 
 def display_image(record, display_icc):
@@ -613,29 +631,33 @@ def display_image(record, display_icc):
     ).copy()
 
 
-def prepare_plugins():
-    """Expose hidden macOS plugin files without changing installed dependencies.
+@lru_cache(maxsize=1)
+def _plugin_mirror(source):
+    """Keep visible links to the loaded Qt runtime alive for this process."""
+    mirror = TemporaryDirectory(prefix="pure-rgb-qt-")
+    root = Path(mirror.name)
+    for plugin in source.glob("*/*.dylib"):
+        target = root / plugin.relative_to(source)
+        target.parent.mkdir(exist_ok=True)
+        target.symlink_to(plugin)
+    return mirror
 
-    Local vendor files have UF_HIDDEN flags; QDir skips the plugin dylibs.
-    Unhidden symlinks keep the original binaries and resolved framework paths.
-    """
+
+def prepare_plugins():
     if sys.platform != "darwin":
         return
-    source = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath))
-    if not any(
-        QFileInfo(str(p)).isHidden() for p in (source / "platforms").glob("*.dylib")
+    source = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)).resolve()
+    platforms = source / "platforms"
+    if not (platforms / "libqcocoa.dylib").is_file():
+        raise RuntimeError("找不到当前 Qt 运行时的 Cocoa 平台插件")
+    if QFileInfo(str(platforms)).isHidden() or any(
+        QFileInfo(str(p)).isHidden() for p in platforms.glob("*.dylib")
     ):
-        return
-    mirror = ROOT / "outputs/ui-preview-state/qt-plugins"
-    for directory in source.iterdir():
-        if not directory.is_dir():
-            continue
-        for plugin in directory.glob("*.dylib"):
-            target = mirror / directory.name / plugin.name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.is_symlink() and not target.exists():
-                target.symlink_to(plugin)
-    QCoreApplication.addLibraryPath(str(mirror))
+        # Source checkouts can contain Finder-hidden libraries. An app's
+        # previous installation must never supply plugin links to a new one.
+        QCoreApplication.addLibraryPath(_plugin_mirror(source).name)
+    else:
+        QCoreApplication.addLibraryPath(str(source))
 
 
 class PreviewWindow(QMainWindow):
@@ -775,10 +797,10 @@ class PreviewWindow(QMainWindow):
         self.canvas_stack = QStackedWidget()
         self.canvas_stack.addWidget(self.canvas)
         center_layout.addWidget(self.canvas_stack, 1)
-        self.split_slider = QSlider(Qt.Orientation.Horizontal)
+        self.split_slider = ScrubberSlider(readout=lambda: f"{self.split_slider.value()}%")
+        self.split_slider.setAccessibleName("Native 分割对比位置")
         self.split_slider.setRange(5, 95)
         self.split_slider.setValue(50)
-        self.split_slider.setAccessibleName("Native 分割对比位置")
         self.split_slider.valueChanged.connect(self.move_split)
         self.split_slider.hide()
         center_layout.addWidget(self.split_slider)
