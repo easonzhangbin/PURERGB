@@ -1,12 +1,14 @@
 """Public PURE RGB release metadata and stable release comparison."""
 
 import re
+import json
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 GITHUB_REPOSITORY = "easonzhangbin/PURERGB"
 GITHUB_URL = f"https://github.com/{GITHUB_REPOSITORY}"
 RELEASES_URL = f"{GITHUB_URL}/releases"
@@ -16,6 +18,19 @@ OPERATING_MANUAL_URL = f"{GITHUB_URL}/blob/v{APP_VERSION}/{OPERATING_MANUAL_PATH
 DONATION_URL = f"{GITHUB_URL}/blob/main/SUPPORT.md"
 
 _VERSION = re.compile(r"v?(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})")
+
+
+def version_description():
+    """Identify a local test build without changing stable update comparison."""
+    try:
+        info = json.loads(Path(__file__).with_name("build-info.json").read_text())
+    except (OSError, ValueError, TypeError):
+        return APP_VERSION
+    if isinstance(info, dict) and info.get("test") is True:
+        build = info.get("build")
+        if isinstance(build, str) and re.fullmatch(r"[1-9][0-9]*", build):
+            return f"{APP_VERSION} 测试版 · Build {build}"
+    return APP_VERSION
 
 
 def check_newer_release():

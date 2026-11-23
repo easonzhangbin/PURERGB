@@ -23,6 +23,7 @@ _KEYS = {
     "output_roi",
     "output_orientation",
     "density",
+    "measurement_method",
     "paper",
     "crop",
     "exposure_ev",
@@ -200,4 +201,10 @@ def checked_bw_recipe(recipe, *, verify_resources=True):
                 "BW float controls require the explicit spatial workflow",
             )
             result["native_float_controls"] = checked
+    from .measurement_method import checked_method
+
+    checked_method(result)
+    from .native_metering_controls import process_controls_active
+    _require(not process_controls_active(result.get("native_controls", {}).get("values", {})),
+             "当前黑白测量未开放独立白点／黑点及范围截断，请在原生黑白参数范围内调整。")
     return result

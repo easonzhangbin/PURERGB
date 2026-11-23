@@ -29,7 +29,6 @@ class CropGeometryPanel(QWidget):
 
     manual_crop_requested = pyqtSignal()
     clear_crop_requested = pyqtSignal()
-    auto_crop_requested = pyqtSignal(str)
     rotation_requested = pyqtSignal(str)
     straighten_changed = pyqtSignal(float, bool)
     straighten_draw_requested = pyqtSignal()
@@ -44,12 +43,6 @@ class CropGeometryPanel(QWidget):
         self.manual = QPushButton("绘制独立输出裁切")
         self.manual.clicked.connect(self.manual_crop_requested)
         column.addWidget(self.manual)
-        self.auto_film = QPushButton("自动裁切 · 保留片基文字")
-        self.auto_film.clicked.connect(lambda: self.auto_crop_requested.emit("film_border"))
-        column.addWidget(self.auto_film)
-        self.auto_image = QPushButton("自动裁切 · 仅有效图像")
-        self.auto_image.clicked.connect(lambda: self.auto_crop_requested.emit("image"))
-        column.addWidget(self.auto_image)
         self.clear = QPushButton("取消输出裁切")
         self.clear.clicked.connect(self.clear_crop_requested)
         column.addWidget(self.clear)
@@ -129,6 +122,5 @@ def install_crop_panel(window, layout, stage):
     panel.straighten_draw_requested.connect(
         lambda panel=panel: window.begin_straighten_draw(panel)
     )
-    panel.auto_crop_requested.connect(window.apply_auto_crop)
     layout.addWidget(panel)
     return panel

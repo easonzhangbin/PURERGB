@@ -45,6 +45,12 @@ int main(int argc, char **argv) {
             NSString *support = [files URLsForDirectory:NSApplicationSupportDirectory
                                               inDomains:NSUserDomainMask].firstObject.path;
             workspace = [support stringByAppendingPathComponent:@"PURE RGB"];
+            // Test automation may keep all preferences and worker caches in a
+            // private directory. Normal launches retain the user's workspace.
+            const char *testData = getenv("PURE_RGB_TEST_DATA_DIR");
+            if ([config[@"PURE RGB Test Build"] boolValue] && testData && testData[0] == '/') {
+                workspace = [NSString stringWithUTF8String:testData];
+            }
             deps = [resources stringByAppendingPathComponent:@"Packages"];
             vendor = [source stringByAppendingPathComponent:@"vendor"];
             if (!workspace || ![files createDirectoryAtPath:workspace withIntermediateDirectories:YES

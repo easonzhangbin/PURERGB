@@ -1,0 +1,28 @@
+diff --git a/src/widgets/accessible/itemviews.cpp b/src/widgets/accessible/itemviews.cpp
+index 3366a610..4f40f656 100644
+--- a/src/widgets/accessible/itemviews.cpp
++++ b/src/widgets/accessible/itemviews.cpp
+@@ -667,7 +667,10 @@ void QAccessibleTable::modelChange(QAccessibleTableModelChangeEvent *event)
+         while (iter != childToId.constEnd()) {
+             QAccessible::Id id = iter.value();
+             QAccessibleInterface *iface = QAccessible::accessibleInterface(id);
+-            Q_ASSERT(iface);
++            if (!iface) {
++                ++iter;
++                continue;
++            }
+             if (event->modelChangeType() == QAccessibleTableModelChangeEvent::RowsInserted
+                 && iface->role() == QAccessible::RowHeader) {
+                 QAccessibleTableHeaderCell *cell = static_cast<QAccessibleTableHeaderCell*>(iface);
+@@ -704,7 +707,10 @@ void QAccessibleTable::modelChange(QAccessibleTableModelChangeEvent *event)
+         while (iter != childToId.constEnd()) {
+             QAccessible::Id id = iter.value();
+             QAccessibleInterface *iface = QAccessible::accessibleInterface(id);
+-            Q_ASSERT(iface);
++            if (!iface) {
++                ++iter;
++                continue;
++            }
+             if (iface->role() == QAccessible::Cell || iface->role() == QAccessible::ListItem) {
+                 Q_ASSERT(iface->tableCellInterface());
+                 QAccessibleTableCell *cell = static_cast<QAccessibleTableCell*>(iface->tableCellInterface());

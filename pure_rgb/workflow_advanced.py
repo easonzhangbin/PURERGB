@@ -16,6 +16,7 @@ from .positive_post import POST_SPECS
 from .native_spatial_v30 import LAB_FIELDS
 from .workflow_ui_model import RESULT_MODES
 from .workspace import checked_recipe
+from .native_metering_controls import RANGE_FIELDS, native_to_slider, slider_to_native
 
 
 @dataclass(frozen=True)
@@ -176,6 +177,14 @@ def advanced_groups(recipe, engine, bw, stage):
     native = engine == "native"
     spatial = bool(recipe.get("native_spatial_controls"))
     if stage == 2:
+        if native and not bw and recipe.get("measurement_method") == "negpy":
+            groups.append(_group(
+                "native_metering", "NegPy 原生测量参数",
+                "与 NegPy 相同的白点、黑点及范围测量参数。截断使用 NegPy 的 −100 至 100 标尺；负值更温和，复位恢复原生默认值。",
+                tuple(replace(s, default=0., low=-100., high=100., step=1.)
+                      if s.key in RANGE_FIELDS else s
+                      for s in NATIVE_SPECS if s.group == "原生密度测量"),
+            ))
         if native and spatial:
             groups.append(
                 _group(
@@ -203,7 +212,7 @@ def advanced_groups(recipe, engine, bw, stage):
             note = "印相参数。" + (
                 "当前分区使用冻结分析；修改本组后需保存新版本重新分析。"
                 if spatial
-                else "自动印相密度／反差开启时，数值作为原生计算参数参与处理。"
+                else "自动印相密度／反差开启时，这里的数值是计算基准；本次实际印相密度与 ISO-R 反差显示在更新后的画面左上角。"
             )
             groups.append(_group("native_print", "原生印相", note, print_specs))
             curve = [
@@ -508,6 +517,8 @@ def advanced_values(recipe, group_key):
                     for k, v in recipe["native_spatial_controls"]["lab"].items()
                 }
             )
+    if group_key == "native_metering":
+        values = {key: native_to_slider(key, value) for key, value in values.items()}
     return {
         s.key: deepcopy(values[s.key])
         for s in group.specs
@@ -655,6 +666,8 @@ def apply_advanced(recipe, engine, bw, changes):
                 },
             )
         else:
+            if key == "native_metering":
+                values = {field: slider_to_native(field, value) for field, value in values.items()}
             result["native_controls"] = _replace_values(
                 result.get("native_controls"), group.specs, values
             )

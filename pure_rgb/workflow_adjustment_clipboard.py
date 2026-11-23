@@ -241,7 +241,7 @@ class PasteAdjustmentsDialog(QDialog):
         source_label = QLabel(f"从 {source['name']} 复制到 {target[1]}")
         source_label.setWordWrap(True)
         layout.addWidget(source_label)
-        self.batch = QCheckBox(f"同时应用到另外 {len(others)} 张已勾选照片")
+        self.batch = QCheckBox(f"同时应用到另外 {len(others)} 张已选照片")
         layout.addWidget(self.batch)
         self.batch.setVisible(bool(others))
 

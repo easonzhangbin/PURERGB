@@ -8,6 +8,23 @@ from PyQt6.QtWidgets import QAbstractItemView, QComboBox, QStyle, QStyleOptionCo
 class WorkflowComboBox(QComboBox):
     """Keep Qt selection/accessibility while sizing text and chevron explicitly."""
 
+    def syncItems(self, entries):
+        """Update catalog rows without resetting the accessible item model."""
+        entries = list(entries)
+        with QSignalBlocker(self):
+            for index, (title, data) in enumerate(entries):
+                if index >= self.count():
+                    self.addItem(title, data)
+                else:
+                    if self.itemText(index) != title:
+                        self.setItemText(index, title)
+                    if self.itemData(index) != data:
+                        self.setItemData(index, data)
+            if entries and self.currentIndex() >= len(entries):
+                self.setCurrentIndex(0)
+            for index in range(self.count() - 1, len(entries) - 1, -1):
+                self.removeItem(index)
+
     def contentRect(self):
         return self.rect().adjusted(14, 0, -34, 0)
 

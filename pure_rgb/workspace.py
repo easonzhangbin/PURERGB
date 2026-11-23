@@ -110,6 +110,7 @@ def checked_recipe(recipe, *, verify_resources=True):
         "roi",
         "density",
         "density_metering",
+        "measurement_method",
         "paper",
         "exposure_ev",
         "crop",
@@ -205,6 +206,9 @@ def checked_recipe(recipe, *, verify_resources=True):
         or not 0 <= roi[1] < roi[3]
     ):
         raise ValueError("成像区域必须为半开区间 x0 y0 x1 y1，或自动识别")
+    from .measurement_method import checked_method
+
+    checked_method(result)
     result.setdefault("density", "negpy")
     result.setdefault("paper", "neutral")
     result.setdefault("exposure_ev", 0.0)

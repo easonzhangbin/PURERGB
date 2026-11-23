@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QFontDatabase
 
+from . import WORKSPACE_ROOT
 from .workflow_progress import WorkflowProgressBar
 from .branding import pureneg_powered_label, pureneg_wordmark_label
 from .native import sha256
@@ -49,6 +50,7 @@ from .workflow_indicators import CheckIndicatorDelegate, ReviewCheckBox
 from .workflow_scroll import WorkflowScrollArea
 from .motion_sliders import ScrubberControl, ScrubberSlider
 from .workspace import write_json
+from .workflow_notices import NoticeLabel
 
 # PURE Neg 原版设计系统（PURENeg.swift · StudioStyle）
 CHARCOAL = "#141517"
@@ -57,6 +59,16 @@ LIGHT = "#F2EDE4"
 SECONDARY = "#C4C4C4"
 MASK_RED = "#FF254D"
 EXCLUDED_GRAY = "#8E8E93"
+REPAIR_TOOL_PREFERENCES = WORKSPACE_ROOT / "outputs/workflow-ui-state/repair-tools.json"
+
+
+def _last_brush_radius():
+    try:
+        value = json.loads(REPAIR_TOOL_PREFERENCES.read_text()).get("brush_radius")
+    except (OSError, ValueError, AttributeError):
+        return 8
+    return value if type(value) is int and 1 <= value <= 96 else 8
+
 
 REVIEW_QSS = f"""
 QDialog {{ background:{CHARCOAL}; }}
@@ -517,7 +529,7 @@ class RepairPreparingDialog(QDialog):
         heading.addWidget(self.title)
         heading.addStretch()
         outer.addLayout(heading)
-        self.message = QLabel("正在准备完整版本并检测尘点、划痕与纤维…")
+        self.message = NoticeLabel("正在准备完整版本并检测尘点、划痕与纤维…")
         self.message.setWordWrap(True)
         outer.addWidget(self.message)
 
@@ -527,7 +539,7 @@ class RepairPreparingDialog(QDialog):
         self.progress.setAccessibleName("除尘准备进度")
         outer.addWidget(self.progress)
 
-        self.detail = QLabel("检测在后台独立进程运行，期间可随时取消。")
+        self.detail = NoticeLabel("检测在后台独立进程运行，期间可随时取消。")
         self.detail.setWordWrap(True)
         outer.addWidget(self.detail)
 
@@ -974,9 +986,9 @@ class RepairDialog(QDialog):
         self.tool_hint.setObjectName("reviewHint")
         self.tool_hint.setWordWrap(True)
         column.addWidget(self.tool_hint)
-        self.radius = ThresholdRow("画笔半径", 1, 96, 1, 8, " px")
-        self.radius.setToolTip("按 【 或 】 调整画笔半径")
-        self.radius.valueChanged.connect(lambda value: self.canvas.set_radius(value))
+        self.radius = ThresholdRow("画笔半径", 1, 96, 1, _last_brush_radius(), " px")
+        self.radius.setToolTip("按 【 或 】 调整画笔半径；下次除尘沿用此半径。")
+        self.radius.valueChanged.connect(self._radius_changed)
         column.addWidget(self.radius)
         history_row = QHBoxLayout()
         history_row.setSpacing(6)
@@ -1003,7 +1015,7 @@ class RepairDialog(QDialog):
         # 03 导出（固定在侧栏底部，随滚动区收缩）
         side.addWidget(review_separator())
         side.addWidget(review_section("03", "导出"))
-        self.status = QLabel("载入审核结果…")
+        self.status = NoticeLabel("载入审核结果…")
         self.status.setObjectName("reviewMessage")
         self.status.setWordWrap(True)
         side.addWidget(self.status)
@@ -1037,6 +1049,7 @@ class RepairDialog(QDialog):
         well_layout = QHBoxLayout(well)
         well_layout.setContentsMargins(1, 1, 1, 1)
         self.canvas = RepairCanvas()
+        self.canvas.set_radius(self.radius.value())
         well_layout.addWidget(self.canvas)
         center.addWidget(well, 1)
         bottom = QHBoxLayout()
@@ -1087,6 +1100,14 @@ class RepairDialog(QDialog):
     # ------------------------------------------------------------------ #
     # Canvas-driving controls
     # ------------------------------------------------------------------ #
+
+    def _radius_changed(self, value):
+        self.canvas.set_radius(value)
+        # Tool preferences belong to the application, not the photo's edits.
+        try:
+            write_json(REPAIR_TOOL_PREFERENCES, {"brush_radius": int(value)})
+        except OSError:
+            pass
 
     def _apply_system_palette(self, *_):
         self.setStyleSheet(REVIEW_QSS if system_dark() else REVIEW_QSS + REVIEW_LIGHT_QSS)

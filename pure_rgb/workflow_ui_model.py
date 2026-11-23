@@ -82,6 +82,7 @@ def base_recipe(paths, source_mode):
         raw=raw,
         roi=None,
         density="negpy",
+        measurement_method="negpy",
         paper="neutral",
         exposure_ev=0,
         crop=False,
@@ -322,11 +323,19 @@ class WorkflowProject:
                 stage=0,
                 current=None,
                 checked=[],
+                selection_version=1,
             )
         # Opening a historical project resolves the former frame step in
         # memory; jobs, image manifests and UI metadata stay untouched here.
         self.data["stage"] = canonical_stage(self.data.get("stage", 0))
         self.photos = self.data["photos"]
+        # Existing workspaces used an empty checkbox set to mean the current
+        # photo. Resolve that once when adopting explicit thumbnail selection.
+        if self.data.get("selection_version") != 1:
+            self.data["checked"] = self.data.get("checked") or (
+                [self.data["current"]] if self.data.get("current") else []
+            )
+            self.data["selection_version"] = 1
         self.preview_metering = {}
         self._highlight_policy_cache = {}
         self._repair_documents = {}
@@ -430,11 +439,17 @@ class WorkflowProject:
         return orientation
 
     @staticmethod
-    def _measurement_from_recipe(recipe, engine):
-        result = dict(version=1, roi=deepcopy(recipe.get("roi")), density="negpy")
+    def _measurement_from_recipe(recipe, engine, previous=None):
+        legacy_spatial = recipe.get("native_spatial_controls", {})
+        keep_legacy = bool(legacy_spatial.get("local_masks") or (
+            recipe.get("source_mode") and legacy_spatial
+        ))
+        result = dict(version=1, roi=deepcopy(recipe.get("roi")), density="negpy",
+                      method=recipe.get("measurement_method", "zonal" if keep_legacy else "negpy"))
         if engine == "native":
             spatial = recipe.get("native_spatial_controls")
             if spatial:
+                result["spatial_controls"] = deepcopy(spatial)
                 result["density_metering"] = dict(
                     version=1, metering=deepcopy(spatial["metering"]),
                 )
@@ -444,19 +459,35 @@ class WorkflowProject:
                     )
         elif recipe.get("density_metering"):
             result["density_metering"] = deepcopy(recipe["density_metering"])
+        if "density_metering" not in result and previous and previous.get("density_metering"):
+            result["density_metering"] = deepcopy(previous["density_metering"])
+        if "spatial_controls" not in result and previous and previous.get("spatial_controls"):
+            result["spatial_controls"] = deepcopy(previous["spatial_controls"])
         return result
 
     @staticmethod
     def _with_measurement(recipe, engine, measurement):
-        result = deepcopy(recipe)
+        from .measurement_method import native_recipe
+
+        method = measurement.get("method", "negpy")
+        result = native_recipe(recipe) if method == "negpy" else deepcopy(recipe)
+        result["measurement_method"] = method
         result.update(roi=deepcopy(measurement["roi"]), density="negpy")
-        document = measurement.get("density_metering")
+        document = measurement.get("density_metering") if method == "zonal" else None
         if engine == "native":
             result.pop("density_metering", None)
             if document:
-                spatial = result.setdefault("native_spatial_controls", dict(
-                    version=1, enabled=True, lab={}, local_masks=[],
+                spatial = result.setdefault("native_spatial_controls", deepcopy(
+                    measurement.get("spatial_controls") or dict(
+                        version=1, enabled=True, lab={}, local_masks=[],
+                    )
                 ))
+                from .native_spatial_v30 import LAB_FIELDS
+
+                values = result.get("native_controls", {}).get("values", {})
+                for key in list(values):
+                    if key.startswith("lab.") and key[4:] in LAB_FIELDS:
+                        spatial["lab"][key[4:]] = values.pop(key)
                 spatial["metering"] = deepcopy(document["metering"])
                 spatial.pop("automatic_avoidance", None)
                 if document.get("automatic_avoidance"):
@@ -481,10 +512,20 @@ class WorkflowProject:
         measurement = photo["measurement"]
         if (type(measurement) is not dict or type(measurement.get("version")) is not int
                 or measurement["version"] != 1
-                or set(measurement) - {"version", "roi", "density", "density_metering"}
+                or set(measurement) - {"version", "roi", "density", "density_metering", "method", "spatial_controls"}
                 or measurement.get("density") != "negpy" or "roi" not in measurement):
             raise ValueError("未知照片前置测量配置")
-        document = measurement.get("density_metering")
+        if "method" not in measurement:
+            native = photo["drafts"].get("native", {})
+            spatial = native.get("native_spatial_controls", {})
+            # Existing explicit local exposure masks keep their original
+            # spatial renderer. Ordinary grid-only drafts adopt the native default.
+            measurement["method"] = "zonal" if spatial.get("local_masks") else "negpy"
+            if spatial and "spatial_controls" not in measurement:
+                measurement["spatial_controls"] = deepcopy(spatial)
+        if measurement["method"] not in ("negpy", "zonal"):
+            raise ValueError("未知密度测量算法")
+        document = measurement.get("density_metering") if measurement["method"] == "zonal" else None
         for engine, draft in photo["drafts"].items():
             if normalize:
                 photo["drafts"][engine] = self._with_measurement(draft, engine, measurement)
@@ -498,7 +539,8 @@ class WorkflowProject:
             else:
                 matches = draft.get("density_metering") == document
             if (not matches or draft.get("roi") != measurement["roi"]
-                    or draft.get("density") != "negpy"):
+                    or draft.get("density") != "negpy"
+                    or draft.get("measurement_method") != measurement["method"]):
                 photo["drafts"][engine] = self._with_measurement(draft, engine, measurement)
         return measurement
 
@@ -531,6 +573,79 @@ class WorkflowProject:
         path = str(Path(path).resolve(strict=True)) if path is not None else None
         label = "应用平场矫正" if path else "移除平场矫正"
         self._set_flatfield(photo, path, strength, label)
+
+    def flatfield_default(self):
+        """The roll's import default, including an explicitly disabled gain."""
+        if "flatfield_default" in self.data:
+            return deepcopy(self.data["flatfield_default"])
+        current = next((p for p in self.photos if p["id"] == self.data["current"]), None)
+        candidates = ([current] if current else []) + list(reversed(self.photos))
+        for photo in candidates:
+            recipe = photo["drafts"].get(photo["engine"], photo["base"])
+            path = photo.get("flatfield_input", recipe.get("flatfield"))
+            if path:
+                return dict(path=path, strength=recipe.get("flatfield_strength", 1.0), enabled=True,
+                            name=self.flatfield_name(path))
+        return None
+
+    def flatfield_name(self, path):
+        for entry in self.data.get("flatfield_library", []):
+            if entry.get("gain_path") == path:
+                return entry.get("name") or Path(path).name
+        setting = self.data.get("flatfield_default") or {}
+        return setting.get("name") if setting.get("path") == path and setting.get("name") else Path(path).name
+
+    def apply_flatfield_default(self, path, *, strength=1.0):
+        """Apply one source choice to every supported group in one saved edit."""
+        if type(strength) not in (int, float) or not 0 <= strength <= 2:
+            raise ValueError("平场强度需为 0..2 的数")
+        path = str(Path(path).resolve(strict=True)) if path is not None else None
+        previous_default = self.data.get("flatfield_default")
+        had_default = "flatfield_default" in self.data
+        updates = []
+        for photo in self.photos:
+            if photo["source_mode"] == "bw" or photo["base"].get("raw_import") == "standard-cfa-dng-v1":
+                continue
+            drafts = {engine: checked_recipe({**recipe, "flatfield": path, "flatfield_strength": strength})
+                      for engine, recipe in photo["drafts"].items()}
+            updates.append((photo, dict(photo), drafts, self._edit_history(photo)))
+        self.data["flatfield_default"] = dict(path=path, strength=strength, enabled=path is not None,
+                                             name=self.flatfield_name(path) if path else None)
+        for photo, _, drafts, _ in updates:
+            photo.update(drafts=drafts, flatfield_input=path)
+            photo.pop("geometry", None)
+            photo.pop("flatfield_inheritance_warning", None)
+        try:
+            self.save()
+        except OSError:
+            if had_default:
+                self.data["flatfield_default"] = previous_default
+            else:
+                self.data.pop("flatfield_default", None)
+            for photo, previous, _, _ in updates:
+                photo.clear()
+                photo.update(previous)
+            raise
+        for photo, _, _, history in updates:
+            self.preview_metering.pop(photo["id"], None)
+            history.record(self._edit_snapshot(photo), "整卷平场矫正")
+        return len(updates)
+
+    def inherit_flatfield(self, photo):
+        setting = self.flatfield_default()
+        if not setting or not setting.get("enabled") or not setting.get("path"):
+            return
+        path = setting["path"]
+        if photo["source_mode"] == "bw" or photo["base"].get("raw_import") == "standard-cfa-dng-v1":
+            photo["flatfield_inheritance_warning"] = "当前输入格式不支持卷默认平场，请为此照片核对校准。"
+            return
+        if not Path(path).is_file():
+            photo["flatfield_inheritance_warning"] = "默认平场文件已不存在，请重新选择参考后再导入。"
+            return
+        photo["flatfield_input"] = path
+        photo["drafts"] = {engine: checked_recipe({**draft, "flatfield": path,
+                                                  "flatfield_strength": setting.get("strength", 1.0)})
+                           for engine, draft in photo["drafts"].items()}
 
     def set_flatfield_strength(self, strength):
         if strength is None:
@@ -674,7 +789,11 @@ class WorkflowProject:
         old = next((p for p in self.photos if p["id"] == key), None)
         if old is None:
             stashed = (self.data.get("removed") or {}).pop(key, None)
-            if isinstance(stashed, dict) and stashed.get("base") == recipe:
+            # completed() records the measured ROI in base. It is derived
+            # geometry, not a different input when importing the same RAW.
+            restore = (isinstance(stashed, dict) and isinstance(stashed.get("base"), dict)
+                       and {**stashed["base"], "roi": None} == recipe)
+            if restore:
                 # Re-importing an unloaded photo restores its saved versions.
                 old = stashed
                 self._restore_shared_crop(old)
@@ -698,35 +817,45 @@ class WorkflowProject:
                 protected_rois=[],
                 fixed_last_strength=0.5,
             )
+            if not restore:
+                self.inherit_flatfield(old)
             self.photos.append(old)
             self.edit_histories[key] = PhotoEditHistory(self._edit_snapshot(old))
         self.data["current"] = key
+        self.data["checked"] = [key]
         self.save()
         return old
 
     def remove_photo(self, photo=None):
-        """Unload a photo from the list; saved runs stay in the workspace.
-
-        The photo's settings and saved-version links are stashed in project
-        data, so importing the same RAW triplet again restores everything
-        instead of starting from scratch. Removing the current photo switches
-        to another remaining one; the empty list returns to the import state.
-        """
+        """Unload one photo, retaining its settings and saved runs for reimport."""
         photo = photo or self.photo()
-        key = photo["id"]
-        if key not in {entry["id"] for entry in self.photos}:
+        return self.remove_photos([photo["id"]])[0]
+
+    def remove_photos(self, identifiers):
+        """Unload a selection in one save; original files and runs stay intact."""
+        keys = set(identifiers)
+        if keys - {entry["id"] for entry in self.photos}:
             raise ValueError("照片不在列表中")
-        self.photos[:] = [entry for entry in self.photos if entry["id"] != key]
+        removed = [entry for entry in self.photos if entry["id"] in keys]
+        if not removed:
+            return []
+        self.data.setdefault("removed", {}).update(
+            (photo["id"], deepcopy(photo)) for photo in removed
+        )
+        self.photos[:] = [entry for entry in self.photos if entry["id"] not in keys]
         self.data["checked"] = [
-            entry for entry in (self.data.get("checked") or []) if entry != key
+            entry for entry in (self.data.get("checked") or []) if entry not in keys
         ]
-        self.data.setdefault("removed", {})[key] = deepcopy(photo)
-        self.preview_metering.pop(key, None)
-        self.edit_histories.pop(key, None)
-        if self.data["current"] == key:
+        self.data["import_queue"] = [
+            entry for entry in self.data.get("import_queue", []) if entry not in keys
+        ]
+        for key in keys:
+            self.preview_metering.pop(key, None)
+            self.edit_histories.pop(key, None)
+        if self.data["current"] in keys:
             self.data["current"] = self.photos[0]["id"] if self.photos else None
         self.save()
-        return photo
+        return removed
 
     @staticmethod
     def _color_engine(photo):
@@ -817,7 +946,9 @@ class WorkflowProject:
         self._set_shared_straighten(photo, straighten_values(checked, photo["engine"]))
         photo["flatfield_input"] = checked.get("flatfield")
         self._shared_flatfield(photo, strength=checked.get("flatfield_strength", 1.0))
-        photo["measurement"] = self._measurement_from_recipe(checked, photo["engine"])
+        photo["measurement"] = self._measurement_from_recipe(
+            checked, photo["engine"], photo.get("measurement")
+        )
         self._shared_measurement(photo)
         photo["output_orientation"] = checked_output_orientation(checked.get("output_orientation"))
         self._shared_orientation(photo)
@@ -1118,9 +1249,22 @@ class WorkflowProject:
             raise ValueError("请先核对导入并重新处理当前平场／源配置")
         return self.workspace.root / "runs" / job["id"] / "manifest.json"
 
+    def selected_photo_ids(self):
+        selected = set(self.data.get("checked") or ())
+        return [photo["id"] for photo in self.photos if photo["id"] in selected]
+
+    def select_photos(self, identifiers):
+        selected = set(identifiers)
+        if selected - {photo["id"] for photo in self.photos}:
+            raise ValueError("所选照片已不在当前项目")
+        self.data["checked"] = [photo["id"] for photo in self.photos if photo["id"] in selected]
+        self.save()
+
     def export_items(self, destination):
         items = []
-        ids = self.data["checked"] or [self.data["current"]]
+        ids = self.selected_photo_ids()
+        if not ids:
+            raise ValueError("请先在照片列表选择要导出的照片")
         for key in ids:
             photo = self.photo(key)
             mode = RESULT_MODES[photo["engine"]]
@@ -1333,7 +1477,7 @@ class WorkflowProject:
     def repair_status(self, photo=None, recipe=None):
         plan, reason = self._repair_selection(photo, recipe)
         return dict(state="active" if plan else "incompatible" if reason else "none",
-                    message=("已确认除尘将保留；调色后按原审核选区重新修复。" if plan else reason or ""))
+                    message=("已保存隐藏除尘数据；调色、裁切、拉直和旋转后自动沿用。" if plan else reason or ""))
 
     def confirmed_record(self, source, photo=None):
         """Only a confirmed review of these exact source bytes replaces output."""

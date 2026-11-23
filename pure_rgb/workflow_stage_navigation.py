@@ -254,7 +254,9 @@ class StageNavigation(QObject):
         close.clicked.connect(lambda: self.set_expanded(False))
         header.addWidget(close)
         layout.addLayout(header)
-        self.card_status = QLabel()
+        from .workflow_notices import NoticeLabel
+
+        self.card_status = NoticeLabel()
         self.card_status.setObjectName("dockStatus")
         self.card_status.setWordWrap(True)
         self.card_status.setTextFormat(Qt.TextFormat.PlainText)
@@ -275,7 +277,7 @@ class StageNavigation(QObject):
         if labels:
             sources.extend(button for button in owner.findChildren(QPushButton)
                            if button.text() in labels and (self.card is None or not self.card.isAncestorOf(button)))
-        return [button for button in sources if isinstance(button, QPushButton)]
+        return [button for button in sources if isinstance(button, QPushButton) and not button.isHidden()]
 
     def _populate_card(self):
         if self.card is None:

@@ -176,7 +176,7 @@ class NativeFilmSelector(QWidget):
         if self.loading:
             return
         value = deepcopy(self.profiles[index])
-        value["strength"] = 1.0
+        value["strength"] = self.strength.value()
         self.set_document(value, default_context=self._matrix_default_context, reset_defaults=True)
         self.changed.emit()
 
@@ -222,7 +222,7 @@ class NativeFilmSelector(QWidget):
         if path:
             try:
                 value = read_film(path)
-                value["strength"] = 1.0
+                value["strength"] = self.strength.value()
                 self._matrix_reference_profiles.insert(0, deepcopy(value))
                 self.set_document(value, default_context=self._matrix_default_context, reset_defaults=True)
                 self.changed.emit()

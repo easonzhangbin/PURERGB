@@ -34,7 +34,12 @@ def native_papers():
 
 
 def native_specs():
-    specs = []
+    specs = [
+        Control("process.white_point_offset", "白点偏移", "原生密度测量", 0., -.25, .25, .01),
+        Control("process.black_point_offset", "黑点偏移", "原生密度测量", 0., -.25, .25, .01),
+        Control("process.luma_range_clip", "亮度范围截断", "原生密度测量", 0., -1., 1., .000001),
+        Control("process.color_range_clip", "颜色截断", "原生密度测量", 1., .000001, 5., .000001),
+    ]
 
     def add(field, title, group, default=0.0, low=-1.0, high=1.0, step=0.01):
         specs.append(
@@ -260,7 +265,7 @@ def checked_outputs(document):
 
 def native_config(config, document):
     values = checked_controls(document, NATIVE_SPECS)["values"]
-    for section in ("exposure", "lab", "finish"):
+    for section in ("process", "exposure", "lab", "finish"):
         changes = {
             k.split(".")[1]: v for k, v in values.items() if k.startswith(section + ".")
         }

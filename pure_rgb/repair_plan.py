@@ -1,7 +1,7 @@
-"""Bind confirmed dust selections to a source and its final pixel coordinates.
+"""Bind confirmed dust selections to a source and retain their review coordinates.
 
-Colour recipes may change. Source pixels, the output coordinate system and the
-review evidence may not. Large TIFF/mask authentication belongs to the repair
+Colour and supported output geometry may change. Source pixels and the review
+evidence may not. Large TIFF/mask authentication belongs to the repair
 executor; this module authenticates the small provenance documents.
 """
 
@@ -58,6 +58,17 @@ def geometry_key(recipe, manifest, mode):
                         geometry={k: v for k, v in values.items() if k.startswith("geometry.")}))
 
 
+def _coordinate_key(recipe, manifest, mode):
+    """Compare rendered coordinates across engines without changing legacy hashes."""
+    shape = list(manifest["source_shape"])
+    analysis = recipe.get("roi") or manifest["roi"]
+    values = recipe.get("post_controls", {}).get(mode, {}).get("values", {})
+    return _digest(dict(source=source_recipe_identity(recipe), source_shape=shape,
+                        rectangle=output_rectangle(recipe, analysis, shape),
+                        orientation=recipe.get("output_orientation"),
+                        geometry={k: v for k, v in values.items() if k.startswith("geometry.")}))
+
+
 def _document(binding):
     path = Path(_path(binding["path"]))
     raw = path.read_bytes()
@@ -109,19 +120,35 @@ def checked_plan(plan):
 
 
 def validate_frame(plan, recipe, manifest, mode):
-    """Fail closed for another source, engine, crop, transform or calibration."""
+    """Return a mapping for edited output geometry, retaining authenticated masks."""
     plan = checked_plan(plan)
     binding = plan["binding"]
     try:
-        if (mode != binding["mode"]
-                or _inputs(manifest["inputs"]) != _inputs(binding["inputs"])
+        parent = _document(plan["parent_manifest"])
+        if mode == binding["mode"]:
+            matching_coordinates = geometry_key(recipe, manifest, mode) == binding["geometry_key"]
+        else:
+            matching_coordinates = (
+                _coordinate_key(recipe, manifest, mode)
+                == _coordinate_key(parent["recipe"], parent, binding["mode"])
+            )
+        if (_inputs(manifest["inputs"]) != _inputs(binding["inputs"])
                 or [_path(p) for p in recipe["raw"]] != [r["path"] for r in _inputs(binding["inputs"])]
                 or manifest["source_shape"] != binding["source_shape"]
                 or _calibration(manifest.get("calibration")) != _calibration(binding.get("calibration"))
                 or any(_raw_identity(manifest).get(key) != value
                        for key, value in binding.get("raw_import_identity", {}).items())
-                or geometry_key(recipe, manifest, mode) != binding["geometry_key"]):
-            raise ValueError("来源、引擎或输出画幅已改变，请重新进行除尘审核")
+                or source_recipe_identity(recipe) != source_recipe_identity(parent["recipe"])):
+            raise ValueError("来源配置已改变，原除尘数据已保留；请重新进行除尘审核")
+        if matching_coordinates:
+            return None
+        from .repair_geometry import frame_descriptor
+
+        source = frame_descriptor(parent["recipe"], parent, binding["mode"])
+        target = frame_descriptor(recipe, manifest, mode)
+        if source["output_size"] != [plan["shape"][1], plan["shape"][0]]:
+            raise ValueError("原除尘审核画幅与已保存坐标不一致")
+        return dict(version=1, source=source, target=target)
     except (KeyError, TypeError, IndexError) as error:
         raise ValueError("当前画面缺少除尘来源证据，请重新审核") from error
 

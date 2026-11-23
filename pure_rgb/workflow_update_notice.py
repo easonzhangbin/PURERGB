@@ -4,9 +4,10 @@ import threading
 
 from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
 from . import release
+from .workflow_notices import NoticeLabel
 
 
 class _UpdateSignals(QObject):
@@ -32,7 +33,7 @@ class UpdateNotice(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.message = QLabel()
+        self.message = NoticeLabel()
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
         buttons = QHBoxLayout()

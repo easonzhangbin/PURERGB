@@ -5,8 +5,9 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import shutil
 import subprocess
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 import xml.etree.ElementTree as ET
 
 
@@ -24,7 +25,14 @@ def write_zip_assistant(app, output):
     if info["CFBundleIdentifier"] != APP_ID:
         raise ValueError("安装助手只能用于 PURE RGB")
     template = Path(__file__).with_name("macos_zip_assistant.command.in").read_text()
-    script = template.replace("@CDHASH@", match[1]).replace("@VERSION@", info["CFBundleShortVersionString"])
+    version = info["CFBundleShortVersionString"]
+    if info.get("PURE RGB Test Build"):
+        version += f" 测试版 Build {info['CFBundleVersion']}"
+        template = template.replace('default button "在访达中安装"', 'default button "直接打开"')
+        template = template.replace("请从 GitHub 正式发布页重新下载并核对 SHA-256。", "请重新解压本次测试包并核对 SHA-256。")
+        template = template.replace("从 GitHub 正式发布页核对下载文件的 SHA-256", "核对本次测试包的 SHA-256")
+        template = template.replace("GitHub Releases 的 SHA-256", "本次测试包的 SHA-256")
+    script = template.replace("@CDHASH@", match[1]).replace("@VERSION@", version)
     with output.open("x") as file:
         file.write(script)
     output.chmod(0o755)
@@ -40,11 +48,16 @@ def build_installer(app, output):
     version = info["CFBundleShortVersionString"]
     minimum_os = info["LSMinimumSystemVersion"]
     output.parent.mkdir(parents=True, exist_ok=True)
-    with TemporaryDirectory(dir=output.parent) as temp:
+    # Build payloads outside File Provider / iCloud folders. Their Finder
+    # metadata must not be archived inside the signed application bundle.
+    with TemporaryDirectory(prefix="pure-rgb-installer-") as temp:
         work = Path(temp)
         root = work / "root"
         root.mkdir()
-        subprocess.run(["/usr/bin/ditto", app, root / app.name], check=True)
+        staged_app = root / app.name
+        subprocess.run(["/usr/bin/ditto", "--norsrc", "--noextattr", app, staged_app], check=True)
+        subprocess.run(["/usr/bin/xattr", "-cr", staged_app], check=True)
+        subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", staged_app], check=True)
         metadata = work / "components.plist"
         metadata.write_bytes(plistlib.dumps([dict(
             RootRelativeBundlePath=app.name, BundleIsRelocatable=False,
@@ -88,8 +101,14 @@ def build_installer(app, output):
             "/usr/bin/productbuild", "--distribution", distribution, "--resources", resources,
             "--package-path", work, "--version", version, "--identifier", f"{APP_ID}.installer", product,
         ], check=True)
-        # Only expose the finished archive after both packaging tools succeed.
-        os.link(product, output)
+        # Publish on the destination filesystem without overwriting a release.
+        with NamedTemporaryFile(prefix=".pure-rgb-installer-", dir=output.parent) as staged:
+            with product.open("rb") as stream:
+                shutil.copyfileobj(stream, staged)
+            os.fchmod(staged.fileno(), 0o644)
+            staged.flush()
+            os.fsync(staged.fileno())
+            os.link(staged.name, output)
 
 
 if __name__ == "__main__":

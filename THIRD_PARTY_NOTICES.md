@@ -5,7 +5,7 @@
 - flexcolor-tool contributors, commit 04e745a2fde3559acb2d4f194b7a192150b26f5c, MIT. The adapter calls build_lut, contrast_brightness and neg_gamma from the unmodified source checkout. LUT resolution/interpolation and input normalization are PURE RGB adapter choices. The representative sensor LUT stage is excluded. See licenses/flexcolor-tool-LICENSE.txt.
 - activexray/nkscan, commit f971cfd8efe89f6e02507c80b0945206fdaf0bcd, MIT OR Apache-2.0; the MIT option is used for the independent prescan exposure/thumbnail metering port in pure_rgb/nikon_metering.py and shared analyzer arithmetic in pure_rgb/nikon_parameters.py. Source paths and provenance are recorded in those modules, outputs/nikon-metering-v1 and outputs/nikon-parameter-study-v1. See licenses/nkscan-MIT.txt. Matching the public implementation is distinct from complete Nikon Scan reproduction; original resource/distribution constraints remain separate.
 
-All reference checkouts remain separate from the PURE RGB source. This research checkout is not a release bundle. Refer to docs/pure_rgb/LICENSE_RISKS.md before preparing a distribution.
+Reference checkouts remain separate from the PURE RGB source repository. Binary releases include the pinned source portions used by the application and their original notices; proprietary Nikon tables and personal calibration profiles are excluded.
 
 - The Qt scrubber controls adapt the interaction and timing of [SmoothUI Scrubber](https://smoothui.dev/docs/components/scrubber). SmoothUI is MIT licensed. See [its license](licenses/SmoothUI-MIT.txt).
 - The native Spring dropdown, Jelly slider, Rubber dock and Glass lens use the interaction designs and spring parameters published by [DesignBookmark Motion](https://designbookmark.com/motion).
@@ -13,3 +13,7 @@ All reference checkouts remain separate from the PURE RGB source. This research 
 ## PURE Neg 观片台
 
 原生灯板和胶片放大镜改编自 PURE Neg 的 BatchLightTable.swift 与 FilmLoupe.swift，版权归 Film Dust for PhotoCraft contributors 所有，采用 MIT 许可。[原项目](https://github.com/easonzhangbin/PURENeg) · [许可全文](licenses/PURENeg-MIT.txt)
+
+## Qt 6.11.2 runtime fixes
+
+The macOS binary includes Qt 6.11.2 with a Cocoa accessibility ownership backport and a local QtWidgets stale-accessibility-cache guard. Original copyright and license notices, exact modified files, patches and build instructions are in [licenses/qt-cocoa-6.11.2](licenses/qt-cocoa-6.11.2/README.txt). Complete corresponding QtBase source and these modifications are provided with the ZIP and as `Qt-6.11.2-Corresponding-Source.tar.gz` alongside the 0.2.1 release downloads. The application retains accessibility support.

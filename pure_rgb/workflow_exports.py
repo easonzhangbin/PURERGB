@@ -79,7 +79,8 @@ def _render_budget(item):
         return _DEFAULT_RENDER_BUDGET, False, ()
     if any(height * width > _LARGE_RAW_PIXELS for height, width in shapes):
         return _DEFAULT_RENDER_BUDGET, True, tuple(identities)
-    allowed = {"raw", "roi", "density", "paper", "exposure_ev", "crop", "flatfield", "cool_tone", "raw_import"}
+    allowed = {"raw", "roi", "density", "paper", "exposure_ev", "crop", "flatfield", "cool_tone",
+               "raw_import", "measurement_method"}
     simple = (
         item.get("mode") == "native"
         and render.get("only_mode", "native") == "native"
@@ -89,6 +90,7 @@ def _render_budget(item):
         and set(recipe) <= allowed
         and recipe.get("raw_import") == "standard-crop-v1"
         and recipe.get("density", "negpy") == "negpy"
+        and recipe.get("measurement_method") in (None, "negpy")
         and recipe.get("paper", "neutral") == "neutral"
         and recipe.get("exposure_ev", 0) == 0
         and recipe.get("crop", False) is False
@@ -279,6 +281,8 @@ def _export_item(item, index, total, root, report_progress):
 
 
 def export_batch(request, progress):
+    if not request["items"]:
+        raise ValueError("请先选择要导出的照片")
     root = Path(request["directory"]).resolve()
     root.mkdir(parents=True, exist_ok=False)
     report = {"state": "running", "saved": [], "errors": [], "items": request["items"]}

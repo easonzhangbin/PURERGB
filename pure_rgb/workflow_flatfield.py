@@ -1,7 +1,10 @@
 """Optional source flat-field calibration in the staged desktop workflow."""
 
 from copy import deepcopy
+import json
+import os
 from pathlib import Path
+import shutil
 import uuid
 
 from .workflow_disclosure import DisclosureButton
@@ -33,7 +36,78 @@ def flatfield_support(photo):
 
 
 class FlatfieldUI:
+    def restore_flatfield_defaults(self):
+        """Read the previous import choice before a new photo is created."""
+        path = getattr(self, "flatfield_defaults_path", None)
+        if path is None:
+            return
+        setting = self.project.flatfield_default()
+        if setting is None:
+            try:
+                setting = json.loads(path.read_text())
+            except (OSError, ValueError):
+                setting = None
+        if setting is None:
+            try:
+                preferences = json.loads((path.parent / "preferences.json").read_text())
+                for name in ("workspace", "last_task_workspace"):
+                    prior = Path(preferences.get(name, "")) / "ui-workflow.json"
+                    if not prior.is_file() or prior.resolve() == self.project.path.resolve():
+                        continue
+                    data = json.loads(prior.read_text())
+                    setting = data.get("flatfield_default")
+                    if setting is None:
+                        for photo in reversed(data.get("photos", [])):
+                            recipe = photo.get("drafts", {}).get(photo.get("engine"), photo.get("base", {}))
+                            gain = photo.get("flatfield_input", recipe.get("flatfield"))
+                            if gain:
+                                entry = next((e for e in data.get("flatfield_library", [])
+                                              if e.get("gain_path") == gain), {})
+                                setting = dict(path=gain, enabled=True, strength=recipe.get("flatfield_strength", 1.0),
+                                               name=entry.get("name") or Path(gain).name)
+                                break
+                    if setting is not None:
+                        break
+            except (OSError, ValueError, TypeError):
+                setting = None
+        if not isinstance(setting, dict):
+            return
+        gain = setting.get("path")
+        strength = setting.get("strength", 1.0)
+        if not isinstance(gain, (str, type(None))) or not isinstance(strength, (int, float)) or not 0 <= strength <= 2:
+            return
+        self.project.data.setdefault("flatfield_default", deepcopy(setting))
+        if gain and not Path(gain).is_file():
+            return
+        self.remember_flatfield_default(setting)
+
+    def remember_flatfield_default(self, setting):
+        """Keep a frozen gain available after switching or removing a project."""
+        path = getattr(self, "flatfield_defaults_path", None)
+        if path is None:
+            return
+        from .workspace import write_json
+
+        saved = deepcopy(setting)
+        gain = saved.get("path")
+        if gain and saved.get("enabled"):
+            source = Path(gain)
+            digest = sha256(source)
+            directory = path.parent / "flatfield-presets"
+            directory.mkdir(parents=True, exist_ok=True)
+            target = directory / (digest + ".npz")
+            if not target.is_file() or sha256(target) != digest:
+                temporary = directory / (uuid.uuid4().hex + ".npz")
+                try:
+                    shutil.copyfile(source, temporary)
+                    os.replace(temporary, target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            saved["path"] = str(target)
+        write_json(path, saved)
+
     def build_flatfield_tools(self, layout):
+        self.restore_flatfield_defaults()
         self.flatfield_pending = {}
         self.flatfield_messages = {}
         self.flatfield_toggle = DisclosureButton("平场矫正（可选）")
@@ -79,7 +153,7 @@ class FlatfieldUI:
         self.flatfield_clear = QPushButton("移除平场")
         self.flatfield_clear.clicked.connect(self.clear_flatfield)
         column.addWidget(self.flatfield_clear)
-        self.flatfield_apply = QPushButton("应用平场并重新处理")
+        self.flatfield_apply = QPushButton("应用到整卷并重新处理")
         self.flatfield_apply.clicked.connect(self.apply_flatfield)
         column.addWidget(self.flatfield_apply)
         self.flatfield_status = QLabel()
@@ -90,7 +164,7 @@ class FlatfieldUI:
         self.flatfield_note.setWordWrap(True)
         self.flatfield_note.setObjectName("muted")
         column.addWidget(self.flatfield_note)
-        scope = QLabel("沿用现有合成后增益校正，三种色彩引擎共用。此入口为单张白光平场，不是逐 LED／暗场校准。")
+        scope = QLabel("应用后整卷兼容照片及后续导入组共用此平场；更换机位、镜头或光圈后请重新核对参考。")
         scope.setWordWrap(True)
         scope.setObjectName("muted")
         column.addWidget(scope)
@@ -113,17 +187,23 @@ class FlatfieldUI:
         self.flatfield_note.setText(note)
         pending = self.flatfield_pending.get(photo["id"]) if photo else None
         recipe = self.project.recipe() if photo else {}
+        setting = self.project.flatfield_default()
         current = recipe.get("flatfield") if photo else None
         current_strength = float(recipe.get("flatfield_strength", 1.0)) if current else 1.0
         selected = pending.get("path") if pending is not None else current
         library = getattr(self.project, "data", {}).get("flatfield_library") or []
-        self.flatfield_library_choice.clear()
+        entries = []
         for entry in library:
             make, model = entry.get("camera") or [None, None]
             label = " · ".join(
                 str(part) for part in (entry.get("name"), make, model) if part
             )
-            self.flatfield_library_choice.addItem(label, entry)
+            entries.append((label, entry))
+        current_entry = self.flatfield_library_choice.currentData()
+        self.flatfield_library_choice.syncItems(entries or [("暂无平场配置", None)])
+        if current_entry is not None:
+            index = self.flatfield_library_choice.findData(current_entry)
+            self.flatfield_library_choice.setCurrentIndex(max(0, index))
         has_library = bool(library)
         self.flatfield_library_choice.setEnabled(
             bool(has_library and supported and not self.tasks.busy)
@@ -151,7 +231,8 @@ class FlatfieldUI:
         self.flatfield_strength.setEnabled(bool(supported and selected and not self.tasks.busy))
         self.flatfield_choose.setEnabled(supported and not self.tasks.busy)
         self.flatfield_clear.setEnabled(bool(supported and not self.tasks.busy and
-                                            (current or pending and pending.get("path"))))
+                                            (current or pending and pending.get("path")
+                                             or setting and setting.get("enabled"))))
         self.flatfield_apply.setEnabled(bool(supported and not self.tasks.busy and
                                              (pending is not None or strength_pending)))
         if pending is not None:
@@ -160,15 +241,29 @@ class FlatfieldUI:
             self.flatfield_source.setToolTip(path or "")
         else:
             self.flatfield_source.setText(
-                f"当前平场：{Path(current).name} · {current_strength:.0%}" if current
+                f"当前平场：{self.project.flatfield_name(current)} · {current_strength:.0%}" if current
                 else "未启用平场。请选择或从库中选用参考。"
             )
             self.flatfield_source.setToolTip(current or "")
+            if photo is None and setting and setting.get("enabled"):
+                name = setting.get("name") or Path(setting["path"]).name
+                self.flatfield_source.setText(f"后续导入平场：{name} · {setting.get('strength', 1.0):.0%}")
+                self.flatfield_source.setToolTip(setting["path"])
         self.flatfield_apply.setText(
-            ("移除平场并重新处理" if pending is not None and not pending.get("path")
-             else "应用平场并重新处理") if photo and photo["initial_job"] else "用于首次导入"
+            ("移除整卷平场并重新处理" if pending is not None and not pending.get("path")
+             else "应用到整卷并重新处理") if photo and photo["initial_job"] else "用于整卷及后续导入"
         )
-        self.flatfield_status.setText(self.flatfield_messages.get(photo["id"], "") if photo else "")
+        status = self.flatfield_messages.get(photo["id"], "") if photo else ""
+        if photo and photo.get("flatfield_inheritance_warning"):
+            status += "\n" + photo["flatfield_inheritance_warning"]
+        elif setting:
+            if setting.get("enabled") and not Path(setting.get("path", "")).is_file():
+                status += "\n默认平场文件已不存在，请重新选择参考。"
+            elif photo and (current != setting.get("path") or current_strength != setting.get("strength", 1.0)):
+                status += "\n此照片的平场与卷默认不同；后续新组仍继承卷默认。"
+            elif not status:
+                status = "整卷及后续新组沿用此平场。" if setting.get("enabled") else "整卷平场已关闭，后续新组沿用关闭状态。"
+        self.flatfield_status.setText(status.strip())
 
     def choose_flatfield(self):
         if self.tasks.busy or not flatfield_support(self.current_photo())[0]:
@@ -276,11 +371,12 @@ class FlatfieldUI:
         try:
             if pending is not None:
                 path = pending["path"]
-                self.project.set_flatfield(path, strength=strength if path else 1.0)
+                self.project.apply_flatfield_default(path, strength=strength if path else 1.0)
                 self.flatfield_pending.pop(photo["id"], None)
             else:
-                self.project.set_flatfield_strength(strength)
-            self.flatfield_messages[photo["id"]] = "已更新平场配置；源处理期间原成片保留。"
+                self.project.apply_flatfield_default(current, strength=strength)
+            self.remember_flatfield_default(self.project.flatfield_default())
+            self.flatfield_messages[photo["id"]] = "整卷兼容照片及后续新组已更新平场；需要时按新来源重新处理。"
             self.crop_locator_cache = None
             self.snapshot_store.clear()
             self.sync_controls()

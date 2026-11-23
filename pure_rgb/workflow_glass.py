@@ -355,6 +355,10 @@ class GlassSurfaces(QObject):
                     # child event themselves, but each view they adopt does.
                     self._track(watched, "popup")
         elif kind == QEvent.Type.Show and isinstance(watched, QWidget) and watched.isWindow():
+            if isinstance(watched, QMessageBox):
+                from .workflow_notices import center_message_box
+
+                center_message_box(watched)
             # QDialog/QMenu window-children never emit ChildAdded either; catch
             # them at Show. Translucency only frosts when their own constructor
             # called prepare_glass (GlassMessageBox/GlassMenu/our dialogs).
@@ -478,7 +482,14 @@ class GlassMessageBox(QMessageBox):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.setOption(QMessageBox.Option.DontUseNativeDialog)
         prepare_glass(self)
+
+    def showEvent(self, event):
+        from .workflow_notices import center_message_box
+
+        center_message_box(self)
+        super().showEvent(event)
 
     @staticmethod
     def _present(icon, parent, title, text, buttons=None, default=None, button_labels=None,

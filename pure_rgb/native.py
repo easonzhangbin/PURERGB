@@ -143,8 +143,9 @@ def native_export(processor, config, records, *, prefer_gpu=False):
         ).encode()
     ).hexdigest()
     from .diagnostics import span
+    from .native_print_metrics import collect_print_values
 
-    with span("native_export_encode"):
+    with span("native_export_encode"), collect_print_values(processor):
         data, error = processor.process_export(
             records[0]["path"], config, export, identity, prefer_gpu=prefer_gpu
         )

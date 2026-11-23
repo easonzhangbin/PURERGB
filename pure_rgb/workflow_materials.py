@@ -466,8 +466,9 @@ class MaterialBinder(QObject):
             tint_view.setLayer_(gradient)
             tint_view.layer().setMasksToBounds_(True)
             effect.addSubview_positioned_relativeTo_(tint_view, A.NSWindowAbove, None)
-        native_text = None
+        native_text = native_text_host = None
         if role == "hud":
+            native_text_host = self.clip_class.alloc().initWithFrame_(((0, 0), (0, 0)))
             native_text = A.NSTextField.labelWithString_(widget.text())
             native_text.setEditable_(False)
             native_text.setSelectable_(False)
@@ -486,10 +487,11 @@ class MaterialBinder(QObject):
             shadow.setShadowBlurRadius_(2)
             shadow.setShadowOffset_((0, -1))
             native_text.setShadow_(shadow)
+            native_text_host.addSubview_(native_text)
             if use_glass:
-                effect.setContentView_(native_text)
+                effect.setContentView_(native_text_host)
             else:
-                effect.addSubview_(native_text)
+                effect.addSubview_(native_text_host)
         container.addSubview_positioned_relativeTo_(
             wrapper, A.NSWindowAbove if role in {"hud", "scroll-edge"} else A.NSWindowBelow, reference
         )
@@ -505,6 +507,7 @@ class MaterialBinder(QObject):
             tint=tint_view,
             gradient=gradient,
             native_text=native_text,
+            native_text_host=native_text_host,
             scroll_mask=scroll_mask,
         )
 
@@ -646,12 +649,19 @@ class MaterialBinder(QObject):
                 native_font = self.api.NSFont.fontWithName_size_(text_state[1], text_state[2])
                 text.setFont_(native_font or self.api.NSFont.systemFontOfSize_(text_state[2]))
                 entry["text_state"] = text_state
-            inset_x, inset_y = 14.0, 7.0
             bounds = effect.bounds()
-            if geometry_changed:
-                text.setFrame_(((inset_x, inset_y),
-                                (max(0.0, bounds.size.width - 2 * inset_x),
-                                 max(0.0, bounds.size.height - 2 * inset_y))))
+            host = entry.get("native_text_host")
+            if host is not None:
+                host.setFrame_(bounds)
+            contents = widget.contentsRect()
+            width = max(0.0, float(contents.width()))
+            measured = text.cell().cellSizeForBounds_(((0, 0), (width, 100000.0)))
+            height = min(max(0.0, float(contents.height())), math.ceil(measured.height))
+            # NSGlassEffectView owns a full-size content view. Its child text
+            # gets the measured height, so AppKit cannot pin a multi-line
+            # NSTextField to the top of a tall capsule during native layout.
+            text.setFrame_(((float(contents.x()), (bounds.size.height - height) / 2),
+                            (width, height)))
         if entry.get("hidden") is not False:
             wrapper.setHidden_(False)
             entry["hidden"] = False

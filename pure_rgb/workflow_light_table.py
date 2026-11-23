@@ -147,8 +147,7 @@ class ProjectLightTable:
             for index in range(listing.count()):
                 item = listing.item(index)
                 if item.data(Qt.ItemDataRole.UserRole) == key:
-                    state = Qt.CheckState.Checked if event["selected"] else Qt.CheckState.Unchecked
-                    item.setCheckState(state)
+                    item.setSelected(event["selected"])
                     break
 
     def _failed(self, error):

@@ -119,8 +119,9 @@ class AdvancedPanel(QWidget):
 
     recipe_changed = pyqtSignal(object)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, default_expanded=False):
         super().__init__(parent)
+        self.default_expanded = default_expanded
         self.original = None
         self.groups = ()
         self.pages = {}
@@ -176,7 +177,7 @@ class AdvancedPanel(QWidget):
 
     def configure(self, recipe, engine, bw, stage):
         self.cancel_pending()
-        expanded = {key for key, header in self.headers.items() if header.isChecked()}
+        expanded = {key: header.isChecked() for key, header in self.headers.items()}
         self.loading = True
         try:
             self.original = deepcopy(recipe)
@@ -212,7 +213,7 @@ class AdvancedPanel(QWidget):
                 self.group_layout.addWidget(header)
                 self.group_layout.addWidget(page)
                 page.hide()
-                if group.key in expanded:
+                if expanded.get(group.key, self.default_expanded):
                     header.setChecked(True)
             self.expand_all_button.setEnabled(bool(self.groups))
             self.collapse_all_button.setEnabled(bool(self.groups))

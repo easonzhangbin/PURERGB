@@ -13,6 +13,9 @@ def shutdown_window(window):
         return
     window._event_filters_active = False
     window.closing = True
+    auto_import = getattr(window, "auto_import", None)
+    if auto_import is not None:
+        auto_import.close()
     for cancel in list(getattr(window, "_deferred_display_work", {}).values()):
         try:
             cancel()
@@ -45,6 +48,9 @@ def shutdown_window(window):
     window.live.invalidate(window.token)
     window.live.shutdown()
     window.tasks.shutdown()
+    thumbnails = getattr(window, "photo_thumbnails", None)
+    if thumbnails is not None:
+        thumbnails.close()
     window.pool.waitForDone()
     window.idle_pool.waitForDone()
     window.light_table.close()

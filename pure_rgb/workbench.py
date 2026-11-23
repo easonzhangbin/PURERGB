@@ -31,7 +31,6 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
     QScrollArea,
     QTabWidget,
     QVBoxLayout,
@@ -39,6 +38,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .workflow_progress import WorkflowProgressBar
+from .workflow_glass import GlassMessageBox as QMessageBox
 from .preview_data import ROOT, MODES, load_samples
 from .workflow_combo import WorkflowComboBox as QComboBox
 from .preview_ui import (

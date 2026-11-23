@@ -80,7 +80,7 @@ class EditHistoryUI:
         self.crop_button.setAccessibleName("裁切、拉直与旋转")
         self.crop_button.setIcon(QIcon(str(icons / "crop.svg")))
         self.crop_button.setIconSize(QSize(18, 18))
-        self.crop_button.setToolTip("打开裁切、自动识别、拉直与旋转")
+        self.crop_button.setToolTip("打开裁切、拉直与旋转")
         self.crop_button.clicked.connect(self.open_crop_tools)
         layout.addWidget(self.crop_button)
 

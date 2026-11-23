@@ -59,7 +59,7 @@ def exposure_codes(pixels, ev):
     )
 
 
-def _study_picture_region(source, roi, locators):
+def _study_picture_region(source, roi, locators, *, automatic_import=False):
     try:
         return study_region(source, roi)
     except NoReliablePictureRectangle:
@@ -67,6 +67,15 @@ def _study_picture_region(source, roi, locators):
             region = detect_picture_from_locators(locators, source.shape)
             if region is not None:
                 return region
+        if automatic_import and roi is None:
+            from .picture import normalized_box
+
+            _, inner = normalized_box((0., 0., 1., 1.), source.shape, .1)
+            return dict(method="Automatic import: central source metering fallback",
+                analysis_roi=inner, detected_picture_roi=None, inset_per_side=.1,
+                coordinate_space="EXIF-oriented merged linear source; half-open xyxy",
+                confidence=None, measurement_only_fallback=True,
+                limitations="Film box not detected; central measurement region, output remains uncropped")
         raise
 
 
@@ -406,11 +415,13 @@ def render(request, *, emit_callback=None, prepared_source=None):
             from .workflow_geometry_preview import write_geometry_previews
 
             locators = write_geometry_previews(source, out)
-        region = _study_picture_region(source, recipe["roi"], locators)
+        region = _study_picture_region(source, recipe["roi"], locators,
+                                       automatic_import=bool(request.get("auto_import")))
         roi = region["analysis_roi"]
         x0, y0, x1, y1 = roi
         output_roi = output_rectangle(recipe, roi, source.shape)
         emit_event(type="progress", fraction=0.22, message="测量画面内部密度")
+        original_metering = recipe.get("measurement_method") == "negpy"
         with span("density_analysis", roi=roi, method=recipe["density"]):
             window = (
                 negpy_window(source, config, roi)
@@ -423,6 +434,11 @@ def render(request, *, emit_callback=None, prepared_source=None):
         frozen = replace(
             config, process=fixed_process(config.process, window, source.shape)
         )
+        if original_metering:
+            from .measurement_method import original_config, original_window
+
+            frozen = original_config(config, roi, source.shape)
+            window = original_window(source, frozen, roi)
         # A Native-only spatial render derives its own source, reference and
         # RGB16 output. The neutral positive is only consumed by the other
         # engines, so avoid rendering a second full frame in that case.
@@ -508,6 +524,14 @@ def render(request, *, emit_callback=None, prepared_source=None):
             adjusted = native_config(
                 film_config, native_overrides or {"version": 1, "values": {}}
             )
+            if original_metering:
+                from .measurement_method import original_config, original_window
+
+                adjusted = original_config(adjusted, roi, source.shape)
+                actual_window = original_window(source, adjusted, roi)
+                report["native_metering_window"] = asdict(actual_window)
+                if only_mode == "native":
+                    report["density_window"] = asdict(actual_window)
             if spatial_controls:
                 from .spatial_workflow_v31 import encode_spatial_workflow
 
@@ -573,6 +597,10 @@ def render(request, *, emit_callback=None, prepared_source=None):
                 if float_controls
                 else "v2: Native film calibration and creative overrides excluded from experimental fitting"
             )
+        if recipe.get("measurement_method") == "negpy" and not any((
+            float_controls, highlight_controls, spatial_controls, recipe.get("density_metering"),
+        )):
+            report["native_print"] = getattr(processor, "pure_native_print", None)
         srgb = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
 
         def save(mode, px, meta):

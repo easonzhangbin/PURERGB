@@ -13,8 +13,11 @@ def render_repair(request, manifest, source_record, mode, *, directory, on_progr
     from .repair_plan import validate_frame
     from .repair_replay import replay_record
 
-    validate_frame(plan, manifest["recipe"], manifest, mode)
-    record = replay_record(source_record, plan, directory=directory, on_progress=on_progress)
+    mapping = validate_frame(plan, manifest["recipe"], manifest, mode)
+    options = dict(directory=directory, on_progress=on_progress)
+    if mapping is not None:
+        options["frame_mapping"] = mapping
+    record = replay_record(source_record, plan, **options)
     manifest.setdefault("repair_results", {})[mode] = record
     return record
 
@@ -34,7 +37,7 @@ def preview_repair(request, session, pixels, reference, icc, *, on_progress):
     recipe = request.get("draft_recipe")
     if recipe is None:
         recipe = {**session.recipe, **request.get("controls", {})}
-    validate_frame(plan, recipe, session.manifest, request["mode"])
+    mapping = validate_frame(plan, recipe, session.manifest, request["mode"])
     same = pixels is reference or np.array_equal(pixels, reference)
     viewport = getattr(session, "viewport_result", None)
     options = dict(
@@ -44,6 +47,8 @@ def preview_repair(request, session, pixels, reference, icc, *, on_progress):
         viewport=viewport,
         on_progress=on_progress,
     )
+    if mapping is not None:
+        options["frame_mapping"] = mapping
     current, provenance = replay_pixels(pixels, icc, plan, **options)
     if same:
         compared = current

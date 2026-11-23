@@ -5,7 +5,8 @@ Full-frame mask coordinates are final output pixels, not RAW/source pixels.
 a viewport samples [y:y+height:step, x:x+width:step], including that exact phase.
 Reduced/viewport healing is a screen approximation because its donor context
 differs. ``replay_record`` alone produces the full-resolution final result.
-The caller must validate the plan's RAW/geometry binding before calling here.
+The caller must validate the plan's RAW binding before calling here. Supported
+output edits carry a mapping from the authenticated review to the current grid.
 """
 
 from collections import OrderedDict
@@ -149,14 +150,29 @@ def _verified_plan(plan):
     else:
         mask = cached[1]
     backend_root, backend_stamp = _verify_backend(plan["backend"])
-    evidence = [(receipt_path, receipt_identity), (source_path, source_identity), (mask_path, mask_identity)]
+    evidence = [(receipt_path, receipt_identity, plan["receipt_sha256"]),
+                (source_path, source_identity, source["sha256"]),
+                (mask_path, mask_identity, plan["mask_sha256"])]
     _unchanged(evidence)
     return mask, backend_root, backend_stamp, evidence
 
 
 def _unchanged(evidence):
-    if any(_identity(path) != identity for path, identity in evidence):
-        raise ValueError("除尘重放期间审核来源或蒙版发生变化")
+    for path, identity, *digests in evidence:
+        if _identity(path) == identity:
+            continue
+        # macOS may attach metadata to a newly created TIFF when the helper
+        # opens it. A ctime change is not a pixel change: authenticate bytes
+        # again instead of discarding a valid large-image repair.
+        if digests:
+            for _ in range(2):
+                current = _identity(path)
+                if sha256(path) == digests[0] and _identity(path) == current:
+                    break
+            else:
+                raise ValueError("除尘重放期间审核来源或蒙版内容发生变化")
+        else:
+            raise ValueError("除尘重放期间审核来源或蒙版发生变化")
 
 
 def _pixel_hash(pixels):
@@ -188,6 +204,27 @@ def _sample_mask(mask, pixels, output_size, sample_step, viewport):
         raise ValueError("除尘蒙版采样网格与当前画面不一致")
     return sampled, dict(x=x, y=y, width=width, height=height, sample_step=sample_step,
                          output_size=size)
+
+
+def _mapped_mask(plan, mask, mapping, pixels, output_size, sample_step, viewport):
+    from .repair_geometry import frame_descriptor, sample_repair_mask
+
+    if (not isinstance(mapping, dict) or set(mapping) != {"version", "source", "target"}
+            or type(mapping.get("version")) is not int or mapping["version"] != 1):
+        raise ValueError("除尘坐标映射记录无效")
+    parent_path, identity = _verified_file(plan["parent_manifest"]["path"],
+                                          plan["parent_manifest"]["sha256"])
+    parent = json.loads(parent_path.read_text())
+    original = frame_descriptor(parent["recipe"], parent, plan["binding"]["mode"])
+    if original != mapping["source"]:
+        raise ValueError("除尘坐标映射与已认证原审核不一致")
+    sampled, grid = sample_repair_mask(mask, original, mapping["target"],
+        output_size=output_size, sample_step=sample_step, viewport=viewport)
+    if sampled.shape != pixels.shape[:2]:
+        raise ValueError("除尘映射蒙版与当前预览采样网格不一致")
+    evidence = (parent_path, identity, plan["parent_manifest"]["sha256"])
+    _unchanged([evidence])
+    return sampled, grid, evidence
 
 
 def _write_tiff(path, pixels, icc):
@@ -244,7 +281,8 @@ def _run_helper(root, scratch, request, on_progress):
 
 
 def replay_pixels(pixels, icc, plan, *, directory, output_size=None, sample_step=1,
-                  viewport=None, on_progress=lambda event: None):
+                  viewport=None, on_progress=lambda event: None, frame_mapping=None,
+                  mask_destination=None):
     """Return new RGB16 pixels plus replay evidence, leaving input unchanged.
 
     ``on_progress`` may raise to cancel; the helper is stopped and all temporary
@@ -257,15 +295,36 @@ def replay_pixels(pixels, icc, plan, *, directory, output_size=None, sample_step
         raise ValueError("除尘重放需要带ICC的RGB16画面")
     plan = deepcopy(plan)
     mask, root, backend_stamp, evidence = _verified_plan(plan)
-    sampled, grid = _sample_mask(mask, pixels, output_size, sample_step, viewport)
+    if frame_mapping is None:
+        sampled, grid = _sample_mask(mask, pixels, output_size, sample_step, viewport)
+    else:
+        sampled, grid, parent_evidence = _mapped_mask(
+            plan, mask, frame_mapping, pixels, output_size, sample_step, viewport)
+        evidence.append(parent_evidence)
+    if mask_destination is not None and (sample_step != 1 or viewport is not None):
+        raise ValueError("仅完整分辨率输出可保存除尘派生蒙版")
     before = _pixel_hash(pixels)
     count = int(np.count_nonzero(sampled))
     provenance = dict(version=1, plan_hash=_hash_value(plan), source_pixel_sha256=before,
                       icc_sha256=hashlib.sha256(icc).hexdigest(), grid=grid,
                       quality="full-resolution" if sample_step == 1 and viewport is None else "screen-approximation",
                       mask_pixels=count, outside_mask_changed_pixels=0, detector_calls=0)
+    if frame_mapping is not None:
+        provenance["frame_mapping"] = deepcopy(frame_mapping)
+
+    def save_mask():
+        if mask_destination is not None:
+            destination = Path(mask_destination).resolve()
+            if destination.exists():
+                raise ValueError("除尘派生蒙版已存在，未覆盖")
+            tifffile.imwrite(destination, sampled, photometric="minisblack",
+                             compression="deflate", metadata=None)
+            provenance["effective_mask"] = dict(path=str(destination), sha256=sha256(destination),
+                                                 shape=list(sampled.shape))
+
     if not count:
         _unchanged(evidence)
+        save_mask()
         return pixels, {**provenance, "changed_pixels": 0, "algorithm": "empty-mask"}
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -275,7 +334,7 @@ def replay_pixels(pixels, icc, plan, *, directory, output_size=None, sample_step
         source_path, mask_path, result_path = (scratch / name for name in ("input.tiff", "mask.tiff", "output.tiff"))
         _write_tiff(source_path, pixels, icc)
         tifffile.imwrite(mask_path, sampled, photometric="minisblack", compression=None, metadata=None)
-        temporary_evidence = [(source_path, _identity(source_path)), (mask_path, _identity(mask_path))]
+        temporary_evidence = [(path, _identity(path), sha256(path)) for path in (source_path, mask_path)]
         result = _run_helper(root, scratch, dict(backend=str(root), input=str(source_path),
                              mask=str(mask_path), output=str(result_path)), on_progress)
         actual, actual_icc = verified_pixels(dict(path=str(result_path), sha256=sha256(result_path)))
@@ -289,10 +348,12 @@ def replay_pixels(pixels, icc, plan, *, directory, output_size=None, sample_step
             raise ValueError("PURE Neg 引擎在重放期间发生变化")
         provenance.update(changed_pixels=changed_count, algorithm=result["algorithm"],
                           healed=result.get("healed", {}))
+        save_mask()
         return actual, provenance
 
 
-def replay_record(source_record, plan, *, directory, on_progress=lambda event: None):
+def replay_record(source_record, plan, *, directory, on_progress=lambda event: None,
+                  frame_mapping=None):
     """Write a new standalone full-resolution TIFF/receipt without replacement."""
     source_record = deepcopy(source_record)
     source_path = Path(source_record["path"]).resolve(strict=True)
@@ -301,15 +362,20 @@ def replay_record(source_record, plan, *, directory, on_progress=lambda event: N
     destination = Path(directory).resolve() / ("replayed-" + uuid.uuid4().hex)
     destination.mkdir(parents=True, exist_ok=False)
     try:
-        actual, provenance = replay_pixels(pixels, icc, plan, directory=destination,
-                                           on_progress=on_progress)
+        options = dict(directory=destination, on_progress=on_progress)
+        if frame_mapping is not None:
+            options.update(frame_mapping=frame_mapping, mask_destination=destination / "mask.tiff")
+        actual, provenance = replay_pixels(pixels, icc, plan, **options)
         if _identity(source_path) != before or sha256(source_path) != source_record["sha256"]:
             raise ValueError("除尘重放期间新成片来源发生变化")
         output = destination / "cleaned.tiff"
         _write_tiff(output, actual, icc)
+        effective = provenance.get("effective_mask", {})
         record = dict(path=str(output), sha256=sha256(output), shape=list(actual.shape),
-                      icc_sha256=hashlib.sha256(icc).hexdigest(), mask_path=plan["mask_path"],
-                      mask_sha256=plan["mask_sha256"], changed_pixels=provenance["changed_pixels"],
+                      icc_sha256=hashlib.sha256(icc).hexdigest(),
+                      mask_path=effective.get("path", plan["mask_path"]),
+                      mask_sha256=effective.get("sha256", plan["mask_sha256"]),
+                      changed_pixels=provenance["changed_pixels"],
                       mask_pixels=provenance["mask_pixels"], outside_mask_changed_pixels=0)
         provenance.update(source_sha256=source_record["sha256"], source_sha=source_record["sha256"],
                           parent_receipt=plan["receipt_path"])

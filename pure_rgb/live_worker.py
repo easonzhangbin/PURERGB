@@ -57,6 +57,7 @@ from .raw_import import create_processor, validate_frozen_import
 
 
 EDITING_DOCUMENT_KEYS = (
+    "measurement_method",
     "density_metering",
     "native_controls",
     "native_float_controls",
@@ -242,6 +243,8 @@ class Session:
                 self.identities[cal["gain_path"]] = self.identity(cal["gain_path"])
         self.processor = self.config = self.source = self.export = None
         self.experimental, self.native_cache, self.references = {}, {}, {}
+        self.native_print_cache = {}
+        self.native_print = None
         self._spatial_context_cache = {}
         self.headroom_cache = {}
         self.flex_research_cache = {}
@@ -462,6 +465,7 @@ class Session:
         return cache["pixels"], cache["icc"]
 
     def render(self, request):
+        self.native_print = None
         if hasattr(self, "bw_session"):
             result = self.bw_session.render(request)
             self.processor = self.bw_session.processor
@@ -474,6 +478,8 @@ class Session:
         for key in EDITING_DOCUMENT_KEYS:
             base.pop(key, None)
         recipe = checked_recipe({**base, **controls})
+        if recipe.get("measurement_method") != self.recipe.get("measurement_method"):
+            raise ValueError("密度测量算法已改变，需要重新创建测量参考")
         if recipe.get("density_metering") != self.recipe.get("density_metering"):
             raise ValueError("共享密度支持已改变，需要重新创建测量参考")
         if self.recipe.get("density_metering"):
@@ -536,7 +542,7 @@ class Session:
             highlight_controls = recipe.get("highlight_controls")
             spatial_controls = recipe.get("native_spatial_controls")
             spatial_config = spatial_source_key = None
-            cache_documents = [document, film]
+            cache_documents = [document, film, recipe.get("measurement_method")]
             if float_controls:
                 cache_documents.append(float_controls)
             if highlight_controls:
@@ -597,6 +603,10 @@ class Session:
                             film,
                         )
                         config = native_config(config, document)
+                        if recipe.get("measurement_method") == "negpy":
+                            from .measurement_method import original_config
+
+                            config = original_config(config, self.manifest["roi"], self.source.shape)
                 with span(
                     "preview_native_positive",
                     spatial=bool(spatial_controls),
@@ -651,6 +661,7 @@ class Session:
                         payload, _ = native_export(
                             self.processor, config, self.manifest["inputs"]
                         )
+                        self.native_print_cache = {key: deepcopy(self.processor.pure_native_print)}
                     if payload is not None:
                         pixels, other = inspect_tiff(payload)
                         if other != icc:
@@ -658,6 +669,7 @@ class Session:
                         pixels, _ = self.source_view(pixels)
                         self.native_cache = {key: pixels}
             pixels = self.native_cache[key]
+            self.native_print = deepcopy(self.native_print_cache.get(key))
         elif mode == "cool-shared-rgb" and recipe.get("nikon_research_controls"):
             original = self.prepare_nikon_reference()
             if original["icc"] != icc:
@@ -1018,6 +1030,7 @@ def main():
                 ),
                 reference_label=getattr(session, "reference_label", "已保存版本"),
                 preview_quality=quality,
+                native_print=getattr(session, "native_print", None),
                 **metering_fields,
                 # A retained anchor means the next edit on this session skips
                 # analysis, so the UI can shorten its debounce safely.

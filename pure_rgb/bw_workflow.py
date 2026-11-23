@@ -466,6 +466,7 @@ class BWSession:
             raise ValueError("Single B&W supports explicit Native preview only")
         controls = request.get("controls")
         if type(controls) is not dict or set(controls) - {
+            "measurement_method",
             "native_controls",
             "highlight_controls",
             "exposure_ev",
@@ -479,6 +480,7 @@ class BWSession:
             )
         base_recipe = deepcopy(self.recipe)
         for key in (
+            "measurement_method",
             "native_controls",
             "highlight_controls",
             "native_spatial_controls",
@@ -488,6 +490,8 @@ class BWSession:
         ):
             base_recipe.pop(key, None)
         recipe = checked_recipe({**base_recipe, **controls})
+        if recipe.get("measurement_method") != self.recipe.get("measurement_method"):
+            raise ValueError("黑白测量算法已改变，需要重新创建测量参考")
         for path, identity in self.identities.items():
             if self.identity(path) != identity:
                 raise ValueError("B&W RAW identity changed")
@@ -541,6 +545,7 @@ class BWSession:
             {
                 k: recipe.get(k)
                 for k in (
+                    "measurement_method",
                     "native_controls",
                     "highlight_controls",
                     "native_spatial_controls",
