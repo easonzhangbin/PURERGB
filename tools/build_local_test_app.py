@@ -21,7 +21,7 @@ from tempfile import TemporaryDirectory
 ROOT = Path(__file__).resolve().parents[1]
 FLAT = Path("assets/branding/deliveries/2026-11-17-flat")
 SPLASH = Path("assets/branding/deliveries/2026-11-13-png-final/Asset-1@2x.png")
-MANUAL = Path("docs/OPERATING_MANUAL.zh-CN.md")
+GUIDES = (Path("docs/OPERATING_MANUAL.zh-CN.md"), Path("docs/RGB_LIGHT_BALANCE_BILINGUAL.md"))
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store", "* 2.*", "usability_check.py")
 _IGNORE_PACKAGES = shutil.ignore_patterns(
     "__pycache__", "*.pyc", ".DS_Store", "*.pth", "_virtualenv*", "__editable__*",
@@ -199,7 +199,8 @@ def build(output, *, portable=False, build_number="15", test_build=False, qt_pac
         copy_file(Path("assets/branding/pure-rgb-header.png"), source)
         copy_file(Path("assets/branding/originals/pureneg-wordmark.png"), source)
         copy_file(SPLASH, source)
-        copy_file(MANUAL, source)
+        for guide in GUIDES:
+            copy_file(guide, source)
         shutil.copytree(ROOT / "docs/images", source / "docs/images",
                         ignore=IGNORE, copy_function=shutil.copyfile)
         copy_file(Path("THIRD_PARTY_NOTICES.md"), source)

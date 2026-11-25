@@ -85,9 +85,8 @@ class UpdateNotice(QWidget):
         self._release_url = f"{release.RELEASES_URL}/tag/v{release.APP_VERSION}"
         self.message.setText(
             f"已更新到 PURE RGB {release.APP_VERSION}\n"
-            "新增图片库和图文介绍，改进平场与镜头校正。\n"
-            "预览和高光找回提速，单击工具栏可直接裁切。\n"
-            "RGB 灯光配平暂时撤下。"
+            "RGB 灯光配平可从「导入归组」或「采集工具」打开。\n"
+            "新增 RAW 曝光检查、平场选用、灯具参考和中英文说明。"
         )
         self.open_button.setText("查看更新说明")
         self.show()

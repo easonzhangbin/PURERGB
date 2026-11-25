@@ -91,6 +91,7 @@ from .workflow_history_ui import EditHistoryUI, PreviewToolbar  # noqa: E402
 from .workflow_flatfield import FlatfieldUI  # noqa: E402
 from .workflow_combo import WorkflowComboBox as QComboBox  # noqa: E402
 from .motion_menus import SpringComboBox  # noqa: E402
+from .release import APP_VERSION, version_description  # noqa: E402
 from .workflow_display import DisplayTracker  # noqa: E402
 from .workflow_performance import (  # noqa: E402
     load_performance_settings, save_performance_settings, resolve_performance,
@@ -98,8 +99,7 @@ from .workflow_performance import (  # noqa: E402
 )
 
 
-# Release this tool once the lamp adjustment and recapture workflow is ready.
-RGB_LIGHT_BALANCE_ENABLED = False
+RGB_LIGHT_BALANCE_ENABLED = True
 
 
 def text(value, muted=False):
@@ -249,8 +249,6 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self._measurement_hint_timer.timeout.connect(self.clear_measurement_hint)
         self.import_attention_photo = None
         self.import_lens_context = None
-        from .release import APP_VERSION, version_description
-
         version_label = version_description()
         self.setWindowTitle("PURE RGB" if version_label == APP_VERSION
                             else f"PURE RGB · {version_label}")
@@ -1120,6 +1118,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             roles.addRow(role, choice)
             self.roles.append(choice)
         layout.addWidget(self.role_host)
+        if RGB_LIGHT_BALANCE_ENABLED:
+            layout.addWidget(button("RGB 灯光配平（可选）…", self.open_rgb_balance))
         layout.addWidget(text("机身与镜头"))
         self.equipment_note = text("选择 RAW 后读取器材与内嵌矫正参数。", True)
         layout.addWidget(self.equipment_note)
@@ -1141,8 +1141,6 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             profile_actions.addWidget(control)
         layout.addLayout(profile_actions)
         self.build_flatfield_tools(layout)
-        if RGB_LIGHT_BALANCE_ENABLED:
-            layout.addWidget(button("RGB 灯光配平（可选）…", self.open_rgb_balance))
         self.import_button = AttentionButton("应用通道更改")
         self.import_button.setObjectName("primary")
         self.import_button.clicked.connect(self.confirm_import)
@@ -2678,11 +2676,14 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             strength = setting.get("strength", 1.0)
         flatfield = (dict(path=str(path), strength=float(strength), enabled=True,
                           name=self.project.flatfield_name(path)) if path else None)
+        library = self.project.data.get("flatfield_library") or []
         dialog = getattr(self, "rgb_balance_dialog", None)
         if dialog is None:
-            self.rgb_balance_dialog = show_rgb_balance_dialog(self, flatfield=flatfield)
+            self.rgb_balance_dialog = show_rgb_balance_dialog(
+                self, flatfield=flatfield, flatfield_library=library,
+            )
         else:
-            dialog.set_flatfield(flatfield)
+            dialog.set_project_flatfield(flatfield, library)
             dialog.show()
             dialog.raise_()
             dialog.activateWindow()
@@ -4913,8 +4914,6 @@ def main():
         window.set_stage(args.stage)
     show_release_notes = False
     if choice.preferences is not None:
-        from .release import APP_VERSION, version_description
-
         if version_description() == APP_VERSION:
             show_release_notes = (preferences.is_file()
                                   and choice.preferences.get("release_notes_version") != APP_VERSION)

@@ -32,7 +32,7 @@ RAW_EXTENSIONS = (
 FILE_FILTER = (
     "平场 RAW 或增益配置 ("
     + " ".join(f"*{s} *{s.upper()}" for s in RAW_EXTENSIONS)
-    + " *.npz);;增益 NPZ (*.npz)"
+    + " *.npz *.NPZ);;增益 NPZ (*.npz *.NPZ)"
 )
 
 

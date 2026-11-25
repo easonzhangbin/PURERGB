@@ -2,9 +2,9 @@
 
 PURE RGB 基于 [NegPy](https://github.com/marcinz606/NegPy) 开发，感谢 marcinz606 与上游贡献者。
 
-**PURE RGB 0.2.2** 是 StudioPURE 为 Apple 芯片 Mac 开发的胶片数字化工作台。它把同一帧底片在红、绿、蓝光下拍摄的三张 RAW 合成为彩色正像，从密度测量、转换调色、除尘审核到选片导出，都在同一套工作流内完成。
+**PURE RGB 0.2.3** 是 StudioPURE 为 Apple 芯片 Mac 开发的胶片数字化工作台。它把同一帧底片在红、绿、蓝光下拍摄的三张 RAW 合成为彩色正像，从密度测量、转换调色、除尘审核到选片导出，都在同一套工作流内完成。
 
-[下载 0.2.2](https://github.com/easonzhangbin/PURERGB/releases/tag/v0.2.2) · [中文使用指南](docs/OPERATING_MANUAL.zh-CN.md) · [本版改进](docs/releases/0.2.2.md) · [捐赠 StudioPURE 项目](SUPPORT.md)
+[下载 0.2.3](https://github.com/easonzhangbin/PURERGB/releases/tag/v0.2.3) · [中文使用指南](docs/OPERATING_MANUAL.zh-CN.md) · [本版改进](docs/releases/0.2.3.md) · [捐赠 StudioPURE 项目](SUPPORT.md)
 
 ![PURE RGB 转换调色工作台。中央的 3 倍放大镜显示石雕纹理，左侧调节参数，右侧查看输出波形。](docs/images/color-workbench.png)
 
@@ -20,6 +20,12 @@ PURE RGB 基于 [NegPy](https://github.com/marcinz606/NegPy) 开发，感谢 mar
 | --- | --- |
 | [![建筑样片的分区密度网格与实测数值](docs/images/zonal-density.png)](docs/images/zonal-density.png) | [![独立观片台的灯板、胶片与显示器提示](docs/images/light-table.png)](docs/images/light-table.png) |
 | 切换到实验方式后，可逐格查看密度，点击排除或恢复该区域。 | 将转换后的正像放在灯板上，检查细节或挑选整卷。 |
+
+## 0.2.3 的主要改进
+
+- 在「导入归组」开放可选的 RGB 灯光配平，分别检查片基配平和保留画幅内的 RAW 曝光。
+- 支持手动载入平场 RAW、选用已保存的平场，以及保存灯具设置和按参考计算调节量。
+- 随应用提供配平指南和柯达资料的中英对照解读，并保留原文链接。[配平中英文说明](docs/RGB_LIGHT_BALANCE_BILINGUAL.md)
 
 ## 0.2.2 的主要改进
 
@@ -50,14 +56,14 @@ PURE RGB 基于 [NegPy](https://github.com/marcinz606/NegPy) 开发，感谢 mar
 
 ## 安装与启动
 
-**Apple 芯片 Mac 下载，要求 macOS 14 或更新版本**。打开 PKG 后按 macOS 安装助手指引安装到「应用程序」。安装包包含运行环境。PKG 没有 Developer ID Installer 签名，应用使用本机临时签名，尚未通过 Apple 公证。若首次打开时 macOS 提示无法验证开发者，先核对发布页上的 SHA-256。如确定来自本项目，可在「系统设置 → 隐私与安全性」中选择「仍要打开」，按当时的系统提示确认。 [下载 PKG 安装助手](https://github.com/easonzhangbin/PURERGB/releases/download/v0.2.2/PURE-RGB-0.2.2-macos-arm64.pkg) · [Apple 官方说明](https://support.apple.com/zh-cn/102445)
+**Apple 芯片 Mac 下载，要求 macOS 14 或更新版本**。打开 PKG 后按 macOS 安装助手指引安装到「应用程序」。安装包包含运行环境。PKG 没有 Developer ID Installer 签名，应用使用本机临时签名，尚未通过 Apple 公证。若首次打开时 macOS 提示无法验证开发者，先核对发布页上的 SHA-256。如确定来自本项目，可在「系统设置 → 隐私与安全性」中选择「仍要打开」，按当时的系统提示确认。 [下载 PKG 安装助手](https://github.com/easonzhangbin/PURERGB/releases/download/v0.2.3/PURE-RGB-0.2.3-macos-arm64.pkg) · [Apple 官方说明](https://support.apple.com/zh-cn/102445)
 
 ### 从源码运行
 
 需要 Git、[uv](https://docs.astral.sh/uv/getting-started/installation/)、稳定版 [Rust 工具链](https://rust-lang.org/tools/install/) 和 Apple 命令行开发者工具。可用 `xcode-select --install` 安装 Apple 工具。准备好这些工具后，再执行以下命令。安装脚本使用 Python 3.13 和固定依赖，首次编译可能需要数分钟。
 
 ```bash
-git clone --branch v0.2.2 https://github.com/easonzhangbin/PURERGB.git
+git clone --branch v0.2.3 https://github.com/easonzhangbin/PURERGB.git
 cd PURERGB
 python3 bootstrap.py
 ./PURE\ RGB.command
@@ -66,7 +72,7 @@ python3 bootstrap.py
 要在 Finder 里启动，可在本机完成上述安装后构建应用。该应用仍使用构建时的源码目录和虚拟环境。
 
 ```bash
-vendor/negpy/.venv/bin/python tools/build_local_test_app.py "$HOME/Applications/PURE RGB 0.2.2.app"
+vendor/negpy/.venv/bin/python tools/build_local_test_app.py "$HOME/Applications/PURE RGB 0.2.3.app"
 ```
 
 应用在启动后及持续运行期间每 24 小时查询 GitHub 正式发布通道。点击「查看更新」阅读说明并下载安装，也可以在 macOS 的 PURE RGB 菜单中主动检查。
