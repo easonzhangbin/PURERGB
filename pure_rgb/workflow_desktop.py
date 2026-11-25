@@ -19,7 +19,7 @@ if __name__ == "__main__":
     prepare_application_identity()
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QLockFile, QPointF, QSize, Qt, QThreadPool, QTimer, pyqtSignal  # noqa: E402
-from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPen  # noqa: E402
+from PyQt6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
     QApplication,
     QAbstractItemView,
@@ -96,6 +96,10 @@ from .workflow_performance import (  # noqa: E402
     load_performance_settings, save_performance_settings, resolve_performance,
     process_rss_bytes, should_release_preview,
 )
+
+
+# Release this tool once the lamp adjustment and recapture workflow is ready.
+RGB_LIGHT_BALANCE_ENABLED = False
 
 
 def text(value, muted=False):
@@ -469,15 +473,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.request_preview()
 
     def show_about(self):
-        from .release import version_description
-        from .workflow_support import DONORS
+        from .workflow_about import show_about
 
-        GlassMessageBox.about(
-            self, "关于 PURE RGB",
-            f"PURE RGB {version_description()}\n\nStudioPURE 出品\n三色负片与黑白影像工作流。\n"
-            "导入归组、画幅与测量、转换调色、修整审核、观片台与 RGB16／ICC 导出。\n\n"
-            f"感谢以下捐助者\n{DONORS}",
-        )
+        show_about(self)
 
     def _settings(self):
         if not hasattr(self, "settings_panel"):
@@ -745,6 +743,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.about_action.triggered.connect(self.show_about)
         self.application_menu.addAction(self.about_action)
         for title, slot in (
+            ("首次使用介绍…", self.open_introduction),
             ("使用指南", lambda: self._settings().open_manual()),
             ("捐赠 StudioPURE 项目", lambda: self._settings().open_donation()),
             ("检查更新", self.check_updates),
@@ -768,6 +767,14 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         from .workflow_application import ApplicationMenuTitles
 
         self.application_menu_titles = ApplicationMenuTitles(self)
+        self.library_menu = self.menuBar().addMenu("图片库")
+        self.library_action = QAction("打开图片库…", self)
+        self.library_action.setShortcut(QKeySequence("Ctrl+Shift+L"))
+        self.library_action.triggered.connect(self.open_image_library)
+        self.library_menu.addAction(self.library_action)
+        if RGB_LIGHT_BALANCE_ENABLED:
+            capture_menu = self.menuBar().addMenu("采集工具")
+            capture_menu.addAction("RGB 灯光配平（可选）…", self.open_rgb_balance)
         root = QWidget()
         root.setObjectName("workflowRoot")
         self.setCentralWidget(root)
@@ -1084,6 +1091,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         split.setSizes([320, 840, 238])
 
     def build_stage_0(self, layout):
+        layout.addWidget(button("图片库…", self.open_image_library))
         layout.addWidget(text("输入方式"))
         self.input_choice = QComboBox()
         self.input_choice.setAccessibleName("新素材输入方式")
@@ -1115,10 +1123,26 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         layout.addWidget(text("机身与镜头"))
         self.equipment_note = text("选择 RAW 后读取器材与内嵌矫正参数。", True)
         layout.addWidget(self.equipment_note)
-        self.lens_correction_button = button("RAW 内嵌镜头矫正", self.change_lens_correction)
+        self.lens_correction_button = button("镜头畸变矫正", self.change_lens_correction)
+        self.lens_correction_button.setToolTip("使用选定 LCP 或 RAW 内嵌镜头参数；照明不均和暗角使用平场矫正。")
         self.lens_correction_button.setCheckable(True)
         layout.addWidget(self.lens_correction_button)
+        self.chromatic_button = button("自动镜头色差矫正", self.change_chromatic_correction)
+        self.chromatic_button.setCheckable(True)
+        self.chromatic_button.setToolTip("校正边缘红绿、蓝紫通道错位；优先读取镜头配置，可随时关闭对照。")
+        layout.addWidget(self.chromatic_button)
+        self.lcp_note = text("镜头配置：自动匹配本机 Adobe Camera Raw 数据库，或手动选择 LCP。", True)
+        layout.addWidget(self.lcp_note)
+        profile_actions = QHBoxLayout()
+        self.lcp_auto = button("自动匹配", self.match_lens_profile)
+        self.lcp_choose = button("选择 LCP…", self.choose_lens_profile)
+        self.lcp_clear = button("清除", self.clear_lens_profile)
+        for control in (self.lcp_auto, self.lcp_choose, self.lcp_clear):
+            profile_actions.addWidget(control)
+        layout.addLayout(profile_actions)
         self.build_flatfield_tools(layout)
+        if RGB_LIGHT_BALANCE_ENABLED:
+            layout.addWidget(button("RGB 灯光配平（可选）…", self.open_rgb_balance))
         self.import_button = AttentionButton("应用通道更改")
         self.import_button.setObjectName("primary")
         self.import_button.clicked.connect(self.confirm_import)
@@ -1550,7 +1574,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             return
         self.navigate_stage(target)
 
-    def navigate_stage(self, index):
+    def navigate_stage(self, index, *, start_crop=False):
         index = canonical_stage(index)
         photo = self.current_photo()
         if index == self.step and (self.geometry_role or self._straighten_panel is not None):
@@ -1589,7 +1613,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.schedule_import_preview()
                 self.status_message(photo.get("import_error") or "照片正在自动准备，完成后即可进入下一步。")
             return
-        self.set_stage(index)
+        self.set_stage(index, start_crop=start_crop)
 
     def remind_pending_drawing(self):
         if self.geometry_role not in (None, "inspect", "meter_grid"):
@@ -1602,7 +1626,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             return True
         return False
 
-    def set_stage(self, index):
+    def set_stage(self, index, *, start_crop=False):
         self.end_history_gesture()
         try:
             index = canonical_stage(index)
@@ -1638,7 +1662,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             if route_changed:
                 self.refresh_photos()
             self.stage_navigation.select(index, animate=had_stage)
-        if route_changed and had_stage and self.current_photo()["initial_job"]:
+        if start_crop:
+            self.begin_selection("crop")
+        elif route_changed and had_stage and self.current_photo()["initial_job"]:
             job = self.project.saved_job()
             if job and not self.project.dirty():
                 sample = self.project.workspace.sample(job)
@@ -1725,11 +1751,17 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.actual_button.setEnabled(ready)
             self.compare.setEnabled(ready)
             self.lens_correction_button.setEnabled(
-                bool(photo and self.import_lens_context
+                bool(photo and ((self.import_lens_context
                      and self.import_lens_context[0] == self.import_preview_context()
-                     and self.import_lens_context[1] and not busy
+                     and self.import_lens_context[1]) or self.project.recipe().get("lens_profile")) and not busy
                      and photo["base"].get("raw_import") != "standard-mono-v1")
             )
+            optical_supported = bool(photo and photo["base"].get("raw_import") in
+                                     ("standard-crop-v1", "standard-cfa-dng-v1"))
+            for control in (self.chromatic_button, self.lcp_auto, self.lcp_choose):
+                control.setEnabled(optical_supported and not busy)
+            self.lcp_clear.setEnabled(optical_supported and not busy and
+                                      bool(self.project.recipe().get("lens_profile")))
             self.native_film.setEnabled(ready and not busy)
             for control in self.orientation_buttons.values():
                 control.setEnabled(ready and not busy)
@@ -1747,6 +1779,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             if not photo:
                 self.equipment_note.setText("选择 RAW 后读取器材与内嵌矫正参数。")
                 self.lens_correction_button.setChecked(False)
+                self.chromatic_button.setChecked(False)
                 self.meter_tools.setEnabled(False)
                 for control in self.advanced_buttons.values():
                     control.setEnabled(False)
@@ -1754,6 +1787,12 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             engine = photo["engine"]
             recipe = self.project.recipe()
             self.lens_correction_button.setChecked(bool(recipe.get("lens_correction")))
+            self.chromatic_button.setChecked(bool(recipe.get("chromatic_aberration")))
+            profile = recipe.get("lens_profile")
+            self.lcp_note.setText("镜头配置：" + Path(profile["path"]).name if profile else
+                                  "镜头配置：内嵌数据优先；未找到时分析画面边缘。可选用本机 Adobe LCP。")
+            if profile and not busy:
+                self.lens_correction_button.setEnabled(True)
             orientation = recipe.get("output_orientation", {})
             direction = [f"顺时针 {orientation.get('quarter_turns', 0) * 90}°"]
             if orientation.get("flip_horizontal"):
@@ -2432,7 +2471,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         image, (description, available, detail) = result
         self.import_lens_context = context, available
         self.equipment_note.setText(description + "\n" + detail)
-        self.lens_correction_button.setEnabled(available and not self.tasks.busy)
+        self.lens_correction_button.setEnabled((available or bool(self.project.recipe().get("lens_profile")))
+                                               and not self.tasks.busy)
         if self.current_photo()["initial_job"]:
             return
         if image is None or image.isNull():
@@ -2468,6 +2508,84 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.lens_correction_button.setChecked(bool(self.project.recipe().get("lens_correction")))
             self.error(error)
 
+    def _apply_chromatic_correction(self, enabled, *, profile=None, replace_profile=False):
+        self._lens_match_serial = getattr(self, "_lens_match_serial", 0) + 1
+        photo = self.current_photo()
+        if not photo or self.tasks.busy:
+            return
+        try:
+            self.project.set_chromatic_correction(enabled, profile=profile, replace_profile=replace_profile)
+            self.sync_controls()
+            if photo["initial_job"]:
+                self.save_version()
+            else:
+                self.status_message("镜头色差设置已保存，将在自动处理中应用。")
+        except Exception as error:
+            self.sync_controls()
+            self.error(error)
+
+    def change_chromatic_correction(self, enabled):
+        if self.loading or not self.current_photo() or self.tasks.busy:
+            return
+        if enabled and not self.project.recipe().get("lens_profile"):
+            self.match_lens_profile(auto_enable=True)
+        else:
+            self._apply_chromatic_correction(enabled)
+
+    def match_lens_profile(self, *, auto_enable=False):
+        photo = self.current_photo()
+        if not photo or self.tasks.busy:
+            return
+        from .adobe_lens_profiles import find_matching_lcp
+
+        identifier, paths = photo["id"], list(self.project.recipe()["raw"])
+        self._lens_match_serial = getattr(self, "_lens_match_serial", 0) + 1
+        serial = self._lens_match_serial
+        self.status_message("正在匹配本机 Adobe 镜头配置…")
+        work = Work((identifier, tuple(paths)), lambda: find_matching_lcp(paths))
+        def completed(context, binding):
+            current = self.current_photo()
+            if (self.closing or not current or current["id"] != context[0] or self.tasks.busy
+                    or serial != self._lens_match_serial
+                    or tuple(self.project.recipe()["raw"]) != context[1]):
+                return
+            if binding is not None or auto_enable:
+                self._apply_chromatic_correction(True, profile=binding, replace_profile=True)
+            if binding is None:
+                self.status_message("未找到唯一匹配的镜头配置；可手动选择 LCP。已启用时将保守分析画面色差。")
+        work.signals.done.connect(completed)
+        def failed(context, message):
+            current = self.current_photo()
+            if (self.closing or not current or current["id"] != context[0]
+                    or serial != self._lens_match_serial
+                    or tuple(self.project.recipe()["raw"]) != context[1]):
+                return
+            self.sync_controls()
+            self.status_message("暂时无法匹配镜头配置：" + message)
+        work.signals.failed.connect(failed)
+        self._lens_match_work = work
+        self.pool.start(work)
+
+    def choose_lens_profile(self):
+        if not self.current_photo() or self.tasks.busy:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择镜头配置", "/Library/Application Support/Adobe/CameraRaw/LensProfiles/1.0",
+            "Adobe 镜头配置 (*.lcp *.LCP)",
+        )
+        if path:
+            from .adobe_lens_profiles import profile_binding
+
+            try:
+                self._apply_chromatic_correction(True, profile=profile_binding(path), replace_profile=True)
+            except Exception as error:
+                self.error(error)
+
+    def clear_lens_profile(self):
+        if self.current_photo():
+            self._apply_chromatic_correction(bool(self.project.recipe().get("chromatic_aberration")),
+                                             replace_profile=True)
+
     def photo_selection_changed(self):
         self.project.select_photos(
             item.data(Qt.ItemDataRole.UserRole) for item in self.photo_list.selectedItems()
@@ -2500,6 +2618,74 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
 
         return (SUPPORTED_RAW_EXTENSIONS - SUPPORTED_JPEG_EXTENSIONS
                 - SUPPORTED_JXL_EXTENSIONS - SUPPORTED_TIFF_EXTENSIONS)
+
+    def open_image_library(self):
+        from .workflow_image_library import ImageLibraryDialog
+
+        dialog = getattr(self, "image_library_dialog", None)
+        if dialog is None or dialog.cancelled.is_set():
+            dialog = ImageLibraryDialog(
+                ROOT / "outputs/workflow-ui-state/image-library.sqlite3", self,
+                source_mode=self.input_choice.currentData(),
+            )
+            dialog.import_requested.connect(self.import_library_paths)
+            self.image_library_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def open_introduction(self):
+        from .workflow_onboarding import show_onboarding
+
+        dialog = getattr(self, "introduction_dialog", None)
+        if dialog is None:
+            self.introduction_dialog = show_onboarding(self)
+        else:
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+
+    def show_first_use_intro(self):
+        path = ROOT / "outputs/workflow-ui-state/introduction.json"
+        try:
+            shown = json.loads(path.read_text()).get("shown") is True
+        except (OSError, ValueError, AttributeError):
+            shown = False
+        if not shown and not self.closing:
+            self.open_introduction()
+            write_json(path, dict(version=1, shown=True))
+
+    def import_library_paths(self, paths, source_mode):
+        if self.tasks.busy:
+            self.image_library_dialog.status.setText("当前任务完成后可继续导入所选照片。")
+            return
+        self.input_choice.setCurrentIndex(self.input_choice.findData(source_mode))
+        self.image_library_dialog.hide()
+        self.import_paths(paths, source_mode, explicit_files=True)
+
+    def open_rgb_balance(self):
+        if not RGB_LIGHT_BALANCE_ENABLED:
+            return
+        from .workflow_rgb_balance import show_rgb_balance_dialog
+
+        photo = self.current_photo()
+        if photo:
+            recipe = self.project.recipe()
+            path, strength = recipe.get("flatfield"), recipe.get("flatfield_strength", 1.0)
+        else:
+            setting = self.project.flatfield_default() or {}
+            path = setting.get("path") if setting.get("enabled", True) else None
+            strength = setting.get("strength", 1.0)
+        flatfield = (dict(path=str(path), strength=float(strength), enabled=True,
+                          name=self.project.flatfield_name(path)) if path else None)
+        dialog = getattr(self, "rgb_balance_dialog", None)
+        if dialog is None:
+            self.rgb_balance_dialog = show_rgb_balance_dialog(self, flatfield=flatfield)
+        else:
+            dialog.set_flatfield(flatfield)
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
 
     def import_files(self):
         extensions = sorted(self.input_extensions())
@@ -4699,7 +4885,9 @@ def main():
     app = QApplication(sys.argv[:1])
     app.setApplicationName("PURE RGB")
     app.setApplicationDisplayName("PURE RGB")
-    app.setFont(QFont("PingFang SC", 12))
+    from .workflow_onboarding_theme import body_font
+
+    app.setFont(body_font())
     app.setWindowIcon(application_icon())
     # Frost every dialog, alert, menu and combo popup with native vibrancy.
     install_glass_surfaces(app)
@@ -4723,9 +4911,20 @@ def main():
     ))
     if args.stage is not None:
         window.set_stage(args.stage)
+    show_release_notes = False
     if choice.preferences is not None:
+        from .release import APP_VERSION, version_description
+
+        if version_description() == APP_VERSION:
+            show_release_notes = (preferences.is_file()
+                                  and choice.preferences.get("release_notes_version") != APP_VERSION)
+            choice.preferences["release_notes_version"] = APP_VERSION
         write_json(preferences, choice.preferences)
     window.showMaximized()
+    if show_release_notes:
+        window.update_notice.show_installed_release()
+    if args.ready_report is None:
+        QTimer.singleShot(900, window.show_first_use_intro)
     QTimer.singleShot(0, window.auto_import.resume)
     window.update_notice.schedule()
     if args.settings:

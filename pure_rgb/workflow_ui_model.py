@@ -680,6 +680,22 @@ class WorkflowProject:
         history.record(self._edit_snapshot(photo), "RAW 内嵌镜头矫正")
         self.save()
 
+    def set_chromatic_correction(self, enabled, *, profile=None, replace_profile=False):
+        photo = self.photo()
+        history = self._edit_history(photo)
+        drafts = {}
+        for engine, recipe in photo["drafts"].items():
+            updated = {**recipe, "chromatic_aberration": enabled}
+            if replace_profile:
+                updated.pop("lens_profile", None)
+                if profile is not None:
+                    updated["lens_profile"] = deepcopy(profile)
+            drafts[engine] = checked_recipe(updated)
+        photo["drafts"] = drafts
+        self.preview_metering.pop(photo["id"], None)
+        history.record(self._edit_snapshot(photo), "镜头色差矫正")
+        self.save()
+
     def register_flatfield(self, report):
         """Index a computed gain for later reuse; one entry per gain content."""
         gain_path = report.get("gain_path")
@@ -885,6 +901,9 @@ class WorkflowProject:
             recipe = with_straighten(recipe, engine, straighten_values(source_draft, source_engine))
             if source_draft.get("lens_correction"):
                 recipe["lens_correction"] = True
+            for field in ("chromatic_aberration", "lens_profile"):
+                if field in source_draft:
+                    recipe[field] = deepcopy(source_draft[field])
             recipe["flatfield"] = flatfield
             if flatfield and "flatfield_strength" in source_draft:
                 recipe["flatfield_strength"] = source_draft["flatfield_strength"]
@@ -965,7 +984,8 @@ class WorkflowProject:
             raise ValueError("请先完成照片导入")
         imported = self.workspace.job(photo["initial_job"])["recipe"]
         recipe = {**photo["base"], "roi": deepcopy(photo["analysis_roi"])}
-        for field in ("raw_import", "flatfield", "flatfield_strength", "registration_check", "lens_correction"):
+        for field in ("raw_import", "flatfield", "flatfield_strength", "registration_check", "lens_correction",
+                      "chromatic_aberration", "lens_profile"):
             if field in imported:
                 recipe[field] = deepcopy(imported[field])
         recipe = checked_recipe(recipe)
@@ -1452,6 +1472,16 @@ class WorkflowProject:
                 raise ValueError("除尘来源清单已改变，请重新进行除尘审核")
             current_job = self.source_job(photo)
             if current_job is None:
+                from .repair_plan import same_optics_baseline_recipe
+
+                parent, _ = self._repair_json(cached["parent_path"])
+                identity = plan["binding"].get("raw_import_identity", {})
+                if (set(identity) == {"source_pixels_sha256", "geometry_token"}
+                        and same_optics_baseline_recipe(parent["recipe"], recipe)):
+                    # Carry the authenticated original into the full render.
+                    # validate_frame must prove the actual pre-CA pixel hash
+                    # and unchanged G coordinates before any mask is applied.
+                    return deepcopy(plan), None
                 return None, "来源配置已改变，请重新进行除尘审核"
             current_path = self.workspace.root / "runs" / current_job["id"] / "manifest.json"
             current, current_identity = self._repair_json(current_path)

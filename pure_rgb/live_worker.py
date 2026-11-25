@@ -303,6 +303,8 @@ class Session:
             self.recipe.get("raw_import", "legacy-v1"),
             flatfield_reference_shape=reference_shape,
             **({"lens_correction": True} if self.recipe.get("lens_correction") else {}),
+            **({"chromatic_aberration": True} if self.recipe.get("chromatic_aberration") else {}),
+            **({"lens_profile": self.recipe["lens_profile"]} if self.recipe.get("lens_profile") else {}),
             **(
                 {"registration_check": self.recipe["registration_check"]}
                 if self.recipe.get("registration_check")
@@ -1032,11 +1034,14 @@ def main():
                 preview_quality=quality,
                 native_print=getattr(session, "native_print", None),
                 **metering_fields,
-                # A retained anchor means the next edit on this session skips
-                # analysis, so the UI can shorten its debounce safely.
+                # A retained anchor or original Native source makes the next
+                # edit cheaper, so the UI can shorten its debounce.
                 preview_reusable=bool(
                     getattr(session, "anchor", None)
                     or getattr(session, "native_cache", None)
+                    or (quality or {}).get("mode") in {
+                        "native-original-screen", "nikon-original-screen", "flex-original-screen",
+                    }
                 ),
                 preview_performance=(
                     getattr(session.density_preview, "last_receipt", None)

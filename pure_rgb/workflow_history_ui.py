@@ -77,11 +77,11 @@ class EditHistoryUI:
             layout.addWidget(control)
         self.crop_button = QPushButton("裁切")
         self.crop_button.setObjectName("cropEdit")
-        self.crop_button.setAccessibleName("裁切、拉直与旋转")
+        self.crop_button.setAccessibleName("裁切")
         self.crop_button.setIcon(QIcon(str(icons / "crop.svg")))
         self.crop_button.setIconSize(QSize(18, 18))
-        self.crop_button.setToolTip("打开裁切、拉直与旋转")
-        self.crop_button.clicked.connect(self.open_crop_tools)
+        self.crop_button.setToolTip("直接在画布上裁切照片")
+        self.crop_button.clicked.connect(lambda: self.open_crop_tools(start_crop=True))
         layout.addWidget(self.crop_button)
 
     def sync_history_actions(self):
@@ -198,10 +198,10 @@ class EditHistoryUI:
         self.schedule_preview()
         self.status_message(("已重做：" if redo else "已撤回：") + label)
 
-    def open_crop_tools(self):
+    def open_crop_tools(self, *, start_crop=False):
         if self.tasks.busy or not self.current_photo():
             return
-        self.navigate_stage(4)
+        self.navigate_stage(4, start_crop=start_crop)
         if self.step == 4:
             panel = self.crop_panels[4]
             self.pages.widget(4).verticalScrollBar().setValue(0)

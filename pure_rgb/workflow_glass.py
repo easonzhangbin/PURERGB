@@ -329,6 +329,8 @@ class GlassSurfaces(QObject):
 
     @staticmethod
     def _classify(surface):
+        if surface.property("useSystemWindowBackground"):
+            return None
         if isinstance(surface, (QFileDialog, QColorDialog)):
             return None  # Native file/colour panels own their materials.
         if isinstance(surface, (QMessageBox, QDialog)):

@@ -45,14 +45,67 @@ def _reference_shape(value, expected):
     return shape
 
 
+def map_gain_to_sensor(gain, mapping):
+    """Select a proven sensor region before any output crop or orientation.
+
+    Full-field resolution changes keep the original low-resolution gain; the
+    Native full-canvas resize remains the single interpolation. An explicit
+    sensor crop is sampled once onto the target sensor canvas, with pixel-center
+    bilinear coordinates. Neither an unknown crop nor extrapolation is accepted.
+    The frozen gain file and input array remain unchanged.
+    """
+    target = mapping.get("target_sensor_shape")
+    if (not isinstance(target, (list, tuple)) or len(target) != 3
+            or any(type(v) is not int or v < 1 for v in target) or target[2] != 3):
+        raise ValueError("Explicit target sensor-visible RGB shape required")
+    region = mapping.get("reference_roi_normalized_xyxy")
+    if (not isinstance(region, (list, tuple)) or len(region) != 4
+            or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                   or not np.isfinite(v) for v in region)):
+        raise ValueError("Explicit normalized reference sensor rectangle required")
+    x0, y0, x1, y1 = region
+    if not 0 <= x0 < x1 <= 1 or not 0 <= y0 < y1 <= 1:
+        raise ValueError("Target sensor rectangle is outside the flat-field reference")
+    if (not isinstance(gain, np.ndarray) or gain.ndim != 3 or gain.shape[2] != 3
+            or min(gain.shape[:2]) < 1 or gain.dtype.kind != "f"
+            or not _finite(gain, positive=True)):
+        raise ValueError("Gain must be finite positive floating HWC RGB")
+    if list(region) == [0., 0., 1., 1.]:
+        return gain
+    height, width, _ = target
+    gh, gw, _ = gain.shape
+    # Match Native resize_linear's half-pixel convention and edge extension.
+    x = np.clip((x0 + (np.arange(width, dtype=np.float64) + .5)
+                 / width * (x1 - x0)) * gw - .5, 0, gw - 1)
+    ix = np.floor(x).astype(np.intp)
+    jx = np.minimum(ix + 1, gw - 1)
+    wx = (x - ix).astype(np.float32)[None, :, None]
+    result = np.empty(target, dtype=np.float32)
+    rows = max(1, 262144 // width)
+    for start in range(0, height, rows):
+        end = min(start + rows, height)
+        y = np.clip((y0 + (np.arange(start, end, dtype=np.float64) + .5)
+                     / height * (y1 - y0)) * gh - .5, 0, gh - 1)
+        iy = np.floor(y).astype(np.intp)
+        jy = np.minimum(iy + 1, gh - 1)
+        wy = (y - iy).astype(np.float32)[:, None, None]
+        upper = gain[iy[:, None], ix[None, :]] * (1 - wx) + gain[iy[:, None], jx[None, :]] * wx
+        lower = gain[jy[:, None], ix[None, :]] * (1 - wx) + gain[jy[:, None], jx[None, :]] * wx
+        result[start:end] = upper * (1 - wy) + lower * wy
+    if not _finite(result, positive=True):
+        raise ValueError("Mapped sensor gain must remain finite and positive")
+    return result
+
+
 def apply_standard_flatfield(
     image, config, plan, *, orientation, full_sensor_shape=None
 ):
     """Return post-merge float32 pixels and an explicit coordinate receipt.
 
     ``full_sensor_shape`` must come from validated calibration provenance. It is
-    the reference's original full visible sensor-layout HWC shape, not the raw
-    storage dimensions, oriented shape, cropped shape or low-resolution gain.
+    the gain's bound full visible sensor-layout HWC shape (after any proven
+    cross-resolution mapping), not RAW storage dimensions, an oriented shape,
+    an output crop or the low-resolution gain raster.
     Active gain without that binding fails closed. Disabled gain is identity.
 
     The exact implementation may allocate a full-resolution RGB gain array,

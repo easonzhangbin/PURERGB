@@ -25,7 +25,7 @@ from .density_matrix import (
     render_variant,
     study_region,
 )
-from .endpoint_study import fit_endpoint_curve
+from .endpoint_study import FIT_REFERENCE_STRIDE, fit_endpoint_curve
 from .engines import check_reference_sources
 from .editing_render import experimental_positive
 from .flatfield import attach_calibration
@@ -319,6 +319,8 @@ def render(request, *, emit_callback=None, prepared_source=None):
                 processor, config, source, automatic = open_triplet(
                     recipe["raw"], raw_import=recipe.get("raw_import", "legacy-v1"),
                     **({"lens_correction": True} if recipe.get("lens_correction") else {}),
+                    **({"chromatic_aberration": True} if recipe.get("chromatic_aberration") else {}),
+                    **({"lens_profile": recipe["lens_profile"]} if recipe.get("lens_profile") else {}),
                     **({"registration_check": recipe["registration_check"]}
                        if recipe.get("registration_check") else {}),
                     **({"configure_source": configure_standard_source}
@@ -422,29 +424,38 @@ def render(request, *, emit_callback=None, prepared_source=None):
         output_roi = output_rectangle(recipe, roi, source.shape)
         emit_event(type="progress", fraction=0.22, message="测量画面内部密度")
         original_metering = recipe.get("measurement_method") == "negpy"
-        with span("density_analysis", roi=roi, method=recipe["density"]):
-            window = (
-                negpy_window(source, config, roi)
-                if recipe["density"] == "negpy"
-                else percentile_window(np.maximum(source, 0), roi)
-            )
         config = replace(
             config, exposure=replace(config.exposure, paper_profile=recipe["paper"])
         )
-        frozen = replace(
-            config, process=fixed_process(config.process, window, source.shape)
-        )
-        if original_metering:
-            from .measurement_method import original_config, original_window
+        method = "negpy-original" if original_metering else recipe["density"]
+        with span("density_analysis", roi=roi, method=method):
+            if original_metering:
+                from .measurement_method import original_config, original_window
 
-            frozen = original_config(config, roi, source.shape)
-            window = original_window(source, frozen, roi)
-        # A Native-only spatial render derives its own source, reference and
-        # RGB16 output. The neutral positive is only consumed by the other
-        # engines, so avoid rendering a second full frame in that case.
+                frozen = original_config(config, roi, source.shape)
+                window = original_window(source, frozen, roi)
+            else:
+                window = (
+                    negpy_window(source, config, roi)
+                    if recipe["density"] == "negpy"
+                    else percentile_window(np.maximum(source, 0), roi)
+                )
+                frozen = replace(
+                    config, process=fixed_process(config.process, window, source.shape)
+                )
+        native_overrides = recipe.get("native_controls")
+        float_controls = recipe.get("native_float_controls")
+        highlight_controls = recipe.get("highlight_controls")
+        spatial_controls = recipe.get("native_spatial_controls")
+        # These Native-only renders produce their own RGB16, export tags and
+        # pinned working ICC. Float/highlight need the neutral export settings,
+        # and other engines still consume the neutral reference pixels.
+        ordinary_native_edits = native_overrides and not any((
+            float_controls, highlight_controls, recipe.get("native_film"),
+        ))
         skip_neutral_native = (
             only_mode == "native"
-            and bool(recipe.get("native_spatial_controls"))
+            and (bool(spatial_controls) or bool(ordinary_native_edits))
             and not recipe.get("density_metering")
             and not recipe.get("nikon_research_controls")
         )
@@ -485,7 +496,7 @@ def render(request, *, emit_callback=None, prepared_source=None):
         # The fitters use only this exact ROI-origin grid. Convert the selected
         # RGB16 samples rather than retaining a full float64 reference ROI.
         # Creative Native edits below remain independent of this neutral grid.
-        fit_stride = 8
+        fit_stride = FIT_REFERENCE_STRIDE
         reference = (
             None
             if only_mode == "native"
@@ -502,10 +513,6 @@ def render(request, *, emit_callback=None, prepared_source=None):
         )
         # Keep neutral reference and all experimental fitting independent of
         # Native-only creative controls. The original export above is immutable.
-        native_overrides = recipe.get("native_controls")
-        float_controls = recipe.get("native_float_controls")
-        highlight_controls = recipe.get("highlight_controls")
-        spatial_controls = recipe.get("native_spatial_controls")
         float_info = None
         highlight_info = None
         with span("native_film_context"):
@@ -525,10 +532,12 @@ def render(request, *, emit_callback=None, prepared_source=None):
                 film_config, native_overrides or {"version": 1, "values": {}}
             )
             if original_metering:
-                from .measurement_method import original_config, original_window
-
                 adjusted = original_config(adjusted, roi, source.shape)
-                actual_window = original_window(source, adjusted, roi)
+                if adjusted.process == frozen.process:
+                    actual_window = window
+                else:
+                    with span("native_density_reanalysis", roi=roi):
+                        actual_window = original_window(source, adjusted, roi)
                 report["native_metering_window"] = asdict(actual_window)
                 if only_mode == "native":
                     report["density_window"] = asdict(actual_window)
@@ -550,6 +559,7 @@ def render(request, *, emit_callback=None, prepared_source=None):
                 report["native_spatial_processing"] = spatial_info
                 report["native_spatial_snapshot"] = spatial_snapshot
             elif highlight_controls:
+                emit_event(type="progress", fraction=0.35, message="正在渲染与合成高光找回…")
                 payload, highlight_info = _native_highlight_export(
                     processor,
                     adjusted,

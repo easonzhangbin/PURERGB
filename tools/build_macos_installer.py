@@ -41,7 +41,7 @@ def write_zip_assistant(app, output):
 def build_installer(app, output):
     info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
     if app.name != "PURE RGB.app" or info["CFBundleIdentifier"] != APP_ID or not info.get("PURE RGB Portable"):
-        raise ValueError("请选择可以独立运行的 PURE RGB.app 正式构建")
+        raise ValueError("请选择可以独立运行的 PURE RGB.app 构建")
     if output.suffix != ".pkg" or output.exists():
         raise ValueError("请指定尚不存在的 .pkg 文件")
     subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", app], check=True)
@@ -78,7 +78,9 @@ def build_installer(app, output):
         ], check=True)
         tree = ET.parse(distribution)
         spec = tree.getroot()
-        title = f"PURE RGB {version} 安装助手"
+        is_test = info.get("PURE RGB Test Build", False)
+        label = f"{version} 测试版 · Build {info['CFBundleVersion']}" if is_test else version
+        title = f"PURE RGB {label} 安装助手"
         ET.SubElement(spec, "title").text = title
         resources = work / "resources"
         resources.mkdir()
@@ -87,9 +89,10 @@ def build_installer(app, output):
             "请先保存任务并退出 PURE RGB。点击「继续」可查看安装位置并确认安装。"
             "程序将安装到「应用程序」，照片和项目保存在原处。\n", encoding="utf-8",
         )
+        checksum_source = "随测试包提供的" if is_test else "GitHub Releases 提供的"
         (resources / "Conclusion.txt").write_text(
             "安装完成。请到「应用程序」打开 PURE RGB。已有任务可在启动时选择载入。\n\n"
-            "如果 macOS 提示无法验证开发者，请核对 GitHub Releases 提供的 SHA-256，"
+            f"如果 macOS 提示无法验证开发者，请核对{checksum_source} SHA-256，"
             "再根据 Apple「在 Mac 上安全地打开 App」说明决定是否允许打开。\n"
             "https://support.apple.com/zh-cn/102445\n", encoding="utf-8",
         )

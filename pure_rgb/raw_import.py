@@ -173,9 +173,12 @@ class StandardRawProcessor(ImageProcessor):
 
     policy = STANDARD_IMPORT
 
-    def __init__(self, *, flatfield_reference_shape=None, registration_check=None, lens_correction=False):
+    def __init__(self, *, flatfield_reference_shape=None, registration_check=None, lens_correction=False,
+                 chromatic_aberration=False, lens_profile=None):
         super().__init__(use_gpu=False)
         self.pure_lens_correction = lens_correction
+        self.pure_chromatic_aberration = chromatic_aberration
+        self.pure_lens_profile = deepcopy(lens_profile)
         self._pure_registration_check = checked_registration_check(
             self.policy, registration_check
         )
@@ -230,6 +233,15 @@ class StandardRawProcessor(ImageProcessor):
     def _header(self, path):
         return inspect_raw_header(path)
 
+    def source_identity_for_paths(self, paths):
+        identity = (tuple((p, file_identity(p)) for p in paths),
+                    tuple(self.pure_flatfield_reference_shape or ()))
+        if self.pure_chromatic_aberration or (self.pure_lens_profile and self.pure_lens_correction):
+            identity += (_digest(dict(chromatic_aberration=self.pure_chromatic_aberration,
+                                      lens_profile=self.pure_lens_profile,
+                                      lens_correction=self.pure_lens_correction)),)
+        return identity
+
     def _decode_band(self, path, band, plan, orientation, params):
         from negpy.kernel.image.logic import uint16_to_float32
         from negpy.features.process.path import positive_decode
@@ -253,10 +265,7 @@ class StandardRawProcessor(ImageProcessor):
         paths = self._paths(file_path, params)
 
         def identity_now():
-            return (
-                tuple((p, file_identity(p)) for p in paths),
-                tuple(self.pure_flatfield_reference_shape or ()),
-            )
+            return self.source_identity_for_paths(paths)
 
         identity = identity_now()
         if identity != self._pure_source_identity:
@@ -317,7 +326,7 @@ class StandardRawProcessor(ImageProcessor):
             for band, (plane, metadata) in enumerate(executor.map(decode_band, inputs)):
                 path, header = paths[band], headers[band]
                 planes.append(plane)
-                if self.pure_lens_correction:
+                if self.pure_lens_correction or self.pure_chromatic_aberration:
                     lens_profiles.append(metadata.get("lens_correction"))
                 if band == 0:
                     primary_metadata = metadata
@@ -361,12 +370,42 @@ class StandardRawProcessor(ImageProcessor):
             if before_flatfield is not None else None
         )
         lens_receipt = None
-        if self.pure_lens_correction:
+        chromatic_receipt = None
+        chromatic_reference = None
+        if self.pure_lens_correction and not self.pure_lens_profile:
             from .raw_lens_correction import correct_registered_lens
 
             merged, lens_receipt = correct_registered_lens(
                 merged, lens_profiles, plan, effective, orientation
             )
+        baseline_lens_receipt = deepcopy(lens_receipt)
+        if self.pure_chromatic_aberration or (self.pure_lens_profile and self.pure_lens_correction):
+            from .raw_lens_correction import correct_additional_optics
+
+            # This is the authenticated pre-CA source, in the same green
+            # coordinate system as an existing dust selection. The mask may
+            # be reused only when inputs, registration, flatfield and this
+            # baseline all still match; it never authorizes arbitrary sources.
+            baseline = merged
+            baseline_context = {}
+            merged, additional_lens, chromatic_receipt = correct_additional_optics(
+                merged, lens_profiles, paths, plan, effective, orientation,
+                chromatic_aberration=self.pure_chromatic_aberration,
+                lens_profile=self.pure_lens_profile, distortion=self.pure_lens_correction,
+                embedded_receipt=lens_receipt, registration=registration,
+                baseline_context=baseline_context,
+            )
+            baseline = baseline_context.get("pixels", baseline)
+            baseline_lens_receipt = baseline_context.get("lens_receipt", baseline_lens_receipt)
+            baseline_sha = hashlib.sha256(memoryview(baseline).cast("B")).hexdigest()
+            green_sha = hashlib.sha256(np.ascontiguousarray(baseline[..., 1])).hexdigest()
+            if additional_lens:
+                lens_receipt = additional_lens
+            chromatic_reference = dict(source_pixels_sha256=baseline_sha,
+                green_pixels_sha256=green_sha)
+            chromatic_reference.update(
+                green_unchanged=bool(np.array_equal(baseline[..., 1], merged[..., 1])),
+                canvas_unchanged=baseline.shape == merged.shape)
         if tuple((p, file_identity(p)) for p in paths) != tuple(zip(paths, identities)):
             raise ValueError("RAW changed while the triplet was assembled")
         geometry = {
@@ -412,6 +451,15 @@ class StandardRawProcessor(ImageProcessor):
             "raw_files_modified": False,
             "LibRaw_decoder_patched": False,
         }
+        if chromatic_receipt is not None and self.pure_chromatic_aberration:
+            receipt["chromatic_aberration"] = chromatic_receipt
+            baseline_geometry = {k: v for k, v in geometry.items() if k != "embedded_lens"}
+            if baseline_lens_receipt:
+                baseline_geometry["embedded_lens"] = baseline_lens_receipt
+            chromatic_reference["effective_geometry"] = baseline_geometry
+            chromatic_reference["geometry_token"] = _digest(dict(
+                bands=bands, registration=registration, effective_geometry=baseline_geometry))
+            receipt["chromatic_reference"] = chromatic_reference
         merged.setflags(write=False)
         self.pure_raw_import_receipt = receipt
         self.pure_raw_import_token = _digest(receipt)
@@ -425,11 +473,15 @@ class StandardRawProcessor(ImageProcessor):
 
 def create_processor(
     policy=LEGACY_IMPORT, *, flatfield_reference_shape=None, registration_check=None,
-    lens_correction=False
+    lens_correction=False, chromatic_aberration=False, lens_profile=None,
 ):
     if policy not in IMPORT_POLICIES:
         raise ValueError("Unknown RAW import policy")
     registration_check = checked_registration_check(policy, registration_check)
+    if type(chromatic_aberration) is not bool:
+        raise ValueError("自动色差矫正必须为开关")
+    if (chromatic_aberration or lens_profile) and policy not in (STANDARD_IMPORT, STANDARD_DNG_IMPORT):
+        raise ValueError("自动色差矫正目前用于标准拜耳三色 RAW")
     options = (
         {"registration_check": registration_check}
         if registration_check is not None
@@ -439,6 +491,10 @@ def create_processor(
         if not is_standard_import(policy):
             raise ValueError("内嵌镜头矫正需要标准 RAW 导入")
         options["lens_correction"] = True
+    if chromatic_aberration:
+        options["chromatic_aberration"] = True
+    if lens_profile:
+        options["lens_profile"] = deepcopy(lens_profile)
     if policy == STANDARD_DNG_IMPORT:
         from .raw_dng_import import StandardCfaDngProcessor
 
@@ -470,6 +526,10 @@ def validate_frozen_import(processor, manifest, source):
     )
     if manifest["recipe"].get("raw_import", LEGACY_IMPORT) == LEGACY_IMPORT:
         return
+    if (bool(getattr(processor, "pure_chromatic_aberration", False))
+            != bool(manifest["recipe"].get("chromatic_aberration", False))
+            or getattr(processor, "pure_lens_profile", None) != manifest["recipe"].get("lens_profile")):
+        raise ValueError("Frozen RAW optics differ from the recipe")
     expected = manifest.get("raw_import_receipt")
     actual = frozen_import_receipt(processor)
     if (

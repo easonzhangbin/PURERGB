@@ -415,8 +415,10 @@ def validate_dng_import_receipt_metadata(receipt):
 class StandardCfaDngProcessor(StandardRawProcessor):
     policy = STANDARD_DNG_IMPORT
 
-    def __init__(self, *, registration_check=None, lens_correction=False):
-        super().__init__(registration_check=registration_check, lens_correction=lens_correction)
+    def __init__(self, *, registration_check=None, lens_correction=False,
+                 chromatic_aberration=False, lens_profile=None):
+        super().__init__(registration_check=registration_check, lens_correction=lens_correction,
+                         chromatic_aberration=chromatic_aberration, lens_profile=lens_profile)
         self._dng_headers = {}
 
     @staticmethod
@@ -463,6 +465,10 @@ class StandardCfaDngProcessor(StandardRawProcessor):
         receipt["geometry_token"] = _digest(
             {k: receipt[k] for k in ("bands", "registration", "effective_geometry")}
         )
+        if receipt.get("chromatic_reference"):
+            reference = receipt["chromatic_reference"]
+            reference["geometry_token"] = _digest(dict(bands=receipt["bands"],
+                registration=receipt["registration"], effective_geometry=reference["effective_geometry"]))
         validate_dng_import_receipt_metadata(receipt)
         self.pure_raw_import_receipt = receipt
         self.pure_raw_import_token = _digest(receipt)

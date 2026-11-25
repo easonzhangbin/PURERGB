@@ -51,6 +51,13 @@ def shutdown_window(window):
     thumbnails = getattr(window, "photo_thumbnails", None)
     if thumbnails is not None:
         thumbnails.close()
+    library = getattr(window, "image_library_dialog", None)
+    if library is not None:
+        library.dispose()
+    balance = getattr(window, "rgb_balance_dialog", None)
+    if balance is not None:
+        balance.dispose()
+        balance.close()
     window.pool.waitForDone()
     window.idle_pool.waitForDone()
     window.light_table.close()

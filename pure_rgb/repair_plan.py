@@ -47,6 +47,42 @@ def _raw_identity(manifest):
     return {key: receipt[key] for key in ("source_pixels_sha256", "geometry_token") if receipt.get(key)}
 
 
+def same_optics_baseline_recipe(original, recipe):
+    identities = [source_recipe_identity(value) for value in (original, recipe)]
+    for identity in identities:
+        identity.pop("chromatic_aberration", None)
+        identity.pop("lens_profile", None)
+    return identities[0] == identities[1]
+
+
+def _same_chromatic_source(parent, recipe, manifest):
+    """Allow CA-only R/B resampling when its unchanged baseline is evidenced.
+
+    Green is the coordinate reference for dust coverage. The full pre-CA RGB
+    hash must also match, so this cannot authorize new RAWs, flat fields,
+    registration, distortion, or merely equal-sized unrelated pictures.
+    """
+    if not same_optics_baseline_recipe(parent["recipe"], recipe):
+        return False
+    baselines, references = [], 0
+    for document in (parent, manifest):
+        reference = (document.get("raw_import_receipt") or {}).get("chromatic_reference")
+        if reference is not None:
+            if (reference.get("green_unchanged") is not True
+                    or reference.get("canvas_unchanged") is not True):
+                return False
+            _sha(reference.get("green_pixels_sha256"))
+            baselines.append({key: _sha(reference.get(key))
+                              for key in ("source_pixels_sha256", "geometry_token")})
+            references += 1
+        else:
+            baseline = _raw_identity(document)
+            if set(baseline) != {"source_pixels_sha256", "geometry_token"}:
+                return False
+            baselines.append(baseline)
+    return bool(references and baselines[0] == baselines[1])
+
+
 def geometry_key(recipe, manifest, mode):
     """Identity of source-to-output coordinates, independent of colour values."""
     shape = list(manifest["source_shape"])
@@ -125,6 +161,11 @@ def validate_frame(plan, recipe, manifest, mode):
     binding = plan["binding"]
     try:
         parent = _document(plan["parent_manifest"])
+        matching_source = (
+            source_recipe_identity(recipe) == source_recipe_identity(parent["recipe"])
+            and all(_raw_identity(manifest).get(key) == value
+                    for key, value in binding.get("raw_import_identity", {}).items())
+        ) or _same_chromatic_source(parent, recipe, manifest)
         if mode == binding["mode"]:
             matching_coordinates = geometry_key(recipe, manifest, mode) == binding["geometry_key"]
         else:
@@ -136,9 +177,7 @@ def validate_frame(plan, recipe, manifest, mode):
                 or [_path(p) for p in recipe["raw"]] != [r["path"] for r in _inputs(binding["inputs"])]
                 or manifest["source_shape"] != binding["source_shape"]
                 or _calibration(manifest.get("calibration")) != _calibration(binding.get("calibration"))
-                or any(_raw_identity(manifest).get(key) != value
-                       for key, value in binding.get("raw_import_identity", {}).items())
-                or source_recipe_identity(recipe) != source_recipe_identity(parent["recipe"])):
+                or not matching_source):
             raise ValueError("来源配置已改变，原除尘数据已保留；请重新进行除尘审核")
         if matching_coordinates:
             return None
@@ -148,6 +187,8 @@ def validate_frame(plan, recipe, manifest, mode):
         target = frame_descriptor(recipe, manifest, mode)
         if source["output_size"] != [plan["shape"][1], plan["shape"][0]]:
             raise ValueError("原除尘审核画幅与已保存坐标不一致")
+        if source == target:
+            return None
         return dict(version=1, source=source, target=target)
     except (KeyError, TypeError, IndexError) as error:
         raise ValueError("当前画面缺少除尘来源证据，请重新审核") from error

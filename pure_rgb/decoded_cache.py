@@ -78,9 +78,14 @@ def cache_key(manifest, recipe, config_document, reference_shape):
         "calibration": (manifest.get("calibration") or {}).get("sha256")
         if recipe["flatfield"]
         else None,
-        "config": config_document,
+        # Private SDK state and export destinations have no effect on RAW
+        # decoding. Workers can use different directories for the same source.
+        "config": {key: value for key, value in config_document.items()
+                   if key not in ("userDir", "export_path")},
         "raw_import": recipe.get("raw_import", LEGACY_IMPORT),
         **({"lens_correction": True} if recipe.get("lens_correction") else {}),
+        **({"chromatic_aberration": True} if recipe.get("chromatic_aberration") else {}),
+        **({"lens_profile": recipe["lens_profile"]} if recipe.get("lens_profile") else {}),
         "registration_check": recipe.get("registration_check"),
         "flatfield_strength": (
             float(recipe.get("flatfield_strength", 1.0)) if recipe["flatfield"] else 1.0
@@ -157,13 +162,30 @@ def _rebind(processor, meta, source, file_path, params):
         or type(key[1]) is not float
     ):
         raise ValueError("decoded cache decoder key differs")
+    # The SDK includes a newly generated flat-field profile ID alongside the
+    # gain digest, including in the embedded-lens token. Keep all decode
+    # settings and the digest strict, and replace only the local handle.
+    fields = list(key)
+    # The pinned SDK load key puts embedded lens settings at 2 and gain at 10.
+    if len(key) == 16 and isinstance(key[10], str) and key[10].startswith("|ff:"):
+        from negpy.features.flatfield.logic import flatfield_token
+
+        old = key[10]
+        flatfield = getattr(params, "flatfield", None)
+        token = flatfield_token(flatfield) if flatfield is not None else ""
+        if not token or old.split(":", 2)[-1] != token.split(":", 2)[-1]:
+            raise ValueError("decoded cache flat-field gain differs")
+        fields[10] = token
+        if isinstance(key[2], str) and key[2].endswith(old):
+            fields[2] = key[2][:-len(old)] + token
     try:
         mtime = os.path.getmtime(file_path)
     except OSError:
         mtime = 0.0
     # The key's mtime is a freshness heuristic; content is already proven by
     # the manifest hashes, so the current mtime rebinds without a re-decode.
-    processor._source_cache_key = (file_path, mtime, *key[2:])
+    fields[1] = mtime
+    processor._source_cache_key = tuple(fields)
     processor._source_cache_value = (source, None, meta["color_space"])
     processor._cam_xyz_by_path[file_path] = tuple(meta["camera_metadata"])
     if hasattr(processor, "pure_raw_import_token"):
@@ -173,10 +195,11 @@ def _rebind(processor, meta, source, file_path, params):
             "flatfield_sampled_change"
         ]
         paths = processor._paths(file_path, params)
-        processor._pure_source_identity = (
+        processor._pure_source_identity = (processor.source_identity_for_paths(paths)
+            if hasattr(processor, "source_identity_for_paths") else (
             tuple((path, file_identity(path)) for path in paths),
             tuple(processor.pure_flatfield_reference_shape or ()),
-        )
+        ))
 
 
 def restore_source(

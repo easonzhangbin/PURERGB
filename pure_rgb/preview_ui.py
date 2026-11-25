@@ -40,7 +40,6 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
-    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -60,10 +59,10 @@ from PyQt6.QtWidgets import (
 
 from .branding import (
     application_icon,
-    lockup_pixmap,
     splash_pixmap,
     wordmark_label,
 )
+from .workflow_about import show_about
 from .workflow_glass import (
     GlassMessageBox, NATIVE_SLIDER_QSS, _set_native_material, attach_glass, detach_glass,
     install_glass_surfaces, prepare_glass,
@@ -153,32 +152,6 @@ def panel(name="panel"):
     layout.setContentsMargins(15, 14, 15, 14)
     layout.setSpacing(12)
     return frame, layout
-
-
-def about_dialog(parent=None):
-    """关于页：品牌组合标 + 工作流说明。"""
-    from .release import APP_VERSION
-    from .workflow_support import DONORS
-
-    dialog = QDialog(parent)
-    dialog.setWindowTitle("关于 PURE RGB")
-    dialog.setFixedWidth(440)
-    layout = QVBoxLayout(dialog)
-    layout.setContentsMargins(28, 26, 28, 18)
-    layout.setSpacing(12)
-    art = QLabel(dialog)
-    art.setPixmap(lockup_pixmap())
-    art.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-    layout.addWidget(art)
-    layout.addWidget(label(f"PURE RGB {APP_VERSION} · 三色负片与黑白影像工作流", "muted", True))
-    layout.addWidget(label(f"感谢以下捐助者\n{DONORS}", "muted", True))
-    close = button("关闭", dialog.accept, True)
-    from .workflow_attention import attach_attention
-
-    attach_attention(close)
-    close.setDefault(True)
-    layout.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
-    return dialog
 
 
 def startup_splash():
@@ -687,7 +660,7 @@ class PreviewWindow(QMainWindow):
         QTimer.singleShot(0, self.configure_display)
 
     def show_about(self):
-        about_dialog(self).exec()
+        show_about(self)
 
     def showEvent(self, event):
         super().showEvent(event)

@@ -29,6 +29,8 @@ def source_recipe_identity(recipe):
     return {
         **{key: recipe.get(key) for key in fields},
         "flatfield_strength": float(recipe.get("flatfield_strength", 1.0)) if recipe.get("flatfield") else 1.0,
+        **({"chromatic_aberration": True} if recipe.get("chromatic_aberration") else {}),
+        **({"lens_profile": recipe["lens_profile"]} if recipe.get("lens_profile") else {}),
     }
 
 
@@ -135,6 +137,8 @@ def checked_recipe(recipe, *, verify_resources=True):
         "experimental_film_controls",
         "raw_import",
         "lens_correction",
+        "chromatic_aberration",
+        "lens_profile",
         "registration_check",
     }:
         raise ValueError("配方包含未支持字段")
@@ -183,6 +187,25 @@ def checked_recipe(recipe, *, verify_resources=True):
         raise ValueError("单色 RGB 暂不支持 RAW 内嵌镜头矫正")
     if not lens:
         result.pop("lens_correction", None)
+    chromatic = result.get("chromatic_aberration", False)
+    if (type(chromatic) is not bool or
+            (chromatic and policy not in ("standard-crop-v1", STANDARD_DNG_IMPORT))):
+        raise ValueError("自动镜头色差矫正需要拜耳三色 RAW 配方")
+    if not chromatic:
+        result.pop("chromatic_aberration", None)
+    profile = result.get("lens_profile")
+    if profile is not None:
+        if (not isinstance(profile, dict) or set(profile) != {"path", "sha256"}
+                or not isinstance(profile["path"], str) or not profile["path"]
+                or not isinstance(profile["sha256"], str) or len(profile["sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in profile["sha256"])
+                or policy not in ("standard-crop-v1", STANDARD_DNG_IMPORT)):
+            raise ValueError("镜头配置需要有效的本机 LCP 文件及校验记录")
+        result["lens_profile"] = {**profile, "path": str(Path(profile["path"]).expanduser().resolve())}
+        if verify_resources and (chromatic or lens):
+            from .adobe_lens_profiles import read_lcp
+
+            read_lcp(result["lens_profile"])
     registration_check = checked_registration_check(
         policy, result.get("registration_check")
     )

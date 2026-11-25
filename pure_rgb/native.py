@@ -38,7 +38,8 @@ def check_baseline():
 
 def open_triplet(
     paths, *, raw_import="legacy-v1", registration_check=None, configure_source=None,
-    decode_cache=None, lens_correction=False,
+    decode_cache=None, lens_correction=False, chromatic_aberration=False, lens_profile=None,
+    frozen_roles=None,
 ):
     from negpy.features.rgbscan.logic import place_triplet
     from negpy.features.rgbscan.models import RgbScanConfig
@@ -72,7 +73,7 @@ def open_triplet(
         raise ValueError(
             "Select three distinct files with the explicit import policy's RAW suffix"
         )
-    if raw_import == STANDARD_MONO_IMPORT:
+    if frozen_roles is not None or raw_import == STANDARD_MONO_IMPORT:
         red, green, blue = map(str, paths)
     else:
         probe = probe_for_policy(raw_import)
@@ -84,6 +85,8 @@ def open_triplet(
         {"role": role, "path": p, "sha256": sha256(p)}
         for role, p in zip("RGB", (red, green, blue))
     ]
+    if frozen_roles is not None and records != frozen_roles:
+        raise ValueError("已导入的通道记录与当前 RAW 不一致，请重新导入")
     config = replace(
         DEFAULT_WORKSPACE_CONFIG,
         process=replace(
@@ -99,6 +102,8 @@ def open_triplet(
     processor = create_processor(
         raw_import,
         **({"lens_correction": True} if lens_correction else {}),
+        **({"chromatic_aberration": True} if chromatic_aberration else {}),
+        **({"lens_profile": lens_profile} if lens_profile else {}),
         **({"registration_check": registration_check} if registration_check else {}),
     )
     try:
@@ -123,16 +128,20 @@ def open_triplet(
     return processor, config, image, records
 
 
-def native_export(processor, config, records, *, prefer_gpu=False):
+def native_export_settings(config):
     from negpy.domain.models import ColorSpace, ExportFormat, TiffCompression
 
-    export = replace(
+    return replace(
         config.export,
         export_fmt=ExportFormat.TIFF,
         export_bit_depth=16,
         export_color_space=ColorSpace.ADOBE_RGB.value,
         tiff_compression=TiffCompression.ZIP,
     )
+
+
+def native_export(processor, config, records, *, prefer_gpu=False):
+    export = native_export_settings(config)
     if hasattr(processor, "pure_raw_import_token"):
         # Validate/replay source identity before binding the export cache token.
         processor._load_source_f32(records[0]["path"], config)

@@ -266,6 +266,7 @@ class DraftPreview:
 
         recipe, mode, _ = self._validate(request)
         self.preview_quality = None
+        self.native_print = None
         if self.density_preview is not None:
             self.density_preview.last_receipt = None
         self.viewport_result = None
@@ -295,6 +296,14 @@ class DraftPreview:
         interactive = render_interactive_post(self, request, recipe, mode)
         if interactive is not None:
             return interactive
+        if recipe.get("measurement_method") == "negpy":
+            from .native_original_preview import try_original_density_screen
+
+            native_sample = try_original_density_screen(self, request, recipe, mode)
+            if native_sample is not None:
+                if self.anchor is not None:
+                    self.anchor.pop("pixels", None)
+                return native_sample
         with span("preview_sampled_density", mode=mode):
             sampled = self.density_preview.try_render(request, recipe, mode)
         if sampled is not None:
@@ -603,15 +612,29 @@ class DraftPreview:
                 density.certificate.validate()
                 prepared = (density.session.processor, density.pristine_config,
                             density.session.source, deepcopy(self.records))
+            request = {
+                "recipe": recipe,
+                "inputs": deepcopy(self.records),
+                "calibration": deepcopy(self.manifest.get("calibration")),
+                "directory": str(path),
+                "only_mode": mode,
+                "transient_preview": True,
+            }
+            if prepared is None:
+                # _validate already bound the draft's decode identity and RAW
+                # records to this completed manifest. The render cache also
+                # checks the frozen import receipt before restoring pixels.
+                anchor = {
+                    "source_shape": self.manifest.get("source_shape"),
+                    "raw_import_receipt": self.manifest.get("raw_import_receipt"),
+                }
+                if recipe.get("flatfield"):
+                    provenance = (request["calibration"] or {}).get("provenance") or {}
+                    capture = provenance.get("capture") or {}
+                    anchor["flatfield_reference_shape"] = capture.get("sensor_shape")
+                request["decode_anchor"] = deepcopy(anchor)
             report = render(
-                {
-                    "recipe": recipe,
-                    "inputs": deepcopy(self.records),
-                    "calibration": deepcopy(self.manifest.get("calibration")),
-                    "directory": str(path),
-                    "only_mode": mode,
-                    "transient_preview": True,
-                },
+                request,
                 emit_callback=progress,
                 **({"prepared_source": prepared} if prepared is not None else {}),
             )

@@ -23,6 +23,8 @@ from .tone_study import (
     brightness_statistics,
 )
 
+FIT_REFERENCE_STRIDE = 8
+
 
 @dataclass(frozen=True)
 class EndpointFit:

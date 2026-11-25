@@ -1,13 +1,13 @@
 """Antialiased check indicators that retain Qt's layout and hit targets."""
 
-from PyQt6.QtCore import QRectF, Qt
-from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtCore import QPointF, QRectF, Qt
+from PyQt6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QCheckBox, QStyle, QStyledItemDelegate, QStyleOptionButton, QStyleOptionViewItem,
 )
 
 
-def _paint_indicator(painter, rect, state, checked, accent, round_shape):
+def _paint_indicator(painter, rect, state, checked, accent, round_shape, *, checkmark=False):
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     enabled = bool(state & QStyle.StateFlag.State_Enabled)
@@ -21,6 +21,16 @@ def _paint_indicator(painter, rect, state, checked, accent, round_shape):
         painter.drawEllipse(bounds)
     else:
         painter.drawRoundedRect(bounds, 4, 4)
+    if checked and checkmark:
+        center = bounds.center()
+        mark = QColor("#23170f") if enabled else QColor(255, 255, 255, 155)
+        painter.setPen(QPen(mark, 1.8, Qt.PenStyle.SolidLine,
+                            Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.drawPolyline(QPolygonF([
+            center + QPointF(-4.0, 0.0),
+            center + QPointF(-1.4, 2.8),
+            center + QPointF(4.2, -3.3),
+        ]))
     painter.restore()
 
 
@@ -45,8 +55,9 @@ class CheckIndicatorDelegate(QStyledItemDelegate):
 
 
 class ReviewCheckBox(QCheckBox):
-    def __init__(self, text, parent=None):
+    def __init__(self, text, parent=None, *, checkmark=False):
         super().__init__(text, parent)
+        self.checkmark = checkmark
         self.setMinimumHeight(24)
 
     def paintEvent(self, event):
@@ -57,5 +68,5 @@ class ReviewCheckBox(QCheckBox):
         painter = QPainter(self)
         _paint_indicator(
             painter, rect, option.state, self.checkState() != Qt.CheckState.Unchecked,
-            "#f0a055", False,
+            "#f0a055", False, checkmark=self.checkmark,
         )

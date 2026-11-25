@@ -36,7 +36,7 @@ def matching_lens(profiles):
     return first
 
 
-def correct_registered_lens(source, profiles, plan, effective, orientation):
+def correct_registered_lens(source, profiles, plan, effective, orientation, *, corrections=None):
     from negpy.features.lens.logic import apply_lens, fill_scale
 
     lens = matching_lens(profiles)
@@ -44,14 +44,65 @@ def correct_registered_lens(source, profiles, plan, effective, orientation):
         RegisteredLensWarp(warp, plan.source_shape, effective.visible_roi)
         for warp in lens.warps
     ))
-    options = LensCorrections(lens.distortion, lens.ca)
+    options = corrections if corrections is not None else LensCorrections(lens.distortion, lens.ca)
     x0, y0, x1, y1 = effective.visible_roi
     scale = fill_scale(mapped, (y1 - y0, x1 - x0), options)
     pixels = apply_lens(source, mapped, orientation, options)
-    return pixels, dict(version=1, profile=lens.source, distortion=lens.distortion,
-                        lateral_ca=lens.ca, fill_scale=scale,
+    return pixels, dict(version=1, profile=lens.source, distortion=bool(options.distortion and lens.distortion),
+                        lateral_ca=bool(options.ca and lens.ca), fill_scale=scale,
                         sensor_xyxy=list(effective.visible_roi),
                         policy="registered-linear-after-flatfield")
+
+
+def correct_additional_optics(source, profiles, paths, plan, effective, orientation, *,
+                              chromatic_aberration=False, lens_profile=None,
+                              distortion=False, embedded_receipt=None, registration=None,
+                              baseline_context=None):
+    """Resolve explicit local LCP, embedded CA, then cautious image estimation."""
+    from .adobe_lens_profiles import apply_lcp, capture_lens
+
+    if lens_profile:
+        capture = capture_lens(paths)
+        if distortion and chromatic_aberration and baseline_context is not None:
+            # Authenticate the same common distortion-only image as a recipe
+            # with CA bypassed. Its green pixels are the dust coordinate frame.
+            base, base_receipt = apply_lcp(source, lens_profile, capture, plan, effective, orientation,
+                                           ca=False, distortion=True, registration=registration)
+            baseline_context.update(pixels=base, lens_receipt=base_receipt)
+        pixels, receipt = apply_lcp(source, lens_profile, capture, plan, effective,
+                                    orientation, ca=chromatic_aberration, distortion=distortion,
+                                    registration=registration)
+        if not chromatic_aberration or receipt.get("lateral_ca"):
+            return pixels, receipt if distortion else None, receipt
+        # An explicitly selected distortion-only LCP can still be followed by
+        # conservative CA estimation; record both parts of the optical chain.
+        source = pixels
+        optical_receipt = receipt if distortion else None
+    else:
+        optical_receipt = None
+    if not chromatic_aberration:
+        return source, optical_receipt, dict(status="disabled", green_unchanged=True)
+    if embedded_receipt and embedded_receipt.get("lateral_ca"):
+        return source, None, dict(version=1, status="applied", method="embedded-raw",
+                                 green_unchanged=True, canvas_unchanged=True,
+                                 reason="内嵌镜头参数已包含横向色差，未重复应用")
+    if not lens_profile:
+        try:
+            lens = matching_lens(profiles)
+        except ValueError:
+            lens = None
+        if lens is not None and lens.ca:
+            pixels, receipt = correct_registered_lens(source, profiles, plan, effective, orientation,
+                                                       corrections=LensCorrections(False, True))
+            return pixels, None, dict(version=1, status="applied", method="embedded-raw",
+                                      green_unchanged=True, canvas_unchanged=True, optical_model=receipt)
+    from .chromatic_aberration import correct_chromatic_aberration
+
+    pixels, receipt = correct_chromatic_aberration(source)
+    if optical_receipt:
+        receipt["preceding_lcp"] = optical_receipt
+        receipt["green_unchanged"] = False
+    return pixels, optical_receipt, receipt
 
 
 def camera_lens_info(paths, correctable):

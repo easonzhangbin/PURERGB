@@ -1,7 +1,9 @@
 """Single linear RAW → native sensor-layout gain, shared by import/render/preview."""
 
 from dataclasses import replace
+from copy import deepcopy
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -58,42 +60,152 @@ def capture_info(path):
             return None
 
     with rawpy.imread(str(path)) as raw:
-        shape = [int(raw.sizes.height), int(raw.sizes.width), 3]
+        sizes = raw.sizes
+        shape = [int(sizes.height), int(sizes.width), 3]
+        geometry = {
+            "raw_shape": [int(sizes.raw_height), int(sizes.raw_width)],
+            "visible_origin_raw": [int(sizes.left_margin), int(sizes.top_margin)],
+        }
     return {
         "sensor_shape": shape,
+        "raw_geometry": geometry,
         "make": text(exif.get("0th", {}).get(271)),
         "model": text(exif.get("0th", {}).get(272)),
         "aperture": ratio(exif.get("Exif", {}).get(33437)),
         "focal_length": ratio(exif.get("Exif", {}).get(37386)),
+        "focal_length_35mm": ratio(exif.get("Exif", {}).get(41989)),
+        "digital_zoom": ratio(exif.get("Exif", {}).get(41988)),
+    }
+
+
+def _sensor_shape(capture):
+    value = capture.get("sensor_shape")
+    if (not isinstance(value, (list, tuple)) or len(value) != 3
+            or any(type(v) is not int or v < 1 for v in value) or value[2] != 3):
+        raise ValueError("平场传感器画幅信息无效")
+    return tuple(value)
+
+
+def _visible_sensor_rectangle(capture):
+    """A LibRaw visible rectangle in its *declared* RAW pixel canvas.
+
+    Those coordinates may only be compared when both RAW canvases match. A
+    smaller RAW canvas is not evidence that an APS-C frame covers a full sensor.
+    """
+    geometry = capture.get("raw_geometry")
+    if geometry is None:
+        return None
+    if not isinstance(geometry, dict):
+        raise ValueError("平场 RAW 画布元数据无效")
+    raw_shape = geometry.get("raw_shape")
+    origin = geometry.get("visible_origin_raw")
+    if (not isinstance(raw_shape, (tuple, list)) or len(raw_shape) != 2
+            or not isinstance(origin, (tuple, list)) or len(origin) != 2
+            or any(type(v) is not int or v < 1 for v in raw_shape)
+            or any(type(v) is not int or v < 0 for v in origin)):
+        raise ValueError("平场 RAW 画布元数据不完整")
+    height, width, _ = _sensor_shape(capture)
+    left, top = origin
+    if left + width > raw_shape[1] or top + height > raw_shape[0]:
+        raise ValueError("平场传感器可见区域超出 RAW 画布")
+    return tuple(raw_shape), (left, top, left + width, top + height)
+
+
+def _crop_hint(capture):
+    # EXIF's equivalent focal length is rounded; it can disprove equal coverage
+    # but cannot establish a precise crop origin. Never infer a centered crop
+    # from this ratio or from a smaller image alone.
+    focal, equivalent = capture.get("focal_length"), capture.get("focal_length_35mm")
+    values = []
+    for value in (focal, equivalent):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            break
+        values.append(value)
+    factor = values[1] / values[0] if len(values) == 2 else None
+    zoom = capture.get("digital_zoom")
+    zoom = (max(1., float(zoom)) if isinstance(zoom, (int, float))
+            and not isinstance(zoom, bool) and math.isfinite(zoom) and zoom >= 0 else None)
+    return factor, zoom
+
+
+def sensor_mapping(reference, target):
+    """Bind a gain to target sensor coordinates without guessing crop positions.
+
+    Same-field resolutions use normalized full-frame coordinates. Explicit
+    LibRaw rectangles in an identical RAW canvas also support off-center crops.
+    Aspect changes and conflicting EXIF crop hints require explicit geometry.
+    """
+    source_shape, target_shape = _sensor_shape(reference), _sensor_shape(target)
+    source_geometry = _visible_sensor_rectangle(reference)
+    target_geometry = _visible_sensor_rectangle(target)
+    full = [0., 0., 1., 1.]
+    region, method = full, "same-sensor-geometry"
+    if source_geometry and target_geometry and source_geometry[0] == target_geometry[0]:
+        sx0, sy0, sx1, sy1 = source_geometry[1]
+        tx0, ty0, tx1, ty1 = target_geometry[1]
+        if not sx0 <= tx0 < tx1 <= sx1 or not sy0 <= ty0 < ty1 <= sy1:
+            raise ValueError("平场参考未覆盖照片的完整传感器区域，不能外推平场")
+        region = [(tx0 - sx0) / (sx1 - sx0), (ty0 - sy0) / (sy1 - sy0),
+                  (tx1 - sx0) / (sx1 - sx0), (ty1 - sy0) / (sy1 - sy0)]
+        if region != full:
+            method = "explicit-raw-canvas-crop"
+    elif source_shape != target_shape:
+        for a, b in zip(_crop_hint(reference), _crop_hint(target)):
+            if ((a is not None and b is not None and abs(a / b - 1.) > .05)
+                    or (a is None and b is not None and b > 1.1)
+                    or (b is None and a is not None and a > 1.1)):
+                raise ValueError("平场传感器画幅的 EXIF 裁切模式不同，缺少准确区域坐标，不能直接拉伸")
+        source_aspect = source_shape[1] / source_shape[0]
+        target_aspect = target_shape[1] / target_shape[0]
+        # Permit decoder-border rounding (a few pixels), not a different aspect
+        # crop. EXIF orientation is applied later and must not swap this canvas.
+        if abs(target_aspect / source_aspect - 1.) > .005:
+            raise ValueError("平场传感器画幅比例不同且缺少准确裁切坐标，不能直接拉伸")
+        method = "normalized-full-sensor-resize"
+    return {
+        "version": 1,
+        "method": method,
+        "reference_sensor_shape": list(source_shape),
+        "target_sensor_shape": list(target_shape),
+        "reference_roi_normalized_xyxy": region,
     }
 
 
 def compatibility(provenance, targets):
     reference = provenance.get("capture", {}) if provenance else {}
+    targets = list(dict.fromkeys(targets))
     warnings = []
     if not reference:
         return {
             "checked": False,
             "warnings": ["旧增益配置没有相机/画幅信息，需自行核对拍摄条件。"],
         }
-    for path in dict.fromkeys(targets):
+    mappings = []
+    for path in targets:
         target = capture_info(path)
-        if target["sensor_shape"] != reference["sensor_shape"]:
-            raise ValueError("平场 RAW 与照片的传感器画幅不一致")
+        def identifier(value):
+            return " ".join(str(value or "").strip("\x00 ").casefold().split())
+
+        camera_verified = all(identifier(capture.get(field))
+                              for capture in (reference, target) for field in ("make", "model"))
         for field in ("make", "model"):
             if (
-                reference.get(field)
-                and target.get(field)
-                and reference[field].casefold() != target[field].casefold()
+                identifier(reference.get(field))
+                and identifier(target.get(field))
+                and identifier(reference[field]) != identifier(target[field])
             ):
                 raise ValueError("平场 RAW 与照片的相机型号不一致")
+        mapping = sensor_mapping(reference, target)
+        if mapping["reference_sensor_shape"] != mapping["target_sensor_shape"] and not camera_verified:
+            raise ValueError("跨分辨率平场需确认相同相机型号；当前相机或传感器画幅元数据不完整")
+        mappings.append({"path": str(path), **mapping, "camera_verified": camera_verified})
         for field, title in (("aperture", "光圈"), ("focal_length", "焦距")):
             a, b = reference.get(field), target.get(field)
             if a is not None and b is not None and abs(a - b) > 0.01:
                 warning = f"{title}不同：平场 {a:g}，照片 {b:g}；适合对照，不能视为完全匹配的校正。"
                 if warning not in warnings:
                     warnings.append(warning)
-    return {"checked": bool(targets), "warnings": warnings}
+    return {"checked": bool(targets), "warnings": warnings, "sensor_mappings": mappings}
 
 
 def gain_from_linear(reference):
@@ -244,6 +356,27 @@ def attach_calibration(config, calibration, directory, targets=(), strength=1.0)
                 else np.power(gain, strength))
         if not np.isfinite(gain).all() or np.any(gain <= 0):
             raise ValueError("此参考在指定强度下无法生成有限的正增益")
+    mappings = report.get("compatibility", {}).get("sensor_mappings", [])
+    if mappings:
+        from .raw_flatfield import map_gain_to_sensor
+
+        mapping = {k: v for k, v in mappings[0].items() if k not in ("path", "camera_verified")}
+        if any({k: v for k, v in item.items() if k not in ("path", "camera_verified")} != mapping
+               for item in mappings[1:]):
+            raise ValueError("同一 RGB 组的传感器区域不同，无法共用平场")
+        gain = map_gain_to_sensor(gain, mapping)
+        original = report.get("provenance")
+        if original and (mapping["reference_sensor_shape"] != mapping["target_sensor_shape"]
+                         or mapping["reference_roi_normalized_xyxy"] != [0., 0., 1., 1.]):
+            applied = deepcopy(original)
+            applied["capture"]["sensor_shape"] = mapping["target_sensor_shape"]
+            # The original frozen reference remains authoritative. This copy
+            # binds the in-process gain to its target for existing render/cache
+            # consumers; it must not masquerade as the original capture geometry.
+            applied["capture"].pop("raw_geometry", None)
+            applied["application_mapping"] = mapping
+            report = {**report, "reference_provenance": original, "provenance": applied}
+        report = {**report, "sensor_mapping": mapping}
     report = {**report, "strength": float(strength),
               "strength_curve": "linear-blend" if strength <= 1.0 else "exposure-stops-v1"}
     set_gain_provider(FlatFieldProfiles.load_gain)

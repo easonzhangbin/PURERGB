@@ -353,6 +353,25 @@ def _bounded_render_buffer(buffer, source_shape, block_rows):
         )
 
 
+def highlight_reference_config(source, config, region):
+    """Measure the exact reference ROI and bind its window to the full source."""
+    region = _roi(region, source.shape)
+    x0, y0, x1, y1 = region
+    # Crop by integer edges before metering to avoid normalized-edge round trips.
+    # metering_process fixes the normalized auxiliary-meter pixel edges.
+    selected = np.ascontiguousarray(source[y0:y1, x0:x1])
+    meter_config = replace(config, process=replace(config.process, meter_rect=None))
+    window = negpy_window(selected, meter_config, (0, 0, x1 - x0, y1 - y0))
+    window = replace(window, analysis=replace(window.analysis, roi=tuple(region)))
+    selection = select_metering_roi(
+        source.shape, region, min_side=2, min_area_fraction=1.0
+    )
+    process = replace(
+        metering_process(config.process, window, selection), meter_rect=None
+    )
+    return replace(config, process=process), window
+
+
 def _merge_highlight(current, incoming):
     if current is None:
         return deepcopy(incoming)
@@ -423,6 +442,8 @@ def render_highlight_workflow(
     from negpy.infrastructure.display.color_spaces import WORKING_COLOR_SPACE
     from negpy.kernel.image.logic import working_oetf_encode
 
+    from .diagnostics import span
+
     _configuration(config, export, bounds_override)
     point = checked_native_float(native_float_controls)
     _header(source, block_rows)
@@ -469,22 +490,8 @@ def render_highlight_workflow(
         else None
     )
     effect_layout = _layout(effect_area.mask) if effect_area else None
-    x0, y0, x1, y1 = region
-    # Exact ROI crop avoids float normalized-edge round-trip changes in the
-    # density calculation. The returned window is restored to source coords;
-    # metering_process calls fixed_process and fixes the auxiliary-meter edges.
-    selected = np.ascontiguousarray(source[y0:y1, x0:x1])
-    meter_config = replace(config, process=replace(config.process, meter_rect=None))
-    window = negpy_window(selected, meter_config, (0, 0, x1 - x0, y1 - y0))
-    window = replace(window, analysis=replace(window.analysis, roi=tuple(region)))
-    selection = select_metering_roi(
-        source.shape, region, min_side=2, min_area_fraction=1.0
-    )
-    ref_process = replace(
-        metering_process(config.process, window, selection), meter_rect=None
-    )
-    reference_config = replace(config, process=ref_process)
-    del selected
+    with span("highlight_reference_meter", roi=region):
+        reference_config, window = highlight_reference_config(source, config, region)
     reference_config_sha = _digest(reference_config.to_dict())
     _require(
         asdict(config.exposure) == asdict(reference_config.exposure)
@@ -497,15 +504,16 @@ def render_highlight_workflow(
             processor, file_path, config, source, source_layout, source_sha
         )
     )
-    base_buffer, base_label = processor.render_export(
-        file_path,
-        config,
-        export,
-        source_key,
-        metrics=metrics,
-        prefer_gpu=False,
-        bounds_override=None,
-    )
+    with span("highlight_native_base", backend="cpu"):
+        base_buffer, base_label = processor.render_export(
+            file_path,
+            config,
+            export,
+            source_key,
+            metrics=metrics,
+            prefer_gpu=False,
+            bounds_override=None,
+        )
     if base_buffer is None:
         raise RuntimeError(base_label)
     _bounded_render_buffer(base_buffer, source.shape, block_rows)
@@ -519,15 +527,16 @@ def render_highlight_workflow(
             processor, file_path, reference_config, source, source_layout, source_sha
         )
     )
-    reference, reference_label = processor.render_export(
-        file_path,
-        reference_config,
-        export,
-        source_key,
-        metrics=metrics,
-        prefer_gpu=False,
-        bounds_override=None,
-    )
+    with span("highlight_native_reference", backend="cpu"):
+        reference, reference_label = processor.render_export(
+            file_path,
+            reference_config,
+            export,
+            source_key,
+            metrics=metrics,
+            prefer_gpu=False,
+            bounds_override=None,
+        )
     if reference is None:
         raise RuntimeError(reference_label)
     _bounded_render_buffer(reference, source.shape, block_rows)
@@ -555,48 +564,49 @@ def render_highlight_workflow(
     below = np.full(3, np.inf)
     above = np.full(3, -np.inf)
     preserved = 0
-    for start in range(0, len(source), block_rows):
-        base_part = base[start : start + block_rows]
-        ref_part = reference[start : start + block_rows]
-        base_linear = decode_working_oetf_pixels(base_part, icc_bytes=icc)
-        ref_linear = decode_working_oetf_pixels(ref_part, icc_bytes=icc)
-        mask = protection.mask[start : start + len(base_part)] if protection else None
-        high, observation = apply_highlight_reference_guarded(
-            base_linear,
-            ref_linear,
-            recipe["controls"],
-            domain=linear_domain,
-            protection_mask=mask,
-            effect_mask=effect_area.mask[start : start + len(base_part)] if effect_area else None,
-        )
-        high_receipt = _merge_highlight(high_receipt, observation)
-        base_linear_sha.update(memoryview(base_linear).cast("B"))
-        ref_linear_sha.update(memoryview(ref_linear).cast("B"))
-        high_linear_sha.update(memoryview(high).cast("B"))
-        if point["values"]:
-            post = apply_positive_float(
-                high, point, domain=linear_domain, icc_bytes=icc
+    with span("highlight_join", source_shape=list(source.shape), backend="cpu"):
+        for start in range(0, len(source), block_rows):
+            base_part = base[start : start + block_rows]
+            ref_part = reference[start : start + block_rows]
+            base_linear = decode_working_oetf_pixels(base_part, icc_bytes=icc)
+            ref_linear = decode_working_oetf_pixels(ref_part, icc_bytes=icc)
+            mask = protection.mask[start : start + len(base_part)] if protection else None
+            high, observation = apply_highlight_reference_guarded(
+                base_linear,
+                ref_linear,
+                recipe["controls"],
+                domain=linear_domain,
+                protection_mask=mask,
+                effect_mask=effect_area.mask[start : start + len(base_part)] if effect_area else None,
             )
-            final = post.image
-            point_receipt = _merge_point(point_receipt, post.receipt)
-        else:
-            final = high
-        final_linear_sha.update(memoryview(final).cast("B"))
-        lower += (final < 0).sum((0, 1))
-        upper += (final > 1).sum((0, 1))
-        below, above = (
-            np.minimum(below, final.min((0, 1))),
-            np.maximum(above, final.max((0, 1))),
-        )
-        final_encoded = working_oetf_encode(np.clip(final, 0, 1))
-        if not point["values"]:
-            identical = np.all(final == base_linear, axis=2)
-            final_encoded[identical] = base_part[identical]
-            preserved += int(identical.sum())
-        encoded[start : start + len(base_part)] = final_encoded
-        del base_linear, ref_linear, high, final, final_encoded
-        if point["values"]:
-            del post
+            high_receipt = _merge_highlight(high_receipt, observation)
+            base_linear_sha.update(memoryview(base_linear).cast("B"))
+            ref_linear_sha.update(memoryview(ref_linear).cast("B"))
+            high_linear_sha.update(memoryview(high).cast("B"))
+            if point["values"]:
+                post = apply_positive_float(
+                    high, point, domain=linear_domain, icc_bytes=icc
+                )
+                final = post.image
+                point_receipt = _merge_point(point_receipt, post.receipt)
+            else:
+                final = high
+            final_linear_sha.update(memoryview(final).cast("B"))
+            lower += (final < 0).sum((0, 1))
+            upper += (final > 1).sum((0, 1))
+            below, above = (
+                np.minimum(below, final.min((0, 1))),
+                np.maximum(above, final.max((0, 1))),
+            )
+            final_encoded = working_oetf_encode(np.clip(final, 0, 1))
+            if not point["values"]:
+                identical = np.all(final == base_linear, axis=2)
+                final_encoded[identical] = base_part[identical]
+                preserved += int(identical.sum())
+            encoded[start : start + len(base_part)] = final_encoded
+            del base_linear, ref_linear, high, final, final_encoded
+            if point["values"]:
+                del post
     high_receipt["shape"] = list(source.shape)
     if point_receipt:
         point_receipt["input_pixels_sha256"] = high_linear_sha.hexdigest()
@@ -617,9 +627,10 @@ def render_highlight_workflow(
             "Highlight effect area",
         )
     encoded_sha = _pixels(encoded)
-    payload, status = processor.encode_export(
-        encoded, export, target, WORKING_COLOR_SPACE
-    )
+    with span("highlight_encode_export", backend="cpu"):
+        payload, status = processor.encode_export(
+            encoded, export, target, WORKING_COLOR_SPACE
+        )
     if payload is None:
         raise RuntimeError(status)
     _unchanged(source, source_layout, source_sha, "Caller full source")

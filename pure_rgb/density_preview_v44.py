@@ -234,15 +234,23 @@ class DensityPreviewCache:
                     )
                     else None
                 )
+                # The manifest authenticated by the draft already records
+                # this exact automatic classification. Re-reading all three
+                # mosaics just to classify the same hashes wastes time.
+                automatic_roles = manifest.get("automatic_roles")
+                verified_order = automatic_roles is not None and automatic_roles == self.owner.records
                 processor, config, source, automatic = workflow_render.open_triplet(
                     recipe["raw"], raw_import=recipe.get("raw_import", "legacy-v1"),
                     **({"lens_correction": True} if recipe.get("lens_correction") else {}),
+                    **({"chromatic_aberration": True} if recipe.get("chromatic_aberration") else {}),
+                    **({"lens_profile": recipe["lens_profile"]} if recipe.get("lens_profile") else {}),
                     **({"registration_check": recipe["registration_check"]}
                        if recipe.get("registration_check") else {}),
                     **({"configure_source": configure_standard_source}
                        if recipe.get("flatfield")
                        and recipe.get("raw_import") in ("standard-crop-v1", "standard-mono-v1") else {}),
                     **({"decode_cache": open_cache} if open_cache is not None else {}),
+                    **({"frozen_roles": automatic_roles} if verified_order else {}),
                 )
                 if [item["path"] for item in automatic] != recipe["raw"]:
                     config = replace(config, rgbscan=replace(config.rgbscan,
@@ -497,53 +505,48 @@ class DensityPreviewCache:
         self.float_samples.move_to_end(key)
         return found["image"], found["icc"]
 
+    def _highlight_mask(self, source_key, shape, name, document, rectangle, step):
+        if not document:
+            return None
+        from .highlight_protection import automatic_highlight_feather
+        from .highlight_sample_v46 import sample_highlight_protection
+
+        key = _key([source_key, name, document, rectangle, step])
+        item = self.protection_samples.get(key)
+        if item is None:
+            item = sample_highlight_protection(
+                list(shape), source_key, **document, rectangle=rectangle, sample_step=step, dtype="float64",
+                automatic_feather_pixels=automatic_highlight_feather(shape))
+            self.protection_samples[key] = item
+            while len(self.protection_samples) > 3:
+                self.protection_samples.popitem(last=False)
+        self.protection_samples.move_to_end(key)
+        return item
+
     def _native_join_sample(self, entry, render_config, reference, highlight, point, rectangle, step, *, exact=True):
         from negpy.kernel.image.logic import _to_uint16_jit
-        from .highlight_sample_v46 import compose_native_sample, sample_highlight_protection
+        from .highlight_sample_v46 import compose_native_sample
 
         image, icc = self._point_float(entry, entry["runner"], render_config, rectangle, step, entry["key"], exact=exact)
-        ref, protection, protection_receipt = None, None, None
-        effect, effect_receipt = None, None
+        ref = None
         if reference is not None:
             ref_config = replace(reference["runner"]._effective, exposure=render_config.exposure,
                                  lab=render_config.lab, toning=render_config.toning)
             ref, other = self._point_float(entry, reference["runner"], ref_config, rectangle, step, reference["key"], exact=exact)
             if other != icc:
                 raise ValueError("Frozen highlight reference ICC differs from the Native base")
-        from .highlight_protection import automatic_highlight_feather
-
-        automatic_feather = automatic_highlight_feather(entry["source"].shape)
-        if highlight and highlight["protection"]:
-            key = _key([entry["key"], "protection", highlight["protection"], rectangle, step])
-            item = self.protection_samples.get(key)
-            if item is None:
-                item = sample_highlight_protection(list(entry["source"].shape), entry["key"],
-                    **highlight["protection"], rectangle=rectangle, sample_step=step, dtype="float64",
-                    automatic_feather_pixels=automatic_feather)
-                self.protection_samples[key] = item
-                while len(self.protection_samples) > 3:
-                    self.protection_samples.popitem(last=False)
-            self.protection_samples.move_to_end(key)
-            protection, protection_receipt = item.mask, item.receipt
-        if highlight and highlight.get("effect_area"):
-            key = _key([entry["key"], "effect", highlight["effect_area"], rectangle, step])
-            item = self.protection_samples.get(key)
-            if item is None:
-                item = sample_highlight_protection(list(entry["source"].shape), entry["key"],
-                    **highlight["effect_area"], rectangle=rectangle, sample_step=step, dtype="float64",
-                    automatic_feather_pixels=automatic_feather)
-                self.protection_samples[key] = item
-                while len(self.protection_samples) > 3:
-                    self.protection_samples.popitem(last=False)
-            self.protection_samples.move_to_end(key)
-            effect, effect_receipt = item.mask, item.receipt
+        mask_args = entry["key"], entry["source"].shape
+        controls = highlight or {}
+        protection = self._highlight_mask(*mask_args, "protection", controls.get("protection"), rectangle, step)
+        effect = self._highlight_mask(*mask_args, "effect_area", controls.get("effect_area"), rectangle, step)
         image, receipt = compose_native_sample(image, icc=icc, reference_encoded=ref,
                                                highlight=highlight, point=point,
-                                               protection_mask=protection, effect_mask=effect)
+                                               protection_mask=protection.mask if protection else None,
+                                               effect_mask=effect.mask if effect else None)
         if receipt is not None:
-            receipt["protection_sampling"] = protection_receipt
-            if effect_receipt is not None:
-                receipt["effect_sampling"] = effect_receipt
+            receipt["protection_sampling"] = protection.receipt if protection else None
+            if effect:
+                receipt["effect_sampling"] = effect.receipt
         return _to_uint16_jit(image), icc, receipt
 
     def _reference(self, recipe, mode, rectangle, step, direction, fallback, icc):
@@ -753,7 +756,19 @@ class DensityPreviewCache:
     @property
     def cache_report(self):
         return dict(retained_source_bytes=int(self.session.source.nbytes) if self.certificate else 0,
-                    derived_bytes=sum(item["pixels"].nbytes for item in self.samples.values())
+                    derived_bytes=sum(item["pixels"].nbytes for item in self.samples.values()
+                                      if "pixels" in item)
+                        + sum(item["encoded"].nbytes for item in self.samples.values()
+                              if "encoded" in item)
+                        + sum(reference["encoded"].nbytes
+                              for item in self.samples.values()
+                              if (reference := item.get("highlight_reference")) is not None)
+                        + sum(result["pixels"].nbytes for item in self.samples.values()
+                              if (result := item.get("highlight_reference", {}).get("result")) is not None)
+                        + sum(item["nikon_cms"]["pixels"].nbytes for item in self.samples.values()
+                              if "nikon_cms" in item)
+                        + sum(item["flex_legacy"]["pixels"].nbytes for item in self.samples.values()
+                              if "pixels" in item.get("flex_legacy", {}))
                         + sum(item["pixels"].nbytes for item in self.references.values())
                         + sum(item["image"].nbytes for item in self.float_samples.values())
                         + sum(item.mask.nbytes for item in self.protection_samples.values())

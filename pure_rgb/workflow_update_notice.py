@@ -22,6 +22,7 @@ class UpdateNotice(QWidget):
         self._disposed = False
         self._checking = False
         self._started = False
+        self._release_url = release.RELEASES_URL
         self._signals = _UpdateSignals(self)
         self._signals.checked.connect(self._checked)
         self._timer = QTimer(self)
@@ -75,11 +76,24 @@ class UpdateNotice(QWidget):
     def _checked(self, latest):
         self._checking = False
         if not self._disposed and latest:
+            self._release_url = release.RELEASES_URL
+            self.open_button.setText("查看更新")
             self.message.setText(f"发现 PURE RGB 新版本 {latest}。")
             self.show()
 
+    def show_installed_release(self):
+        self._release_url = f"{release.RELEASES_URL}/tag/v{release.APP_VERSION}"
+        self.message.setText(
+            f"已更新到 PURE RGB {release.APP_VERSION}\n"
+            "新增图片库和图文介绍，改进平场与镜头校正。\n"
+            "预览和高光找回提速，单击工具栏可直接裁切。\n"
+            "RGB 灯光配平暂时撤下。"
+        )
+        self.open_button.setText("查看更新说明")
+        self.show()
+
     def open_release(self):
-        if not QDesktopServices.openUrl(QUrl(release.RELEASES_URL)):
+        if not QDesktopServices.openUrl(QUrl(self._release_url)):
             self.message.setText("无法打开发布页，请在设置中重试。")
 
     def dispose(self):
