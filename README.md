@@ -8,6 +8,14 @@ PURE RGB 基于 [NegPy](https://github.com/marcinz606/NegPy) 开发，感谢 mar
 
 ![PURE RGB 转换调色工作台。中央的 3 倍放大镜显示石雕纹理，左侧调节参数，右侧查看输出波形。](docs/images/color-workbench.png)
 
+## RGB 分色翻拍图解 / Illustrated trichrome guide
+
+九张图展示同一格负片的三路 RAW、片基配平、原始 RAW 曝光余量和正像转换。用实拍说明**橙框决定调哪一路灯，蓝框决定三路要不要一起改快门**。图解附有柯达原厂手册和 DIASTOR 研究的原文链接。
+
+Follow one negative from three separate RAW exposures to a finished positive. The nine illustrated cards explain how the orange box guides individual lamp changes and the blue box guides a shared exposure change.
+
+[中文九图指南](docs/RGB_TRICHROME_GUIDE.zh-CN.md) · [English illustrated guide](docs/RGB_TRICHROME_GUIDE.en.md)
+
 ## 工作台与观片台
 
 - **六步工作流。** 顶部依次为「导入归组」「画幅与测量」「转换调色」「修整审核」「观片台」「导出」。半透明磨砂玻璃面板透出底色，明亮的橙红色标示当前步骤和主要操作。照片、调节参数和输出示波器可同时查看。

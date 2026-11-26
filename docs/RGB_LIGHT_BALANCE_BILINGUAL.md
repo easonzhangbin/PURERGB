@@ -1,5 +1,7 @@
 # RGB 灯光配平与柯达资料 / RGB light balancing and Kodak references
 
+[中文九图指南](RGB_TRICHROME_GUIDE.zh-CN.md) · [English illustrated guide](RGB_TRICHROME_GUIDE.en.md)
+
 ## 柯达 H-61A 的 D-min 与 LAD / Kodak H-61A D-min and LAD
 
 H-61A 用未受光的场景背景说明 **D-min**。对应的负片区域几乎未曝光，冲洗后呈最低密度。**LAD** 是实验室用于核对印片过程的参考。负片 LAD 标准色块取自反射率 16% 的中性目标，名义 Status M 密度为 R 0.80、G 1.20、B 1.60。
