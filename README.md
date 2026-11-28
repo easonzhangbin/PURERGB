@@ -2,7 +2,9 @@
 
 PURE RGB 基于 [NegPy](https://github.com/marcinz606/NegPy) 开发，感谢 marcinz606 与上游贡献者。
 
-**PURE RGB 0.2.4** 是 StudioPURE 为 Apple 芯片 Mac 开发的胶片数字化工作台。它把同一帧底片在红、绿、蓝光下拍摄的三张 RAW 合成为彩色正像，从密度测量、转换调色、除尘审核到选片导出，都在同一套工作流内完成。
+**PURE RGB** 是 StudioPURE 为 Apple 芯片 Mac 开发的胶片数字化工作台，专为 RGB 分色翻拍设计。它将同一格底片在红、绿、蓝光下分别拍摄的三张 RAW 对齐并合成为彩色正像。从片基测量、平场校正和负片转换，到调色、除尘审核、整卷选片和带 ICC 色彩配置的 16 位 TIFF 导出，都可以在同一套工作流中完成。基于 NegPy 的印相引擎利用负片密度保留高光层次，调整印相曝光时也能保持原有色彩。
+
+**PURE RGB** is a film digitization workbench from StudioPURE for Macs with Apple silicon, designed for trichrome camera scanning. It aligns three RAW captures of the same negative frame, one under each of red, green, and blue light, and combines them into a color positive. The workflow covers film base measurement, flat-field correction, negative conversion, color grading, dust removal and review, selection across an entire roll, and 16-bit TIFF export with an embedded ICC profile. The NegPy-based print engine uses negative density to preserve highlight detail and lets you adjust print exposure while keeping the original color balance.
 
 [下载 0.2.4](https://github.com/easonzhangbin/PURERGB/releases/tag/v0.2.4) · [中文使用指南](docs/OPERATING_MANUAL.zh-CN.md) · [本版改进](docs/releases/0.2.4.md) · [捐赠 StudioPURE 项目](SUPPORT.md)
 
