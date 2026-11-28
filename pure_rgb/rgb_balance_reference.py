@@ -8,7 +8,9 @@ from pathlib import Path
 import re
 import unicodedata
 
-from .rgb_light_balance import CHANNELS, CaptureSettings, _shutter_label
+from .rgb_light_balance import (
+    CHANNELS, CaptureSettings, MEASUREMENT_SCHEMA, MEASUREMENT_SCHEMA_VERSION, _shutter_label,
+)
 
 
 SCHEMA = "pure-rgb-balance-reference"
@@ -64,6 +66,19 @@ class BalanceReference:
     def from_report(cls, text):
         if _utf8_size(text) > MAX_REPORT_BYTES:
             raise ValueError("报告太大，无法载入曝光参考。")
+        stripped = text.lstrip("\ufeff \t\r\n")
+        if stripped.startswith("{"):
+            try:
+                payload = json.loads(stripped, object_pairs_hook=_unique_object)
+            except (ValueError, RecursionError):
+                raise ValueError("报告里的曝光参考格式无效。") from None
+            if (not isinstance(payload, dict) or payload.get("schema") != MEASUREMENT_SCHEMA
+                    or type(payload.get("schema_version")) is not int
+                    or payload["schema_version"] != MEASUREMENT_SCHEMA_VERSION):
+                raise ValueError("这份报告没有可载入的曝光参考。")
+            if "capture_reference" not in payload:
+                raise ValueError("这份报告没有可载入的曝光参考。")
+            return cls.from_dict(payload["capture_reference"])
         lines = text.lstrip("\ufeff").splitlines()
         starts = [index for index, line in enumerate(lines) if line.strip() == REFERENCE_BEGIN]
         ends = [index for index, line in enumerate(lines) if line.strip() == REFERENCE_END]
@@ -78,6 +93,11 @@ class BalanceReference:
             payload = json.loads(block, object_pairs_hook=_unique_object)
         except (ValueError, RecursionError):
             raise ValueError("报告里的曝光参考格式无效。") from None
+        return cls.from_dict(payload)
+
+    @classmethod
+    def from_dict(cls, payload):
+        """Read the unchanged reference schema from either TXT or measurement JSON."""
         if not isinstance(payload, dict) or set(payload) != {"schema", "version", "channels"}:
             raise ValueError("报告里的曝光参考字段无效。")
         version = payload["version"]

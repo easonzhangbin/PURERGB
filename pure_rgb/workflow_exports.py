@@ -2,6 +2,7 @@
 
 import json
 import _thread
+from copy import deepcopy
 from pathlib import Path
 import subprocess
 import sys
@@ -9,6 +10,7 @@ import os
 import re
 import threading
 import time
+import uuid
 
 from .preview_data import ROOT, copy_verified_tiff
 from .workspace import write_json
@@ -21,6 +23,35 @@ _DEFAULT_RENDER_BUDGET = 12 * _GIB
 _SIMPLE_RENDER_BUDGET = 8 * _GIB
 _LARGE_RAW_PIXELS = 100_000_000
 _SIMPLE_RAW_PIXELS = 25_000_000
+
+
+def remaining_export_items(request, report):
+    """Retain only failed frozen items after a complete worker receipt."""
+    failed = {error["id"] for error in report["errors"]}
+    delivered = {(entry["id"], entry["mode"], entry["path"]) for entry in report["saved"]}
+    return [
+        deepcopy(item) for item in request["items"]
+        if item["id"] in failed
+        and (item["id"], item["mode"], item["destination"]) not in delivered
+    ]
+
+
+def retry_export_request(request):
+    """Use a fresh run directory and choose new names for existing targets."""
+    items = deepcopy(request["items"])
+    for item in items:
+        path = Path(item["destination"])
+        if path.exists() or path.is_symlink():
+            suffix = f"_retry_{uuid.uuid4().hex[:12]}{path.suffix}"
+            # Keep the generated name within the original TIFF filename limit.
+            stem_bytes = path.stem.encode("utf-8")[:255 - len(suffix.encode("utf-8"))]
+            stem = stem_bytes.decode("utf-8", "ignore")
+            item["destination"] = str(path.with_name(stem + suffix))
+    return dict(
+        action="export_batch",
+        directory=str(Path(request["directory"]).with_name(uuid.uuid4().hex)),
+        items=items,
+    )
 
 
 def _render_budget(item):

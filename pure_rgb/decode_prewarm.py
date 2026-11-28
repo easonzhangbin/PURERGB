@@ -120,7 +120,7 @@ def prewarm(manifest_path, cancelled, *, start_guard=None, end_guard=None):
                             process.terminate()
                             stopped = True
                             break
-                        time.sleep(0.25)
+                        time.sleep(0.05)
                         if time.monotonic() >= next_memory_check:
                             available = _available_memory()
                             if available is None or available < 3 * _GIB:

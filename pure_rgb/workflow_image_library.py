@@ -8,12 +8,13 @@ import threading
 from PyQt6.QtCore import QSize, Qt, QThreadPool, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QIcon, QPixmap
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+    QAbstractItemView, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
 
 from .image_library import ImageLibrary
 from .preview_ui import Work
+from .workflow_border_beam import attach_theme_beam
 from .workflow_combo import WorkflowComboBox
 from .workflow_notices import center_notice_text
 
@@ -23,6 +24,7 @@ class ImageLibraryDialog(QDialog):
 
     def __init__(self, path, parent=None, *, source_mode="rgb"):
         super().__init__(parent)
+        self.setObjectName("workflowRoot")
         self.setWindowTitle("图片库")
         self.resize(1040, 740)
         self.setMinimumSize(740, 520)
@@ -42,7 +44,10 @@ class ImageLibraryDialog(QDialog):
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self.next_thumbnail)
         outer = QVBoxLayout(self)
-        actions = QHBoxLayout()
+        toolbar = QFrame()
+        toolbar.setObjectName("workflowHeader")
+        actions = QHBoxLayout(toolbar)
+        actions.setContentsMargins(12, 8, 12, 8)
         self.add = QPushButton("关联目录…")
         self.add.clicked.connect(self.add_folder)
         self.refresh = QPushButton("刷新目录")
@@ -54,12 +59,14 @@ class ImageLibraryDialog(QDialog):
         for widget in (self.add, self.refresh, self.remove, self.reveal):
             actions.addWidget(widget)
         actions.addStretch()
-        outer.addLayout(actions)
+        outer.addWidget(toolbar)
+        self.header_beam = attach_theme_beam(toolbar)
         note = QLabel("关联素材目录，保留原文件位置。选中照片即可导入当前项目并自动处理。")
         note.setWordWrap(True)
         outer.addWidget(note)
         split = QSplitter()
         self.folders = QListWidget()
+        self.folders.setObjectName("libraryFolders")
         self.folders.setAccessibleName("图片库目录")
         self.folders.currentItemChanged.connect(self.folder_changed)
         split.addWidget(self.folders)
@@ -83,6 +90,7 @@ class ImageLibraryDialog(QDialog):
         filters.addWidget(self.search, 1)
         column.addLayout(filters)
         self.photos = QListWidget()
+        self.photos.setObjectName("libraryPhotos")
         self.photos.setAccessibleName("图片库照片；单击单选，⌘／Ctrl 多选，Shift 连选，⌘A／Ctrl+A 全选")
         self.photos.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.photos.setViewMode(QListWidget.ViewMode.IconMode)

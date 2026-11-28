@@ -15,22 +15,23 @@ from pathlib import Path
 
 import numpy as np
 
+from .common_positive import apply_common_positive
 from .output_orientation import sample_oriented
 from .output_orientation_cache import cache_budget_bytes
+from .positive_lut import fit_point_codes
 from .positive_post import post_codes
 from .preview_data import verified_pixels
 from .preview_grid import post_requires_full_grid
 from .professional_controls import output_codes
-from .workspace import checked_recipe, output_rectangle
+from .workspace import checked_recipe, output_rectangle, source_recipe_identity
 
 
 MODE = "cool-shared-rgb"
 PREVIEW_LONG_EDGE = 1400
 _NEUTRAL_NATIVE_KEYS = (
     "native_controls", "native_film", "native_float_controls",
-    "native_spatial_controls", "highlight_controls",
+    "native_spatial_controls", "highlight_controls", "common_positive_controls",
 )
-_SOURCE_KEYS = ("raw", "raw_import", "flatfield", "registration_check")
 
 
 def _canonical(document):
@@ -67,7 +68,7 @@ class NikonDraftPreview:
         self.parent_digest = parent_digest
         self.saved_recipe = checked_recipe(self.manifest["recipe"])
         self.reference_identity = None
-        self.sample = self.cms = None
+        self.sample = self.cms = self.coarse_cms = None
         self.sources_checked = False
         self.source_reads = 0
 
@@ -92,13 +93,14 @@ class NikonDraftPreview:
             or saved.get("output_orientation")
         ):
             return False
-        if any(recipe.get(key) != saved.get(key) for key in _SOURCE_KEYS):
+        if source_recipe_identity(recipe) != source_recipe_identity(saved):
             return False
         saved_roi = saved.get("roi") or self.manifest["roi"]
         requested_roi = recipe.get("roi") or self.manifest["roi"]
         if (
             requested_roi != saved_roi
             or recipe["density"] != saved["density"]
+            or recipe.get("measurement_method") != saved.get("measurement_method")
             or recipe["paper"] != saved["paper"]
             or post_requires_full_grid(recipe.get("post_controls", {}).get(MODE))
         ):
@@ -110,10 +112,10 @@ class NikonDraftPreview:
 
     @property
     def retained_bytes(self):
-        return sum(entry["pixels"].nbytes for entry in (self.sample, self.cms) if entry)
+        return sum(entry["pixels"].nbytes for entry in (self.sample, self.cms, self.coarse_cms) if entry)
 
     def close(self):
-        self.sample = self.cms = None
+        self.sample = self.cms = self.coarse_cms = None
 
     def _source(self, recipe, full, sample_step_override=None):
         record = self.manifest["results"]["native"]
@@ -139,7 +141,7 @@ class NikonDraftPreview:
             raise ValueError("Nikon 原生参考的完整网格、ICC或身份不一致")
         self.reference_identity = identity
         sample = sample_oriented(pixels[y0:y1, x0:x1], None, direction, step)
-        self.sample = self.cms = None
+        self.sample = self.cms = self.coarse_cms = None
         if sample.nbytes * 2 <= cache_budget_bytes():
             sample = _readonly(sample)
             self.sample = dict(key=key, pixels=sample, icc=icc)
@@ -147,13 +149,16 @@ class NikonDraftPreview:
             sample.setflags(write=False)
         return sample, icc, step, rectangle
 
-    def render(self, recipe, *, full=False, sample_step_override=None):
+    def render(self, recipe, *, full=False, sample_step_override=None, interactive_edge=None):
         """Return an exact current-grid preview, or None for the normal fallback."""
         recipe = checked_recipe(recipe)
         if type(full) is not bool:
             raise ValueError("Nikon 预览分辨率必须为布尔值")
         if sample_step_override is not None and (type(sample_step_override) is not int or sample_step_override < 1):
             raise ValueError("Nikon 精细预览步长必须为正整数")
+        if interactive_edge is not None and (full or sample_step_override is not None
+                or type(interactive_edge) is not int or interactive_edge < 1):
+            raise ValueError("Nikon 拖动预览尺寸只适用于适应窗口")
         if not self.eligible(recipe):
             return None
         if not self.sources_checked:
@@ -174,14 +179,24 @@ class NikonDraftPreview:
         resources = checked_nikon_resources()
         previous_reads = self.source_reads
         reference, icc, step, rectangle = self._source(recipe, full, sample_step_override)
+        slot = "cms"
+        if interactive_edge is not None:
+            factor = (max(reference.shape[:2]) + interactive_edge - 1) // interactive_edge
+            if factor > 1:
+                # Reuse the authenticated, already-oriented fit grid. Taking
+                # every nth point preserves its phase without reopening TIFF.
+                reference = _readonly(reference[::factor, ::factor])
+                step *= factor
+                slot = "coarse_cms"
         document = recipe["nikon_research_controls"]
         key = _canonical([self.sample["key"] if self.sample else None,
                           list(reference.shape), rectangle,
                           recipe.get("output_orientation"), step, document,
                           recipe.get("experimental_film_controls")])
-        cms_cache_hit = self.cms is not None and self.cms["key"] == key
+        cached = getattr(self, slot)
+        cms_cache_hit = cached is not None and cached["key"] == key
         if cms_cache_hit:
-            converted, cms_receipt = self.cms["pixels"], self.cms["receipt"]
+            converted, cms_receipt = cached["pixels"], cached["receipt"]
         else:
             source_key = hashlib.sha256(_canonical({
                 "parent_manifest_sha256": self.parent_digest,
@@ -198,18 +213,18 @@ class NikonDraftPreview:
             )
             if other != icc:
                 raise ValueError("Nikon 快速预览工作ICC不一致")
-            self.cms = None
+            setattr(self, slot, None)
             if (self.retained_bytes + converted.nbytes) <= cache_budget_bytes():
                 converted = _readonly(converted)
-                self.cms = dict(key=key, pixels=converted, receipt=cms_receipt)
-        current, _ = output_codes(
-            converted,
-            recipe.get("output_controls", {}).get(MODE) or dict(version=1, values={}),
-            recipe["exposure_ev"],
-        )
-        current, _ = post_codes(
-            current, recipe.get("post_controls", {}).get(MODE), sample_step=step
-        )
+                setattr(self, slot, dict(key=key, pixels=converted, receipt=cms_receipt))
+        output = recipe.get("output_controls", {}).get(MODE) or dict(version=1, values={})
+        post = recipe.get("post_controls", {}).get(MODE)
+        positive = apply_common_positive(converted, recipe.get("common_positive_controls"))
+        current = (fit_point_codes(positive, output, recipe["exposure_ev"], post)
+                   if not full and sample_step_override is None else None)
+        if current is None:
+            current, _ = output_codes(positive, output, recipe["exposure_ev"])
+            current, _ = post_codes(current, post, sample_step=step, collect_ranges=False)
         record = self.manifest["results"]["native"]
         if (
             _identity(record["path"]) != self.reference_identity

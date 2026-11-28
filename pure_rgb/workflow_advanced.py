@@ -10,7 +10,8 @@ from dataclasses import dataclass, replace
 import plistlib
 from pathlib import Path
 
-from .professional_controls import Control, NATIVE_SPECS, OUTPUT_SPECS, checked_controls
+from .professional_controls import Control, NATIVE_SPECS, OUTPUT_SPECS, PRINT_EXPOSURE_EV, checked_controls
+from .native_headroom import HEADROOM_CONTROL, HEADROOM_STRENGTH
 from .positive_float import FLOAT_SPECS
 from .positive_post import POST_SPECS
 from .native_spatial_v30 import LAB_FIELDS
@@ -197,7 +198,10 @@ def advanced_groups(recipe, engine, bw, stage):
         return tuple(groups)
     if stage == 3:
         if native:
-            blocked = {"exposure.grade", "exposure.paper_profile"}
+            blocked = {
+                "exposure.grade", "exposure.paper_profile", PRINT_EXPOSURE_EV,
+                HEADROOM_CONTROL, HEADROOM_STRENGTH,
+            }
             if spatial or recipe.get("bw_metering"):
                 blocked |= {"exposure.contrast_mask_strength", "exposure.diffusion"}
             print_specs = [
@@ -280,7 +284,7 @@ def advanced_groups(recipe, engine, bw, stage):
                 ),
             )
         )
-        if native and recipe.get("highlight_controls"):
+        if native and (bw or recipe.get("measurement_method") != "negpy") and recipe.get("highlight_controls"):
             from .highlight_reference_guarded import DEFAULTS
 
             specs = [

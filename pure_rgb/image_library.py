@@ -82,8 +82,10 @@ class ImageLibrary:
         if cancelled():
             return None
         with self.connection() as db:
-            # Removal while scanning must never recreate an orphan index.
-            if db.execute("SELECT 1 FROM folders WHERE id=?", (identifier,)).fetchone() is None:
+            # Take the write lock before checking that the folder still exists.
+            # A SELECT by itself does not start a SQLite write transaction.
+            db.execute("BEGIN IMMEDIATE")
+            if cancelled() or db.execute("SELECT 1 FROM folders WHERE id=?", (identifier,)).fetchone() is None:
                 return None
             db.execute("DELETE FROM media WHERE folder=?", (identifier,))
             db.executemany("INSERT INTO media VALUES (?, ?, ?, ?)", records)

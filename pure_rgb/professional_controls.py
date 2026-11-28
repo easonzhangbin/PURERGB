@@ -9,7 +9,11 @@ import math
 
 import numpy as np
 
+from .native_headroom import HEADROOM_CONTROL, HEADROOM_STRENGTH
 from .tone_study import GAMMA
+
+
+PRINT_EXPOSURE_EV = "exposure.print_exposure_ev"
 
 
 @dataclass(frozen=True)
@@ -22,6 +26,9 @@ class Control:
     high: float = 1.0
     step: float = 0.01
     choices: tuple = ()
+
+
+PRINT_EXPOSURE_SPEC = Control(PRINT_EXPOSURE_EV, "印相曝光（EV）", "明暗与反差", 0., -4., 4., .1)
 
 
 def native_papers():
@@ -39,6 +46,9 @@ def native_specs():
         Control("process.black_point_offset", "黑点偏移", "原生密度测量", 0., -.25, .25, .01),
         Control("process.luma_range_clip", "亮度范围截断", "原生密度测量", 0., -1., 1., .000001),
         Control("process.color_range_clip", "颜色截断", "原生密度测量", 1., .000001, 5., .000001),
+        PRINT_EXPOSURE_SPEC,
+        Control(HEADROOM_CONTROL, "保留负片动态范围", "明暗与反差", False),
+        Control(HEADROOM_STRENGTH, "高光找回强度", "明暗与反差", 0.0),
     ]
 
     def add(field, title, group, default=0.0, low=-1.0, high=1.0, step=0.01):
@@ -247,7 +257,8 @@ def checked_controls(document, specs):
             )
         if not valid:
             raise ValueError(f"专业控件参数越界或类型错误：{key}")
-        if value != spec.default:
+        # An explicit zero also replaces the legacy highlight path for this photo.
+        if value != spec.default or key == HEADROOM_STRENGTH:
             result[key] = value
     return {"version": 1, "values": result}
 
@@ -265,6 +276,9 @@ def checked_outputs(document):
 
 def native_config(config, document):
     values = checked_controls(document, NATIVE_SPECS)["values"]
+    values.pop(PRINT_EXPOSURE_EV, None)
+    values.pop(HEADROOM_CONTROL, None)
+    values.pop(HEADROOM_STRENGTH, None)
     for section in ("process", "exposure", "lab", "finish"):
         changes = {
             k.split(".")[1]: v for k, v in values.items() if k.startswith(section + ".")
@@ -274,6 +288,10 @@ def native_config(config, document):
                 config, **{section: replace(getattr(config, section), **changes)}
             )
     return config
+
+
+def native_print_ev(recipe):
+    return recipe.get("native_controls", {}).get("values", {}).get(PRINT_EXPOSURE_EV, 0.0)
 
 
 def output_codes(pixels, document, common_ev=0.0):

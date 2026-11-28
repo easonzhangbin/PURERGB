@@ -2225,6 +2225,7 @@ final class BatchLightTableController: NSWindowController, NSWindowDelegate {
 
     private let singleFrame: Bool
     private let viewingRepair: Bool
+    private let obsidian: Bool
     private let board: LightTable
     #if PURENEG_TONE_CALIBRATION
     private static let filmLightPreference = "settings.lightTableCalibration"
@@ -2249,9 +2250,10 @@ final class BatchLightTableController: NSWindowController, NSWindowDelegate {
     private lazy var next = NSButton(title: "前往导出",
                                                 target: self, action: #selector(advance))
 
-    init(singleFrame: Bool = false, viewingRepair: Bool = false) {
+    init(singleFrame: Bool = false, viewingRepair: Bool = false, obsidian: Bool = false) {
         self.singleFrame = singleFrame || viewingRepair
         self.viewingRepair = viewingRepair
+        self.obsidian = obsidian
         board = LightTable(singleFrame: singleFrame || viewingRepair, viewingRepair: viewingRepair)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1110, height: 718),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -2504,7 +2506,7 @@ final class BatchLightTableController: NSWindowController, NSWindowDelegate {
     private func build(_ window: NSWindow) {
         let root = NSView()
         window.contentView = root
-        StudioStyle.installBackdrop(in: window, root: root)
+        StudioStyle.installBackdrop(in: window, root: root, obsidian: obsidian)
 
         let name = NSTextField(labelWithString: headingTitle)
         name.textColor = StudioStyle.secondaryText
@@ -2523,7 +2525,7 @@ final class BatchLightTableController: NSWindowController, NSWindowDelegate {
             orientationTools.spacing = 5
             toolbarViews.append(orientationTools)
         }
-        let toolbar = bar(toolbarViews, height: 45)
+        let toolbar = bar(toolbarViews, height: 45, accented: true)
         let instructions: String
         if viewingRepair {
             instructions = L10n.surface("用右下角电源点亮观片器，拖动放大镜检查胶片细节。")
@@ -2605,12 +2607,13 @@ final class BatchLightTableController: NSWindowController, NSWindowDelegate {
         return stack
     }
 
-    private func bar(_ views: [NSView], height: CGFloat) -> NSView {
-        bar(horizontal(views), height: height)
+    private func bar(_ views: [NSView], height: CGFloat, accented: Bool = false) -> NSView {
+        bar(horizontal(views), height: height, accented: accented)
     }
 
-    private func bar(_ content: NSView, height: CGFloat) -> NSView {
-        let panel = StudioStyle.panel(content, horizontal: 14, vertical: 6)
+    private func bar(_ content: NSView, height: CGFloat, accented: Bool = false) -> NSView {
+        let panel = StudioStyle.panel(content, horizontal: 14, vertical: 6,
+                                      obsidian: obsidian, accented: accented)
         panel.heightAnchor.constraint(equalToConstant: height).isActive = true
         return panel
     }

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .output_orientation import checked_document
 from .output_orientation_cache import _color_recipe
-from .workspace import checked_recipe, output_rectangle
+from .workspace import checked_recipe, output_rectangle, source_recipe_identity
 
 
 _MODES = {"native": "native", "nikon": "cool-shared-rgb", "flex": "flex-endpoint"}
@@ -32,6 +32,19 @@ def _resolved_recipe(recipe, auto_roi):
         # same measured support as the normally resolved UI draft.
         result = checked_recipe({**result, "roi": deepcopy(auto_roi)}, verify_resources=False)
     return result
+
+
+def _same_metering_source(saved, desired):
+    fields = ("roi", "density", "measurement_method", "density_metering", "bw_metering",
+              "native_spatial_controls", "native_film")
+
+    def process_values(recipe):
+        values = recipe.get("native_controls", {}).get("values", {})
+        return {key: value for key, value in values.items() if key.startswith("process.")}
+
+    return (source_recipe_identity(saved) == source_recipe_identity(desired)
+            and all(saved.get(key) == desired.get(key) for key in fields)
+            and process_values(saved) == process_values(desired))
 
 
 def saved_full_source_record(window, locator_recipe, *, allow_reference=False):
@@ -68,7 +81,7 @@ def saved_full_source_record(window, locator_recipe, *, allow_reference=False):
             candidate_mode = mode
             if allow_reference and candidate_mode not in manifest["results"]:
                 candidate_mode = "native"
-            if allow_reference and saved["raw"] != desired_recipe["raw"]:
+            if allow_reference and not _same_metering_source(saved, desired_recipe):
                 continue
             if not allow_reference and _comparable(saved, mode) != desired:
                 continue
@@ -85,9 +98,11 @@ def saved_full_source_record(window, locator_recipe, *, allow_reference=False):
             if (not record or record.get("shape") != expected
                     or not Path(record["path"]).is_file()):
                 continue
-            from .draft_preview import _saved_measurement_valid
+            from .draft_preview import _saved_color_valid, _saved_measurement_valid
 
-            if not _saved_measurement_valid(manifest):
+            valid = (_saved_measurement_valid(manifest) if allow_reference
+                     else _saved_color_valid(manifest, candidate_mode))
+            if not valid:
                 continue
             record = deepcopy(record)
             record["display_source_step"] = max(1, (max(expected[:2]) + 2047) // 2048)

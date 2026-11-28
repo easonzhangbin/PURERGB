@@ -15,6 +15,8 @@ import pickle
 import shutil
 import tempfile
 import time
+from types import SimpleNamespace
+import weakref
 
 import numpy as np
 
@@ -185,27 +187,34 @@ def _rebind(processor, meta, source, file_path, params):
     # The key's mtime is a freshness heuristic; content is already proven by
     # the manifest hashes, so the current mtime rebinds without a re-decode.
     fields[1] = mtime
-    processor._source_cache_key = tuple(fields)
-    processor._source_cache_value = (source, None, meta["color_space"])
-    processor._cam_xyz_by_path[file_path] = tuple(meta["camera_metadata"])
-    if hasattr(processor, "pure_raw_import_token"):
-        processor.pure_raw_import_receipt = deepcopy(meta["receipt"])
-        processor.pure_raw_import_token = meta["import_token"]
-        processor.pure_flatfield_sampled_source_mean_absolute_change = meta[
-            "flatfield_sampled_change"
-        ]
+    cache_value = (source, None, meta["color_space"])
+    camera_metadata = tuple(meta["camera_metadata"])
+    standard = hasattr(processor, "pure_raw_import_token")
+    if standard:
+        receipt = deepcopy(meta["receipt"])
+        import_token = meta["import_token"]
+        flatfield_change = meta["flatfield_sampled_change"]
         paths = processor._paths(file_path, params)
-        processor._pure_source_identity = (processor.source_identity_for_paths(paths)
+        source_identity = (processor.source_identity_for_paths(paths)
             if hasattr(processor, "source_identity_for_paths") else (
             tuple((path, file_identity(path)) for path in paths),
             tuple(processor.pure_flatfield_reference_shape or ()),
         ))
+    processor._source_cache_key = tuple(fields)
+    processor._source_cache_value = cache_value
+    processor._cam_xyz_by_path[file_path] = camera_metadata
+    if standard:
+        processor.pure_raw_import_receipt = receipt
+        processor.pure_raw_import_token = import_token
+        processor.pure_flatfield_sampled_source_mean_absolute_change = flatfield_change
+        processor._pure_source_identity = source_identity
 
 
 def restore_source(
-    processor, manifest, recipe, config_document, reference_shape, file_path, params
+    processor, manifest, recipe, config_document, reference_shape, file_path, params,
+    *, frozen=False,
 ):
-    """Rebind a validated cached decode onto the processor, or return None."""
+    """Restore a validated decode, with its certificate if requested, or return None."""
     if not _enabled():
         return None
     directory = _directory()
@@ -221,6 +230,7 @@ def restore_source(
     if not data_path.is_file() or not meta_path.is_file():
         event("decoded_cache_miss", reason="absent")
         return None
+    certificate = None
     try:
         with meta_path.open("rb") as stream:
             meta = pickle.load(stream)
@@ -243,7 +253,16 @@ def restore_source(
             )
         ):
             raise ValueError("decoded cache geometry differs")
-        digest = hashlib.sha256(memoryview(source).cast("B")).hexdigest()
+        if frozen:
+            from .immutable_source_v44 import ImmutableSourceCertificate
+
+            # Authenticate the exact immutable bytes that the preview will use.
+            # A read-only mmap can still change if its backing file is edited.
+            certificate = ImmutableSourceCertificate.create(source)
+            source = certificate.source
+            digest = certificate.sha256
+        else:
+            digest = hashlib.sha256(memoryview(source).cast("B")).hexdigest()
         if digest != meta["pixels_sha256"]:
             raise ValueError("decoded cache pixels differ")
         if recipe.get("raw_import", LEGACY_IMPORT) != LEGACY_IMPORT:
@@ -259,6 +278,8 @@ def restore_source(
                 raise ValueError("decoded cache import receipt differs")
         _rebind(processor, meta, source, file_path, params)
     except (OSError, EOFError, ValueError, KeyError, TypeError, pickle.UnpicklingError):
+        if certificate is not None:
+            certificate.close()
         _drop(data_path, meta_path)
         event("decoded_cache_miss", reason="invalid")
         return None
@@ -269,7 +290,7 @@ def restore_source(
             pass
     event("decoded_cache_hit", bytes=int(source.nbytes))
     _report_prewarm_entry(data_path, meta_path)
-    return source
+    return (source, certificate) if frozen else source
 
 
 def store_source(
@@ -323,17 +344,22 @@ def store_source(
                     None,
                 ),
             )
+            receipt = meta["receipt"]
+            expected = manifest.get("raw_import_receipt") or {}
+            if (
+                not isinstance(receipt, dict)
+                or not isinstance(meta["import_token"], str)
+                or receipt.get("source_pixels_sha256") != meta["pixels_sha256"]
+                or expected.get("source_pixels_sha256") != meta["pixels_sha256"]
+                or expected.get("geometry_token") != receipt.get("geometry_token")
+            ):
+                return
         if (
             source.dtype != np.float32
+            or (manifest.get("source_shape") is not None
+                and list(source.shape) != list(manifest["source_shape"]))
             or not isinstance(meta["color_space"], str)
             or not isinstance(meta["camera_metadata"], tuple)
-            or (
-                standard
-                and not (
-                    isinstance(meta["receipt"], dict)
-                    and isinstance(meta["import_token"], str)
-                )
-            )
         ):
             return
         directory.mkdir(parents=True, exist_ok=True)
@@ -375,14 +401,19 @@ class RenderDecodeCache:
     differ from automatic classification take the re-decode path instead.
     """
 
-    def __init__(self, records, manifest, recipe, reference_shape):
+    def __init__(self, records, manifest, recipe, reference_shape, *, frozen=False):
         self.records = records
         self.manifest = manifest
         self.recipe = recipe
         self.reference_shape = reference_shape
+        self.frozen = frozen
+        self._certificate = None
 
     def restore(self, processor, config_document, file_path, params):
-        return restore_source(
+        if self._certificate is not None:
+            self._certificate.close()
+            self._certificate = None
+        result = restore_source(
             processor,
             self.manifest,
             self.recipe,
@@ -390,7 +421,21 @@ class RenderDecodeCache:
             self.reference_shape,
             file_path,
             params,
+            frozen=self.frozen,
         )
+        if self.frozen and result is not None:
+            source, self._certificate = result
+            return source
+        return result
+
+    def take_source_certificate(self, source):
+        certificate, self._certificate = self._certificate, None
+        if certificate is not None:
+            if certificate.source is source:
+                certificate.validate(source)
+                return certificate
+            certificate.close()
+        return None
 
     def store(
         self, processor, config_document, file_path, source, ir, color_space
@@ -408,15 +453,69 @@ class RenderDecodeCache:
         )
 
 
-def render_decode_context(request, recipe, anchor):
+def source_anchor(manifest):
+    calibration = manifest.get("calibration") or {}
+    provenance = calibration.get("provenance") or {}
+    capture = provenance.get("capture") or {}
+    return {
+        "source_shape": manifest.get("source_shape"),
+        "raw_import_receipt": manifest.get("raw_import_receipt"),
+        "flatfield_reference_shape": capture.get("sensor_shape"),
+    }
+
+
+class ImportDecodeCache:
+    """Capture decoder state, then cache it once the completed import is certified."""
+
+    def __init__(self, request, recipe):
+        self.records = request["inputs"]
+        self.recipe = recipe
+        self.pending = None
+
+    def restore(self, processor, config_document, file_path, params):
+        return None
+
+    def store(self, processor, config_document, file_path, source, ir, color_space):
+        if not _enabled() or ir is not None or _budget_bytes() < source.nbytes + 4096:
+            return
+        # Export can evict or replace the processor's working source. Keep the
+        # decoder metadata without pinning another image or processor.
+        state = SimpleNamespace(
+            _source_cache_key=processor._source_cache_key,
+            _cam_xyz_by_path={file_path: deepcopy(processor._cam_xyz_by_path.get(file_path))},
+            pure_raw_import_receipt=deepcopy(getattr(processor, "pure_raw_import_receipt", None)),
+            pure_raw_import_token=getattr(processor, "pure_raw_import_token", None),
+            pure_flatfield_sampled_source_mean_absolute_change=getattr(
+                processor, "pure_flatfield_sampled_source_mean_absolute_change", None
+            ),
+        )
+        self.pending = weakref.ref(source), state, config_document, file_path, color_space
+
+    def commit(self, manifest, source):
+        pending, self.pending = self.pending, None
+        if (
+            pending is None
+            or manifest.get("state") != "complete"
+            or manifest.get("raw_hashes_unchanged") is not True
+            or manifest.get("inputs") != self.records
+            or manifest.get("automatic_roles") != self.records
+        ):
+            return
+        reference, state, config_document, file_path, color_space = pending
+        if reference() is not source:
+            return
+        context = render_decode_context(manifest, self.recipe, source_anchor(manifest))
+        if context is not None:
+            context.store(state, config_document, file_path, source, None, color_space)
+
+
+def render_decode_context(request, recipe, anchor, *, frozen=False):
     """Build the render cache context, or None when the anchor cannot bind.
 
     Strict anchor validation keeps new photos (no completed run yet) exactly
     on the uncached path: a wrong or partial anchor disables caching instead
     of restoring an unproven decode.
     """
-    from .raw_import import LEGACY_IMPORT
-
     if not isinstance(anchor, dict):
         return None
     shape = anchor.get("source_shape")
@@ -457,7 +556,7 @@ def render_decode_context(request, recipe, anchor):
         "source_shape": shape,
     }
     return RenderDecodeCache(
-        request["inputs"], manifest, recipe, reference
+        request["inputs"], manifest, recipe, reference, frozen=frozen
     )
 
 

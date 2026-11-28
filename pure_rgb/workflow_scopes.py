@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import math
 
 import numpy as np
-from PyQt6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, QThreadPool, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import QButtonGroup, QHBoxLayout, QLabel, QSizePolicy, QToolButton, QVBoxLayout, QWidget
 
@@ -22,6 +22,77 @@ _BINS = 256
 _BACKGROUND = (14, 17, 20)
 _CHANNELS = ((246, 91, 83), (92, 221, 135), (86, 158, 255))
 _BRIGHTNESS = (223, 230, 234)
+
+
+class PreviewScopeRefresh(QObject):
+    """Compute scopes after presenting the photo, keeping only the latest frame."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(1)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(65)
+        self.timer.timeout.connect(self._start)
+        self.pending = None
+        self.generation = 0
+        self.running = self.closed = False
+
+    def submit(self, read, present, release):
+        if self.closed:
+            release()
+            return
+        self.generation += 1
+        self._drop_pending()
+        self.pending = (read, present, release)
+        if not self.running and not self.timer.isActive():
+            self.timer.start()
+
+    def _drop_pending(self):
+        if self.pending is not None:
+            _, _, release = self.pending
+            self.pending = None
+            release()
+
+    def cancel(self):
+        self.generation += 1
+        self.timer.stop()
+        self._drop_pending()
+
+    def _start(self):
+        if self.closed or self.pending is None:
+            return
+        from .preview_ui import Work
+
+        read, present, release = self.pending
+        self.pending = None
+        self.running = True
+
+        def load():
+            try:
+                return read()
+            finally:
+                release()
+
+        def done(generation, result):
+            self.running = False
+            if self.closed:
+                return
+            if generation == self.generation and result is not None:
+                present(result)
+            if self.pending is not None:
+                self.timer.start()
+
+        work = Work(self.generation, load)
+        work.signals.done.connect(done)
+        work.signals.failed.connect(lambda generation, _message: done(generation, None))
+        self.pool.start(work)
+
+    def close(self):
+        self.closed = True
+        self.cancel()
+        self.pool.waitForDone()
 
 
 @dataclass(frozen=True)

@@ -7,12 +7,14 @@ render fallback, then takes the requested final-output rectangle.
 
 from copy import deepcopy
 import hashlib
+import os
+from pathlib import Path
 
 import numpy as np
 
-from .output_orientation import _matrix, checked_document, orient_reference, sample_oriented
+from .output_orientation import _matrix, _oriented_view, _relative_document, checked_document, sample_oriented
 from .output_orientation_cache import _color_recipe
-from .preview_data import verified_pixels
+from .preview_data import deflate_rgb_strips, verified_pixels
 from .preview_grid import post_requires_full_grid
 from .workspace import checked_recipe, output_rectangle
 
@@ -87,18 +89,80 @@ def source_rectangle_for_viewport(source_rectangle, orientation, viewport):
             int(high[0]) + sx0, int(high[1]) + sy0]
 
 
-def _identity(path):
-    from pathlib import Path
-
-    value = Path(path).stat()
+def _stat_identity(value):
     return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+
+
+def _identity(path):
+    return _stat_identity(Path(path).stat())
+
+
+def _saved_strip_tile(owner, record, identity, saved_roi, source_roi, direction, step):
+    """Read only the needed strips from an authenticated saved RGB16 TIFF."""
+    from tifffile import TiffFile
+
+    from .diagnostics import span
+
+    path = Path(record["path"])
+    a, b, c, d = saved_roi
+    x0, y0, x1, y1 = source_roi
+    if (x1 - x0) * (y1 - y0) > MAX_TILE_PIXELS:
+        return None
+    saved_direction = owner.recipe.get("output_orientation")
+    key = (path, record["sha256"], identity)
+    with path.open("rb") as stream, TiffFile(stream) as tif:
+        if _stat_identity(os.fstat(stream.fileno())) != identity:
+            raise ValueError("高清参考成片读取期间发生变化")
+        layout = deflate_rgb_strips(tif, identity[2])
+        if layout is None:
+            return None
+        shape, icc, _ = layout
+        turns = (saved_direction or {}).get("quarter_turns", 0)
+        expected_shape = (c - a, d - b, 3) if turns % 2 else (d - b, c - a, 3)
+        if shape != expected_shape:
+            raise ValueError("高清参考成片与保存网格不一致")
+        if getattr(owner, "_saved_viewport_identity", None) != key:
+            with span("verify_saved_viewport_file"):
+                stream.seek(0)
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            if digest != record["sha256"]:
+                raise ValueError("样片 TIFF 已变化，哈希核验失败")
+        viewport = dict(x=x0 - a, y=y0 - b, width=x1 - x0, height=y1 - y0,
+                        output_size=[c - a, d - b], sample_step=1)
+        inverse = _relative_document(saved_direction, None)
+        x0, y0, x1, y1 = source_rectangle_for_viewport([0, 0, shape[1], shape[0]], inverse, viewport)
+        tile = np.empty((y1 - y0, x1 - x0, 3), dtype=np.uint16)
+        page = tif.pages[0]
+        rows = page.rowsperstrip
+        decode = page.decode
+        with span("decode_saved_viewport_strips"):
+            for index in range(y0 // rows, (y1 - 1) // rows + 1):
+                start = index * rows
+                count = page.databytecounts[index]
+                stream.seek(page.dataoffsets[index])
+                data = stream.read(count)
+                if len(data) != count:
+                    raise ValueError("高清参考成片的压缩条带不完整")
+                pixels, position, _ = decode(data, index)
+                if (pixels is None or position != (0, 0, start, 0, 0)
+                        or pixels.shape != (1, min(rows, shape[0] - start), shape[1], 3)
+                        or pixels.dtype != np.uint16):
+                    raise ValueError("高清参考成片的压缩条带不完整")
+                top, bottom = max(start, y0), min(start + rows, y1)
+                tile[top - y0:bottom - y0] = pixels[0, top - start:bottom - start, x0:x1]
+        if _stat_identity(os.fstat(stream.fileno())) != identity:
+            raise ValueError("高清参考成片读取期间发生变化")
+    if _identity(path) != identity:
+        raise ValueError("高清参考成片读取期间发生变化")
+    owner._saved_viewport_identity = key
+    return sample_oriented(tile, saved_direction, direction, step), icc
 
 
 def _saved_tile(owner, recipe, mode, source_roi, step):
     """An unchanged saved color result can supply an exact viewport directly."""
-    from .draft_preview import _saved_measurement_valid
+    from .draft_preview import _saved_color_valid
 
-    if mode not in owner.manifest["results"] or not _saved_measurement_valid(owner.manifest):
+    if mode not in owner.manifest["results"] or not _saved_color_valid(owner.manifest, mode):
         return None
     old, new = _color_recipe(owner.recipe, mode), _color_recipe(recipe, mode)
     for doc in (old, new):
@@ -113,17 +177,23 @@ def _saved_tile(owner, recipe, mode, source_roi, step):
         return None
     record = owner.manifest["results"][mode]
     identity = _identity(record["path"])
-    pixels, icc = verified_pixels(record)
-    pixels = orient_reference(pixels, owner.recipe.get("output_orientation"), None)
-    if (pixels.shape[:2] != (d - b, c - a)
-            or hashlib.sha256(icc).hexdigest() != owner.manifest["icc_sha256"]
+    direction = recipe.get("output_orientation")
+    tile = _saved_strip_tile(owner, record, identity, saved_roi, source_roi, direction, step)
+    if tile is None:
+        pixels, icc = verified_pixels(record)
+        inverse = _relative_document(owner.recipe.get("output_orientation"), None)
+        pixels = _oriented_view(pixels, inverse)
+        if pixels.shape[:2] != (d - b, c - a):
+            raise ValueError("高清参考成片与保存网格不一致")
+        current = sample_oriented(pixels[y0-b:y1-b, x0-a:x1-a], None, direction, step).copy()
+    else:
+        current, icc = tile
+    if (hashlib.sha256(icc).hexdigest() != owner.manifest["icc_sha256"]
             or _identity(record["path"]) != identity):
         raise ValueError("高清参考成片与保存网格或身份不一致")
-    current = sample_oriented(pixels[y0-b:y1-b, x0-a:x1-a], None,
-                              recipe.get("output_orientation"), step)
     owner.reference_label = "已保存版本"
     owner.metering_receipt = owner._metering_receipt(owner.manifest, mode)
-    return current.copy(), current.copy(), icc
+    return current, current, icc
 
 
 def render_viewport(owner, request, recipe=None, mode=None):

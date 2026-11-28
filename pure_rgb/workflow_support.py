@@ -7,7 +7,7 @@ from PyQt6.QtGui import QDesktopServices, QPixmap
 from PyQt6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 
 from .release import DONATION_URL
-from .workflow_glass import prepare_glass, stylesheet
+from .workflow_glass import observe_appearance, prepare_glass, stylesheet
 
 
 DONORS = "nothing老庄、J3RRYK33PF1T、熊小默、基岩、一笑而过"
@@ -19,6 +19,7 @@ def donation_dialog(parent):
     prepare_glass(dialog)
     dialog.setObjectName("workflowRoot")
     dialog.setStyleSheet(stylesheet(False))
+    observe_appearance(dialog, lambda: dialog.setStyleSheet(stylesheet(False)))
     dialog.setWindowTitle("捐赠 StudioPURE 项目")
     layout = QVBoxLayout(dialog)
     layout.setContentsMargins(24, 20, 24, 18)

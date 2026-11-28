@@ -38,6 +38,8 @@ from .native_spatial_v30 import (
     LAB_FIELDS,
     LAB_RANGES,
     NativeSpatialCPU,
+    _FIRST_PRINT_EV_ENGINE,
+    _PRE_PRINT_EV_ENGINE,
     _local,
     _render_configuration,
 )
@@ -516,23 +518,31 @@ def _load_snapshot(snapshot, source, config, roi, document, source_key, highligh
         data.get("sha256") == _digest({k: v for k, v in data.items() if k != "sha256"}),
         "Spatial workflow snapshot checksum changed",
     )
+    from .film_density_domain_v45 import _FIRST_PRINT_EV_ADAPTER, _PRE_PRINT_EV_ADAPTER
+
     runtime = _runtime()
+    previous_runtime = {
+        **runtime,
+        "native_spatial_v30.py": _PRE_PRINT_EV_ENGINE,
+        "film_density_domain_v45.py": _PRE_PRINT_EV_ADAPTER,
+    }
     # Existing frozen packets use the same metering and explicit-reference format.
     previous_runtimes = [
-        {**runtime, "spatial_workflow_v31.py": digest}
+        {**previous_runtime, "spatial_workflow_v31.py": digest}
         for digest in (
             "4ea280794496a50e1daac16561ae53e5f62dcbe02b4643e4a60cc21f209c8302",
             "f6888eb0012f29858d477404da5d8d28daca7dcc58e3cd686640348d62b134bd",
             "965bd641dd471f5cff599536f7e899c8b862c35bf26d4bdd5fe1aad52cd8555c",
             "fa2cddb2e52f153c89153352640e7f9b5e9ef6a9e4653f6cdbd352de4f1892e7",
             "1ead28c792134e14e94635301daabf65bfb5e30f0805248e21340226ff68199f",
+            "601eabfa5f0b1f7ebecf8e1046f22d0a66e05e00e1d1b72ae29ab1044c9debf7",
         )
     ]
     # These exact packets predate the runtime compatibility fix. All other
     # runtime components still have to match byte-for-byte.
     previous_runtimes.extend(
         {
-            **runtime,
+            **previous_runtime,
             "spatial_workflow_v31.py": spatial_hash,
             "native_spatial_v30.py": native_hash,
         }
@@ -543,6 +553,12 @@ def _load_snapshot(snapshot, source, config, roi, document, source_key, highligh
             ("acb13c78fe25a423e49a44ee213123640638e11edd86cf4371a3aa25230a31e4", "0dddc5b5a00b0c39fd8c160afb4e17e1a54a8990d703b92140b9fff1eb9b7362"),
         )
     )
+    previous_runtimes.append({
+        **runtime,
+        "spatial_workflow_v31.py": "fe70e99a1c761ad51738534feac93f343bcd35c71e54adb53abe55e0e21caf2b",
+        "native_spatial_v30.py": _FIRST_PRINT_EV_ENGINE,
+        "film_density_domain_v45.py": _FIRST_PRINT_EV_ADAPTER,
+    })
     _require(
         data["runtime"] in [runtime, *previous_runtimes]
         and data["source_key"] == source_key
@@ -663,6 +679,7 @@ def encode_spatial_workflow(
     highlight=None,
     point=None,
     film=None,
+    print_ev=0.0,
 ):
     """Original full-source CPU -> optional guarded high/point -> SDK RGB16/ICC."""
     if film and film["strength"] != 0:
@@ -670,7 +687,7 @@ def encode_spatial_workflow(
 
         return encode_film_spatial(processor, source, config, records, roi, document,
                                   film=film, source_key=source_key, snapshot=snapshot,
-                                  highlight=highlight, point=point)
+                                  highlight=highlight, point=point, print_ev=print_ev)
     from .highlight_reference_guarded import apply_highlight_reference_guarded
     from .highlight_workflow import _merge_highlight
     from .native_float import checked_native_float
@@ -711,10 +728,14 @@ def encode_spatial_workflow(
     # Both renderers are local to this one-shot export. Retaining their full
     # intermediate stages cannot accelerate another render and multiplies the
     # peak memory needed by large scans.
-    base_result = base.render(readonly, base._meter, base._render, cache_stages=False)
+    base_result = base.render(
+        readonly, base._meter, base._render, cache_stages=False, print_ev=print_ev
+    )
     image = base_result.image
     ref_image = (
-        reference.render(readonly, reference._meter, reference._render, cache_stages=False).image
+        reference.render(
+            readonly, reference._meter, reference._render, cache_stages=False, print_ev=print_ev
+        ).image
         if reference
         else None
     )
@@ -790,4 +811,6 @@ def encode_spatial_workflow(
         snapshot_restored_without_metering=snapshot is not None,
         output_encoded_sha256=_pixels(image),
     )
+    if print_ev:
+        report["native_print_exposure"] = base_result.receipt["native_print_exposure"]
     return payload, export, report, _canonical(frozen)

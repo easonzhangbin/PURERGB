@@ -172,7 +172,7 @@ def _bounded_stage_receipt(name, before, after):
     }
 
 
-def post_linear(linear, document, *, sample_step=1):
+def post_linear(linear, document, *, sample_step=1, collect_ranges=True):
     values = checked_controls(document, POST_SPECS)["values"]
     if not values:
         return linear, {"identity": True}
@@ -247,12 +247,13 @@ def post_linear(linear, document, *, sample_step=1):
             **exposure,
         )
         context.metrics["final_bounds"] = LogNegativeBounds(*transfer_bounds())
-        before = _range_receipt(out)
+        before = _range_receipt(out) if collect_ranges else None
         density = -np.log10(np.maximum(out, np.float32(1e-30))) / TRANSFER_DENSITY_RANGE
         out = TransferProcessor(config, positive_source=True).process(density, context)
         name = "NegPy.TransferProcessor(positive_source=True)"
         stages.append(name)
-        bounded_stages.append(_bounded_stage_receipt(name, before, out))
+        if collect_ranges:
+            bounded_stages.append(_bounded_stage_receipt(name, before, out))
     if hue := values.get(HUE_SPEC.key, 0):
         import cv2
 
@@ -293,38 +294,43 @@ def post_linear(linear, document, *, sample_step=1):
             config = replace(
                 config, sharpen_radius=max(0.01, config.sharpen_radius / sample_step)
             )
-            before = _range_receipt(out)
+            before = _range_receipt(out) if collect_ranges else None
             out = apply_clahe(out, config.clahe_strength)
             out = PhotoLabProcessor(config).process(out, context)
             name = "NegPy.CLAHE+PhotoLabProcessor"
             stages.append(name)
-            bounded_stages.append(_bounded_stage_receipt(name, before, out))
+            if collect_ranges:
+                bounded_stages.append(_bounded_stage_receipt(name, before, out))
         else:
             skipped_groups.append("lab: all effect strengths neutral")
     toning = section("toning")
     if toning:
         out = np.ascontiguousarray(out, dtype=np.float32)
         config = ToningConfig(**toning)
-        before = _range_receipt(out)
+        bounded = collect_ranges and (config.shadow_tint_strength > 0 or config.highlight_tint_strength > 0)
+        before = _range_receipt(out) if bounded else None
         out = ToningProcessor(config).process(out, context)
         name = "NegPy.ToningProcessor(split)"
         stages.append(name)
-        if config.shadow_tint_strength > 0 or config.highlight_tint_strength > 0:
+        if bounded:
             bounded_stages.append(_bounded_stage_receipt(name, before, out))
     finish = section("finish")
     if finish:
         out = np.ascontiguousarray(out, dtype=np.float32)
         config = FinishConfig(**finish)
-        before = _range_receipt(out)
+        bounded = collect_ranges and config.vignette_stops != 0
+        before = _range_receipt(out) if bounded else None
         out = FinishProcessor(config).process(out, context)
         name = "NegPy.FinishProcessor"
         stages.append(name)
-        if config.vignette_stops != 0:
+        if bounded:
             bounded_stages.append(_bounded_stage_receipt(name, before, out))
     if not np.isfinite(out).all():
         raise ValueError("公共后期出现非有限结果")
     if not stages:
         out = linear
+    if not collect_ranges:
+        return out, {"identity": not stages, "stages": stages}
     return out, {
         "identity": not stages,
         "version": 2,
@@ -341,18 +347,19 @@ def post_linear(linear, document, *, sample_step=1):
     }
 
 
-def post_codes(pixels, document=None, *, sample_step=1):
+def post_codes(pixels, document=None, *, sample_step=1, collect_ranges=True):
     if not document or not checked_controls(document, POST_SPECS)["values"]:
         return pixels, {"identity": True}
     linear = (pixels.astype(np.float32) / 65535) ** GAMMA
-    out, metadata = post_linear(linear, document, sample_step=sample_step)
+    out, metadata = post_linear(linear, document, sample_step=sample_step, collect_ranges=collect_ranges)
     from .editing_render import encode_positive_rows
 
-    metadata["RGB16_encoding"] = {
-        "input_was_already_quantized_RGB16": True,
-        "linear_clamp_bounds": [0.0, 1.0],
-        "lower_truncated_fraction_rgb": (out < 0).mean(axis=(0, 1)).tolist(),
-        "upper_truncated_fraction_rgb": (out > 1).mean(axis=(0, 1)).tolist(),
-        "scope": "Exact final encoder clamp only; earlier original-processor clipping remains unmeasured",
-    }
+    if collect_ranges:
+        metadata["RGB16_encoding"] = {
+            "input_was_already_quantized_RGB16": True,
+            "linear_clamp_bounds": [0.0, 1.0],
+            "lower_truncated_fraction_rgb": (out < 0).mean(axis=(0, 1)).tolist(),
+            "upper_truncated_fraction_rgb": (out > 1).mean(axis=(0, 1)).tolist(),
+            "scope": "Exact final encoder clamp only; earlier original-processor clipping remains unmeasured",
+        }
     return encode_positive_rows(np.maximum(out, 0)), metadata

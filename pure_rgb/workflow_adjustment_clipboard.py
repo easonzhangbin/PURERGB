@@ -6,6 +6,7 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QLabel, QVBoxLayout
 
+from .native_headroom import HEADROOM_CONTROL, HEADROOM_STRENGTH, headroom_selected, native_headroom_strength
 from .native_spatial_v30 import LAB_FIELDS
 from .positive_post import POST_SPECS
 from .professional_controls import NATIVE_SPECS
@@ -20,11 +21,12 @@ GROUPS = {
     "details": ("色度、锐化、降噪与暗角", True),
     "paper": ("印相相纸与胶片配置", True),
     "engine": ("当前引擎专用调整", True),
-    "highlight": ("高光找回参数（保留目标选区）", False),
+    "highlight": ("高光找回", False),
     "orientation": ("输出旋转与翻转", False),
     "crop": ("输出裁切（按画幅比例）", False),
     "geometry": ("拉直、透视与后期几何", False),
 }
+_HEADROOM_FIELDS = (HEADROOM_CONTROL, HEADROOM_STRENGTH)
 
 
 def copy_adjustments(project, photo):
@@ -49,11 +51,14 @@ def available_groups(source, photo, engine):
     if same_native:
         result.add("paper")
         target = photo["drafts"][engine]
-        origin_high = (source["recipe"].get("highlight_controls")
-                       or source.get("suspended_highlight_controls"))
-        if (not origin_high or target.get("highlight_controls")
-                or photo.get("suspended_highlight_controls")
-                or target.get("roi") or photo.get("analysis_roi")):
+        origin = source["recipe"]
+        origin_high = origin.get("highlight_controls") or source.get("suspended_highlight_controls")
+        if _has_density_headroom(origin):
+            if rgb and target.get("measurement_method") == "negpy":
+                result.add("highlight")
+        elif (not origin_high or target.get("highlight_controls")
+              or photo.get("suspended_highlight_controls")
+              or target.get("roi") or photo.get("analysis_roi")):
             result.add("highlight")
     if same_mode and source["engine"] == engine:
         origin = source["recipe"]
@@ -68,6 +73,10 @@ def available_groups(source, photo, engine):
     if not source["recipe"].get("output_roi") or (source["shape"] and photo.get("source_shape")):
         result.add("crop")
     return result
+
+
+def _has_density_headroom(recipe):
+    return recipe.get("measurement_method") == "negpy" and headroom_selected(recipe)
 
 
 def _fields(target, source, keys):
@@ -158,7 +167,8 @@ def merged_adjustments(source, photo, engine, target, groups):
                      [spec.key for spec in POST_SPECS if spec.group in post_categories],
                      source_mode, target_mode)
     native_keys = [spec.key for spec in NATIVE_SPECS
-                   if spec.group in native_categories and spec.key != "exposure.paper_profile"]
+                   if spec.group in native_categories and spec.key != "exposure.paper_profile"
+                   and spec.key not in _HEADROOM_FIELDS]
     if target.get("native_spatial_controls") or target.get("bw_metering"):
         blocked = {"exposure.contrast_mask_strength", "exposure.diffusion", "lab.sharpen_auto_masking"}
         native_keys = [key for key in native_keys if key not in blocked]
@@ -185,7 +195,15 @@ def merged_adjustments(source, photo, engine, target, groups):
 
 def _copy_highlight_adjustments(target, source, photo):
     """Copy controls while retaining the target photo's source-coordinate shapes."""
-    source_high = source["recipe"].get("highlight_controls")
+    origin = source["recipe"]
+    if _has_density_headroom(origin):
+        values = _values(target, "native_controls", create=True)
+        values.pop(HEADROOM_CONTROL, None)
+        values[HEADROOM_STRENGTH] = native_headroom_strength(origin)
+        return
+    if target.get("measurement_method") == "negpy":
+        _fields(_values(target, "native_controls"), {}, _HEADROOM_FIELDS)
+    source_high = origin.get("highlight_controls")
     source_settings = source_high or source.get("suspended_highlight_controls")
     target_high = deepcopy(target.get("highlight_controls")
                            or photo.get("suspended_highlight_controls"))

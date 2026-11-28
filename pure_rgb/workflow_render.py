@@ -1,5 +1,6 @@
 """Subprocess RAW renderer using the existing tested Native/cool/Flex adapters."""
 
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 import hashlib
 import io
@@ -30,13 +31,17 @@ from .engines import check_reference_sources
 from .editing_render import experimental_positive
 from .flatfield import attach_calibration
 from .diagnostics import event, span
-from .decoded_cache import render_decode_context
+from .decoded_cache import ImportDecodeCache, render_decode_context
 from .positive_post import post_codes
 from .film_profiles import native_film_context
-from .native import native_export, open_triplet, sha256
+from .native import native_export, native_export_settings, open_triplet, sha256
+from .native_headroom import (
+    native_headroom_active, native_headroom_engine, native_headroom_strength, native_local_highlight,
+    print_exposure_receipt,
+)
 from .picture import NoReliablePictureRectangle, detect_picture_from_locators
 from .preview_data import MODES
-from .professional_controls import native_config, output_codes
+from .professional_controls import native_config, native_print_ev, output_codes
 from .rgb_curve_study import fit_shared_curve
 from .study import preview, read_rgb
 from .tone_study import GAMMA
@@ -59,7 +64,15 @@ def exposure_codes(pixels, ev):
     )
 
 
-def _study_picture_region(source, roi, locators, *, automatic_import=False):
+def _study_picture_region(source, roi, locators, *, automatic_import=False, frame_roi=None):
+    if roi is None and frame_roi is not None:
+        from .picture import AUTO_PICTURE_INSET, metering_region_from_frame
+
+        return dict(method="Confirmed output frame",
+            analysis_roi=metering_region_from_frame(frame_roi, source.shape),
+            detected_picture_roi=list(frame_roi), inset_per_side=AUTO_PICTURE_INSET,
+            coordinate_space="EXIF-oriented merged linear source; half-open xyxy",
+            confidence="confirmed frame", limitations="Confirmed frame used for measurement")
     try:
         return study_region(source, roi)
     except NoReliablePictureRectangle:
@@ -117,23 +130,40 @@ def _export_source_key(processor, config, records):
 
 
 def _native_highlight_export(
-    processor, config, records, source, export, document, point=None
+    processor, config, records, source, export, document, point=None, *, film=None, print_ev=0.0,
 ):
     from .highlight_workflow import render_highlight_workflow
 
-    result = render_highlight_workflow(
-        processor,
-        records[0]["path"],
-        source,
-        config,
-        export,
-        _export_source_key(processor, config, records),
-        document,
-        native_float_controls=point,
-    )
+    adapter = native_headroom_engine(processor, strength=0, print_ev=print_ev) if print_ev else nullcontext()
+    with adapter:
+        result = render_highlight_workflow(
+            processor,
+            records[0]["path"],
+            source,
+            config,
+            export,
+            _export_source_key(processor, config, records),
+            document,
+            native_float_controls=point,
+            film=film,
+        )
     if result is None:
         raise ValueError("活动高光路由不可收到关闭参数")
     return result
+
+
+def _native_headroom_export(processor, config, records, export, point=None, *, strength=1.0, print_ev=0.0):
+    with native_headroom_engine(processor, strength=strength, print_ev=print_ev) as mapping:
+        if point:
+            payload, float_info = _native_float_export(
+                processor, config, records, export or native_export_settings(config), point,
+            )
+        else:
+            payload, _ = native_export(processor, config, records)
+            float_info = None
+    if mapping.receipt is None:
+        raise ValueError("负片动态范围映射未取得印相前的密度信号")
+    return payload, mapping.receipt, float_info
 
 
 def _cool_headroom_export(
@@ -263,13 +293,16 @@ def render(request, *, emit_callback=None, prepared_source=None):
     }
     processor = None
     preconfigured_flatfield = None
-    # A render starts a new run with no manifest, so decoded-cache traffic is
-    # only valid against a prior completed run's import receipt (the anchor).
     decode_context = (
         render_decode_context(request, recipe, request.get("decode_anchor"))
         if prepared_source is None
         else None
     )
+    import_cache = None
+    if (decode_context is None and prepared_source is None
+            and request.get("auto_import") is True and not request.get("transient_preview")):
+        import_cache = ImportDecodeCache(request, recipe)
+        decode_context = import_cache
 
     def configure_standard_source(candidate, initial_config, automatic_records):
         nonlocal preconfigured_flatfield
@@ -418,7 +451,8 @@ def render(request, *, emit_callback=None, prepared_source=None):
 
             locators = write_geometry_previews(source, out)
         region = _study_picture_region(source, recipe["roi"], locators,
-                                       automatic_import=bool(request.get("auto_import")))
+                                       automatic_import=bool(request.get("auto_import")),
+                                       frame_roi=recipe.get("output_roi") if recipe.get("crop") else None)
         roi = region["analysis_roi"]
         x0, y0, x1, y1 = roi
         output_roi = output_rectangle(recipe, roi, source.shape)
@@ -445,7 +479,9 @@ def render(request, *, emit_callback=None, prepared_source=None):
                 )
         native_overrides = recipe.get("native_controls")
         float_controls = recipe.get("native_float_controls")
-        highlight_controls = recipe.get("highlight_controls")
+        headroom = native_headroom_active(recipe)
+        print_ev = native_print_ev(recipe)
+        highlight_controls = native_local_highlight(recipe)
         spatial_controls = recipe.get("native_spatial_controls")
         # These Native-only renders produce their own RGB16, export tags and
         # pinned working ICC. Float/highlight need the neutral export settings,
@@ -455,7 +491,7 @@ def render(request, *, emit_callback=None, prepared_source=None):
         ))
         skip_neutral_native = (
             only_mode == "native"
-            and (bool(spatial_controls) or bool(ordinary_native_edits))
+            and (headroom or (print_ev and not highlight_controls) or bool(spatial_controls) or bool(ordinary_native_edits))
             and not recipe.get("density_metering")
             and not recipe.get("nikon_research_controls")
         )
@@ -515,6 +551,7 @@ def render(request, *, emit_callback=None, prepared_source=None):
         # Native-only creative controls. The original export above is immutable.
         float_info = None
         highlight_info = None
+        headroom_info = None
         with span("native_film_context"):
             film_config, film_receipt = native_film_context(
                 frozen, source, roi, recipe["density"], recipe.get("native_film")
@@ -555,9 +592,23 @@ def render(request, *, emit_callback=None, prepared_source=None):
                     highlight=highlight_controls,
                     point=float_controls,
                     film=recipe.get("native_film"),
+                    print_ev=print_ev,
                 )
                 report["native_spatial_processing"] = spatial_info
                 report["native_spatial_snapshot"] = spatial_snapshot
+            elif headroom or (print_ev and not highlight_controls):
+                emit_event(type="progress", fraction=0.35, message="正在映射负片动态范围并生成正像…")
+                payload, headroom_info, float_info = _native_headroom_export(
+                    processor, adjusted, records, export, float_controls,
+                    strength=native_headroom_strength(recipe) if headroom else 0,
+                    print_ev=print_ev,
+                )
+                if headroom:
+                    report["native_headroom_processing"] = headroom_info
+                else:
+                    headroom_info = None
+                if float_info is not None:
+                    report["native_float_processing"] = float_info
             elif highlight_controls:
                 emit_event(type="progress", fraction=0.35, message="正在渲染与合成高光找回…")
                 payload, highlight_info = _native_highlight_export(
@@ -568,6 +619,8 @@ def render(request, *, emit_callback=None, prepared_source=None):
                     export,
                     highlight_controls,
                     float_controls,
+                    film=recipe.get("native_film"),
+                    print_ev=print_ev,
                 )
                 float_info = (
                     highlight_info.get("native_float_processing")
@@ -600,6 +653,8 @@ def render(request, *, emit_callback=None, prepared_source=None):
                 raise ValueError("Native 控件渲染的 ICC 与参考不一致")
             report["native_reference_config"] = report["native_config"]
             report["native_config"] = adjusted.to_dict()
+            if print_ev:
+                report["native_print_exposure_processing"] = print_exposure_receipt(print_ev)
             report["reference_policy"] = (
                 "v4: Native film, creative, float and highlight controls excluded from experimental fitting"
                 if highlight_controls
@@ -699,10 +754,15 @@ def render(request, *, emit_callback=None, prepared_source=None):
                 "native",
                 native,
                 {
-                    "kind": "Native PRINT with explicit positive float point controls"
+                    "kind": "NegPy PRINT with density-driven highlight roll-off"
+                    if headroom else "NegPy PRINT with luminance-only print exposure"
+                    if print_ev else "Native PRINT with explicit positive float point controls"
                     if float_controls
                     else "NegPy unchanged renderer",
                     "native_controls": native_overrides,
+                    **({"native_headroom_processing": headroom_info} if headroom_info else {}),
+                    **({"native_print_exposure_processing": report["native_print_exposure_processing"]}
+                       if print_ev else {}),
                     **(
                         {
                             "native_float_controls": float_controls,
@@ -859,6 +919,8 @@ def render(request, *, emit_callback=None, prepared_source=None):
                 and prepared_source is None):
             processor.cleanup()
             processor.destroy_all()
+    if import_cache is not None:
+        import_cache.commit(report, source)
     emit_event(type="result", directory=str(out))
     return report
 

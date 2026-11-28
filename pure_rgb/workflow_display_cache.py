@@ -6,10 +6,12 @@ This does not open RAW sources, change saved images, or bound render memory.
 
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import lru_cache
 import hashlib
 import math
 from pathlib import Path
 import re
+import sys
 import threading
 
 import numpy as np
@@ -17,8 +19,9 @@ from PIL import Image
 from PyQt6.QtGui import QColorSpace, QImage
 
 from .preview_data import verified_pixels
+from .preview_fit_transport import FIT_TRANSPORT, read_fit_record
 from .workflow_display import named_reference_profile, profile_description
-from .workflow_color_parallel import transform_rgb_image
+from .workflow_color_parallel import transform_packed_rgb, transform_rgb_image
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,8 @@ class _SourceEntry:
 
 _MAX_SOURCE_ITEM_BYTES = 32 * 1024**2
 _DISPLAY_CODE_CHUNK_ELEMENTS = 2_000_000
+_RGB16_TO_RGB8 = ((np.arange(65536, dtype=np.uint32) + 128) // 257).astype(np.uint8)
+_RGB16_TO_RGB8.setflags(write=False)
 
 
 def _scope_data(pixels, orientation):
@@ -116,6 +121,51 @@ def _converted_image(pixels, source_icc, target, proof, full, max_edge, workers=
     return result
 
 
+@lru_cache(maxsize=12)
+def _qt_display_color_space(icc):
+    profile_description(icc)
+    space = QColorSpace.fromIccProfile(icc)
+    if not space.isValid():
+        raise ValueError("Qt无法标记实际显示ICC")
+    return space
+
+
+@lru_cache(maxsize=12)
+def _validate_source_profile(icc):
+    profile_description(icc)
+
+
+def _interactive_converted_image(pixels, source_icc, target, proof, workers):
+    """Convert a bounded grid directly into the canvas's opaque RGB32 raster."""
+    if sys.byteorder == "little":
+        _validate_source_profile(source_icc)
+        target_space = _qt_display_color_space(target.icc)
+        try:
+            from negpy_core import lut_u16
+        except ImportError:
+            codes = _display_codes(pixels)
+        else:
+            codes = lut_u16(np.ascontiguousarray(pixels), _RGB16_TO_RGB8)
+        packed_icc = source_icc
+        if proof != "off":
+            reference = named_reference_profile(proof)
+            bounded = np.empty_like(codes)
+            if not transform_packed_rgb(codes, bounded, source_icc, reference, workers=workers):
+                return _converted_image(pixels, source_icc, target, proof, True, 2048, workers)
+            codes, packed_icc = bounded, reference
+        height, width = codes.shape[:2]
+        image = QImage(width, height, QImage.Format.Format_RGB32)
+        if not image.isNull() and image.bytesPerLine() == width * 4:
+            image.fill(0xff000000)
+            address = image.bits()
+            address.setsize(image.sizeInBytes())
+            output = np.frombuffer(address, dtype=np.uint8).reshape(height, width, 4)
+            if transform_packed_rgb(codes, output, packed_icc, target.icc, workers=workers):
+                image.setColorSpace(target_space)
+                return image
+    return _converted_image(pixels, source_icc, target, proof, True, 2048, workers)
+
+
 class DisplayImageCache:
     """Thread-safe LRU for foreground or idle conversion of saved TIFF records.
 
@@ -133,6 +183,7 @@ class DisplayImageCache:
         self._recency = OrderedDict()
         self._bytes = self._hits = self._misses = self._conversions = 0
         self._source_bytes = self._source_hits = self._source_misses = self._verifications = 0
+        self._settle_image = None
         self._epoch = 0
         self._budget = 0
         self.set_workers(workers)
@@ -152,7 +203,9 @@ class DisplayImageCache:
             self._evict()
 
     def _evict(self):
-        while self._recency and self._bytes + self._source_bytes > self._budget:
+        if self._settle_image is not None and self._settle_bytes > self._budget // 8:
+            self._settle_image = None
+        while self._recency and self._bytes + self._source_bytes + self._settle_bytes > self._budget:
             (kind, key), _ = self._recency.popitem(last=False)
             entries = self._entries if kind == "image" else self._sources
             removed = entries.pop(key, None)
@@ -161,6 +214,10 @@ class DisplayImageCache:
                     self._bytes -= removed.size_bytes
                 else:
                     self._source_bytes -= removed.size_bytes
+
+    @property
+    def _settle_bytes(self):
+        return self._settle_image[1].sizeInBytes() if self._settle_image is not None else 0
 
     def _touch(self, kind, key):
         self._recency[(kind, key)] = None
@@ -188,15 +245,17 @@ class DisplayImageCache:
             self._recency.clear()
             self._bytes = 0
             self._source_bytes = 0
+            self._settle_image = None
             self._epoch += 1
 
     def stats(self):
         with self._lock:
             return dict(
                 entries=len(self._entries),
-                bytes=self._bytes + self._source_bytes,
+                bytes=self._bytes + self._source_bytes + self._settle_bytes,
                 image_bytes=self._bytes,
                 source_bytes=self._source_bytes,
+                settle_image_bytes=self._settle_bytes,
                 source_entries=len(self._sources),
                 source_hits=self._source_hits,
                 source_misses=self._source_misses,
@@ -206,6 +265,45 @@ class DisplayImageCache:
                 misses=self._misses,
                 conversions=self._conversions,
             )
+
+    def _recently_verified_image(self, key):
+        if self._settle_image is not None and self._settle_image[0] == key:
+            return QImage(self._settle_image[1])
+        return None
+
+    def get_interactive_image(self, record, target, proof="off", *, reuse_for_settle=False):
+        """Authenticate a held frame and optionally retain its final-size display image."""
+        if proof not in {"off", "srgb", "adobe-rgb", "display-p3"}:
+            raise ValueError("未知软打样色域")
+        digest = record.get("sha256")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("样片SHA256无效")
+        path = Path(record["path"]).resolve(strict=True)
+        packet = {**record, "path": str(path)}
+        fit_record = record.get("transport") == FIT_TRANSPORT
+        reuse_for_settle = reuse_for_settle and fit_record
+        read_pixels = read_fit_record if fit_record else verified_pixels
+        settle_key = (digest, target.icc, target.signature, proof)
+        with self._lock:
+            workers, epoch = self._workers, self._epoch
+        for _ in range(3):
+            identity = _file_identity(path)
+            pixels, icc = read_pixels(packet)
+            if _file_identity(path) == identity:
+                image = None
+                if reuse_for_settle:
+                    with self._lock:
+                        image = self._recently_verified_image(settle_key)
+                if image is None:
+                    image = _interactive_converted_image(pixels, icc, target, proof, workers)
+                if _file_identity(path) == identity:
+                    if reuse_for_settle:
+                        with self._lock:
+                            if epoch == self._epoch and image.sizeInBytes() <= self._budget // 8:
+                                self._settle_image = (settle_key, QImage(image))
+                                self._evict()
+                    return image
+        raise ValueError("样片在显示读取期间持续变化，请重试预览")
 
     def get_image(
         self, record, target, proof="off", full=True, max_edge=2048, sample_step=1,
@@ -261,9 +359,17 @@ class DisplayImageCache:
             scope_direction,
         )
         cached_image = None
+        fit_record = record.get("transport") == FIT_TRANSPORT
+        if fit_record:
+            # A retained fit image is reusable across tokens, but every new
+            # file still has to authenticate its RGB16 + ICC payload first.
+            key = (FIT_TRANSPORT, digest, None, *key[3:])
         with self._lock:
+            source_key = (str(path), digest, identity, source_step, scope_direction)
+            source = self._sources.get(source_key)
             entry = self._entries.get(key)
-            if entry is not None and _file_identity(path) == identity:
+            if (entry is not None and (not fit_record or source is not None)
+                    and _file_identity(path) == identity):
                 self._entries.move_to_end(key)
                 self._touch("image", key)
                 if not include_scopes or entry.scope_data is not None:
@@ -273,8 +379,6 @@ class DisplayImageCache:
             self._misses += 1
             epoch = self._epoch
             workers = self._workers
-            source_key = (str(path), digest, identity, source_step, scope_direction)
-            source = self._sources.get(source_key)
             if (source is not None and _file_identity(path) == identity
                     and (not include_scopes or source.scope_data is not None or source_step == 1)):
                 self._source_hits += 1
@@ -290,19 +394,36 @@ class DisplayImageCache:
             if source is None:
                 with self._lock:
                     self._verifications += 1
-                pixels, source_icc = verified_pixels({**record, "path": str(path)})
+                read_pixels = read_fit_record if fit_record else verified_pixels
+                pixels, source_icc = read_pixels({**record, "path": str(path)})
             else:
                 pixels, source_icc = source.pixels, source.icc
             after_read = _file_identity(path)
             if after_read == identity:
                 scopes = source.scope_data if source is not None else None
+                if fit_record and cached_image is None:
+                    with self._lock:
+                        entry = self._entries.get(key)
+                        if entry is not None:
+                            cached_image = QImage(entry.image)
+                            if scopes is None:
+                                scopes = entry.scope_data
+                        elif source_step == 1 and (full or max(pixels.shape[:2]) <= max_edge):
+                            # The settled packet has been authenticated on its
+                            # own filesystem identity. The same digest includes
+                            # every pixel and the embedded source ICC profile.
+                            cached_image = self._recently_verified_image(
+                                (digest, target.icc, target.signature, proof)
+                            )
                 if include_scopes and scopes is None:
                     scopes = _scope_data(pixels, scope_orientation)
                 grid = pixels if source is not None else pixels[::source_step, ::source_step]
-                image = cached_image if cached_image is not None else _converted_image(
-                    grid, source_icc, target,
-                    proof, full, max_edge, workers,
-                )
+                if cached_image is not None:
+                    image = cached_image
+                elif fit_record and (full or max(grid.shape[:2]) <= max_edge):
+                    image = _interactive_converted_image(grid, source_icc, target, proof, workers)
+                else:
+                    image = _converted_image(grid, source_icc, target, proof, full, max_edge, workers)
                 after_read = _file_identity(path)
                 if after_read == identity:
                     break
@@ -313,7 +434,8 @@ class DisplayImageCache:
             source, cached_image = None, None
         else:
             raise ValueError("样片在显示读取期间持续变化，请重试预览")
-        key = (*key[:2], identity, *key[3:])
+        if not fit_record:
+            key = (*key[:2], identity, *key[3:])
         scope_bytes = scopes.nbytes if scopes is not None else 0
         entry = _Entry(image, hashlib.sha256(source_icc).hexdigest(),
                        int(image.sizeInBytes()) + scope_bytes, scopes)
@@ -326,7 +448,8 @@ class DisplayImageCache:
             source_size = grid.nbytes + len(source_icc) + scope_bytes
             if source_size <= min(_MAX_SOURCE_ITEM_BYTES, self._budget // 2):
                 if source is None:
-                    owned = np.frombuffer(grid.tobytes(), dtype=np.uint16).reshape(grid.shape)
+                    owned = (grid if fit_record and source_step == 1
+                             else np.frombuffer(grid.tobytes(), dtype=np.uint16).reshape(grid.shape))
                     source = _SourceEntry(owned, bytes(source_icc), scopes)
                 elif scopes is not source.scope_data:
                     source = _SourceEntry(source.pixels, source.icc, scopes)

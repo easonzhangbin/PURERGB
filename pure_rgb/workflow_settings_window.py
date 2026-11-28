@@ -18,9 +18,11 @@ from .release import (
     APP_VERSION, OPERATING_MANUAL_PATH, OPERATING_MANUAL_URL, RELEASES_URL,
     check_newer_release,
 )
+from .workflow_border_beam import attach_theme_beam
 from .workflow_branding import header_logo
 from .workflow_glass import (
-    WORKSPACE_INSET, WORKSPACE_GAP, attach_glass, detach_glass, prepare_glass, stylesheet,
+    WORKSPACE_INSET, WORKSPACE_GAP, apply_solid_window_chrome, attach_glass, detach_glass,
+    obsidian_enabled, observe_appearance, prepare_glass, stylesheet,
 )
 from .workflow_materials import attach_materials
 from .workflow_settings_ui import SettingsPanel
@@ -76,6 +78,7 @@ class SettingsWindow(QWidget):
         title.setObjectName("settingsTitle")
         row.addWidget(title)
         outer.addWidget(header)
+        self.header_beam = attach_theme_beam(header)
 
         body = QFrame()
         body.setObjectName("glassPanel")
@@ -111,6 +114,7 @@ class SettingsWindow(QWidget):
         if application is not None:
             application.aboutToQuit.connect(self.dispose)
             application.styleHints().colorSchemeChanged.connect(self._system_appearance_changed)
+            observe_appearance(self, self._theme_preset_changed)
         if parent is not None:
             parent.destroyed.connect(self.dispose)
 
@@ -136,6 +140,7 @@ class SettingsWindow(QWidget):
         prepare_glass(dialog)
         dialog.setObjectName("workflowRoot")
         dialog.setStyleSheet(stylesheet(False))
+        observe_appearance(dialog, lambda: dialog.setStyleSheet(stylesheet(False)))
         dialog.setWindowTitle("PURE RGB · 使用指南")
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.resize(760, 680)
@@ -213,6 +218,15 @@ class SettingsWindow(QWidget):
     def _system_appearance_changed(self, *_):
         self._apply_style(self._surface_installed and self.glass_report["attached"])
 
+    def _theme_preset_changed(self):
+        if self.closing or self.disposed:
+            return
+        self._release_native()
+        if self.isVisible():
+            self._install_materials()
+        else:
+            self._apply_style(False)
+
     def _position_initially(self):
         if self._positioned:
             return
@@ -246,7 +260,11 @@ class SettingsWindow(QWidget):
     def _install_materials(self):
         if self.closing or self.disposed or not self.isVisible() or self._surface_installed:
             return
-        self.glass_report = attach_glass(self, base="under", veil=None)
+        if obsidian_enabled():
+            chrome = apply_solid_window_chrome(self)
+            self.glass_report = dict(mode="obsidian", attached=False, chrome=chrome)
+        else:
+            self.glass_report = attach_glass(self, base="under", veil=None)
         self._apply_style(self.glass_report["attached"])
         if self.glass_report["attached"]:
             self.glass_report["controls"] = attach_materials(self)

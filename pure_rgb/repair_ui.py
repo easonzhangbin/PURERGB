@@ -44,7 +44,11 @@ from .branding import pureneg_powered_label, pureneg_wordmark_label
 from .native import sha256
 from .preview_ui import Canvas, Work, display_image
 from .tasks import Tasks
-from .workflow_glass import GlassMessageBox, NATIVE_SLIDER_QSS, system_dark
+from .workflow_border_beam import attach_theme_beam
+from .workflow_glass import (
+    GlassMessageBox, NATIVE_SLIDER_QSS, obsidian_enabled, observe_appearance, prepare_glass,
+    system_dark,
+)
 from .workflow_attention import AttentionButton
 from .workflow_indicators import CheckIndicatorDelegate, ReviewCheckBox
 from .workflow_scroll import WorkflowScrollArea
@@ -137,6 +141,24 @@ QLabel#reviewSectionIndex, QLabel#reviewHint, QLabel#reviewLegend,
 QLabel#reviewRowTitle, QLabel#reviewPowered, QLabel#reviewMessage { color:#514c46; }
 QLabel#reviewCounts, QLabel#reviewValue { color:#8c420d; }
 QPushButton:disabled, QCheckBox:disabled { color:#74716f; }
+"""
+
+REVIEW_OBSIDIAN_QSS = """
+QDialog { background:#0b0b0c; }
+QFrame#reviewToolbar, QFrame#reviewSidebar {
+    background:#141517; border-color:#34363c;
+}
+QFrame#photoWell { border-color:#34363c; }
+QFrame#reviewSeparator { background:#34363c; }
+QLabel#reviewSectionIndex, QLabel#reviewHint, QLabel#reviewLegend,
+QLabel#reviewRowTitle, QLabel#reviewPowered, QLabel#reviewMessage { color:#b1b4bb; }
+QPushButton { background:#1e2024; border-color:#34363c; }
+QPushButton:hover { background:#292c31; border-color:#666a75; }
+QPushButton:disabled, QPushButton#reviewPrimary:disabled { background:#1a1c20; }
+QListWidget#reviewRegions { background:#1a1c20; border-color:#34363c; }
+QListWidget#reviewRegions::item:selected { background:#493221; }
+QSlider::groove:horizontal { background:#34363c; }
+QSlider::handle:horizontal { border-color:#666a75; }
 """
 
 
@@ -508,8 +530,6 @@ class RepairPreparingDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        from .workflow_glass import prepare_glass
-
         prepare_glass(self)
         self.setWindowTitle("PURE RGB · PURE Neg 除尘")
         self.setModal(True)
@@ -518,7 +538,9 @@ class RepairPreparingDialog(QDialog):
         outer.setContentsMargins(28, 26, 28, 24)
         outer.setSpacing(14)
 
-        heading = QHBoxLayout()
+        self.header = QFrame()
+        self.header.setObjectName("reviewPreparingHeader")
+        heading = QHBoxLayout(self.header)
         heading.setSpacing(12)
         try:
             heading.addWidget(pureneg_wordmark_label(26))
@@ -528,7 +550,8 @@ class RepairPreparingDialog(QDialog):
         self.title.setObjectName("section")
         heading.addWidget(self.title)
         heading.addStretch()
-        outer.addLayout(heading)
+        outer.addWidget(self.header)
+        attach_theme_beam(self.header)
         self.message = NoticeLabel("正在准备完整版本并检测尘点、划痕与纤维…")
         self.message.setWordWrap(True)
         outer.addWidget(self.message)
@@ -559,6 +582,18 @@ class RepairPreparingDialog(QDialog):
         row.addWidget(self.close_button)
         outer.addLayout(row)
         self._failed = False
+        observe_appearance(self, self._apply_theme)
+        self._apply_theme()
+
+    def _apply_theme(self):
+        obsidian = obsidian_enabled()
+        self.header.layout().setContentsMargins(*(12, 8, 12, 8) if obsidian else (0, 0, 0, 0))
+        self.header.setStyleSheet(
+            "QFrame#reviewPreparingHeader {"
+            "background:#141517; border:1px solid #34363c; border-radius:12px;}"
+            if obsidian else ""
+        )
+        self.update()
 
     def _request_cancel(self):
         self.cancel_button.setEnabled(False)
@@ -661,20 +696,25 @@ class SegmentedRow(QWidget):
             self._buttons.append(control)
         self._apply_palette()
         QApplication.styleHints().colorSchemeChanged.connect(self._apply_palette)
+        observe_appearance(self, self._apply_palette)
         self.setCurrentIndex(
             self._data.index(initial) if initial in self._data else 0
         )
 
     def _apply_palette(self, *_):
+        obsidian = obsidian_enabled()
         text, active = (SECONDARY, AMBER) if system_dark() else ("#4c4845", "#8c420d")
+        background = "#1a1c20" if obsidian else "rgba(255,255,255,18)"
+        hover = "#292c31" if obsidian else "rgba(255,255,255,24)"
+        selection = "#493221" if obsidian else "rgba(240,160,85,36)"
         self.setStyleSheet(
             f"""
-            QWidget#repairSegmentedRow {{background:rgba(255,255,255,18);
+            QWidget#repairSegmentedRow {{background:{background};
                 border-radius:11px;}}
             QToolButton {{font-size:12px;border:0;border-radius:8px;padding:0 10px;
                 color:{text};background:transparent;}}
-            QToolButton:hover {{background:rgba(255,255,255,24);}}
-            QToolButton:checked {{color:{active};background:rgba(240,160,85,36);}}
+            QToolButton:hover {{background:{hover};}}
+            QToolButton:checked {{color:{active};background:{selection};}}
             QToolButton:disabled {{color:rgba(196,196,196,100);}}
             QToolButton[nativeMaterial="true"] {{background:transparent;}}
             QToolButton[nativeMaterial="true"]:checked:enabled {{color:{LIGHT};}}
@@ -770,8 +810,6 @@ class RepairDialog(QDialog):
     def __init__(self, receipt_path, requests, parent):
         super().__init__(parent, Qt.WindowType.Window)
         self.setModal(True)
-        from .workflow_glass import prepare_glass
-
         prepare_glass(self)
         self.path = Path(receipt_path)
         self.receipt = json.loads(self.path.read_text())
@@ -794,6 +832,7 @@ class RepairDialog(QDialog):
         self.setMinimumSize(980, 655)
         self._apply_system_palette()
         QApplication.styleHints().colorSchemeChanged.connect(self._apply_system_palette)
+        observe_appearance(self, self._apply_system_palette)
         self.tasks = Tasks(requests, self)
         self.tasks.done.connect(self.finished_task)
         self.tasks.failed.connect(self.failed_task)
@@ -846,6 +885,7 @@ class RepairDialog(QDialog):
         self.zoom.setMinimumWidth(48)
         bar.addWidget(self.zoom)
         outer.addWidget(toolbar)
+        attach_theme_beam(toolbar)
 
         body = QHBoxLayout()
         body.setSpacing(12)
@@ -1110,7 +1150,12 @@ class RepairDialog(QDialog):
             pass
 
     def _apply_system_palette(self, *_):
-        self.setStyleSheet(REVIEW_QSS if system_dark() else REVIEW_QSS + REVIEW_LIGHT_QSS)
+        overrides = ""
+        if obsidian_enabled():
+            overrides = REVIEW_OBSIDIAN_QSS
+        elif not system_dark():
+            overrides = REVIEW_LIGHT_QSS
+        self.setStyleSheet(REVIEW_QSS + overrides)
 
     def _pick_tool(self, index):
         if self.tool.isEnabled():

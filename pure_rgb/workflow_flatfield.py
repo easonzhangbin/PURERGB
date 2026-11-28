@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 
 from .flatfield import FILE_FILTER, RAW_EXTENSIONS
 from .native import sha256
+from .raw_import import file_identity
 from .workflow_combo import WorkflowComboBox as QComboBox
 from .motion_sliders import ScrubberControl
 
@@ -96,10 +97,12 @@ class FlatfieldUI:
             directory = path.parent / "flatfield-presets"
             directory.mkdir(parents=True, exist_ok=True)
             target = directory / (digest + ".npz")
-            if not target.is_file() or sha256(target) != digest:
+            if source.absolute() != target.absolute() and (not target.is_file() or sha256(target) != digest):
                 temporary = directory / (uuid.uuid4().hex + ".npz")
                 try:
                     shutil.copyfile(source, temporary)
+                    if sha256(temporary) != digest:
+                        raise ValueError("平场增益复制期间发生变化")
                     os.replace(temporary, target)
                 finally:
                     temporary.unlink(missing_ok=True)
@@ -291,7 +294,7 @@ class FlatfieldUI:
             if path.suffix.lower() not in (*RAW_EXTENSIONS, ".npz"):
                 raise ValueError("请选择平场 RAW 或增益 NPZ。")
             request = dict(action="flatfield_import", photo=photo["id"],
-                calibration=dict(path=str(path), sha256=sha256(path)), freeze_gain=True,
+                calibration=dict(path=str(path), file_identity=file_identity(path)), freeze_gain=True,
                 directory=str(self.project.workspace.root / "calibrations" / uuid.uuid4().hex),
                 targets=deepcopy(photo["base"]["raw"]))
             self.stop_preview()
@@ -352,7 +355,7 @@ class FlatfieldUI:
         photo = self.current_photo()
         if photo:
             self.flatfield_messages[photo["id"]] = "平场强度待应用；点击应用后重新处理。"
-        self.sync_controls()
+        self.sync_flatfield_controls()
 
     def apply_flatfield(self):
         photo = self.current_photo()

@@ -9,6 +9,7 @@ No workspace, saved manifest, source RAW or export is modified here.
 from copy import deepcopy
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import uuid
@@ -60,6 +61,44 @@ def _saved_measurement_valid(manifest):
     except (ValueError, TypeError, KeyError, OverflowError):
         return False
     return True
+
+
+def uses_direct_highlight_recovery(recipe):
+    """Spatial and monochrome rendering do not use the darker alternate."""
+    from .native_headroom import native_local_highlight
+
+    return (not recipe.get("source_mode") and not recipe.get("native_spatial_controls")
+            and bool((native_local_highlight(recipe) or {}).get("reference_density_offset")))
+
+
+def saved_highlight_recovery_current(manifest):
+    from .highlight_reference_guarded import RECOVERY_POLICY
+
+    direct = manifest.get("highlight_processing")
+    processing = direct.get("highlight_processing") if isinstance(direct, dict) else None
+    return (isinstance(processing, dict)
+            and processing.get("reference_recovery_policy") == RECOVERY_POLICY)
+
+
+def saved_print_exposure_current(manifest):
+    from .native_headroom import PRINT_EXPOSURE_POLICY
+    from .professional_controls import native_print_ev
+
+    ev = native_print_ev(manifest.get("recipe") or {})
+    processing = manifest.get("native_print_exposure_processing")
+    return not ev or (isinstance(processing, dict)
+                      and processing.get("policy") == PRINT_EXPOSURE_POLICY
+                      and type(processing.get("ev")) in (int, float)
+                      and processing["ev"] == ev)
+
+
+def _saved_color_valid(manifest, mode):
+    if mode == "native":
+        if uses_direct_highlight_recovery(manifest.get("recipe") or {}) and not saved_highlight_recovery_current(manifest):
+            return False
+        if not saved_print_exposure_current(manifest):
+            return False
+    return _saved_measurement_valid(manifest)
 
 
 def _anchor_grid_valid(anchor, pixels, icc):
@@ -142,6 +181,7 @@ def _controls(recipe, mode):
 def _replay_setup(recipe, mode):
     """Conservative frozen-session compatibility; never invent a snapshot."""
     from .live_worker import PREVIEW_CONTROL_KEYS
+    from .native_headroom import native_local_highlight
 
     relevant = _color_recipe(recipe, mode)
     result = {
@@ -160,10 +200,10 @@ def _replay_setup(recipe, mode):
         # Spatial snapshots bind the input configuration, not only the mask.
         result["spatial_native_config"] = deepcopy(recipe.get("native_controls"))
         result["spatial_film"] = deepcopy(recipe.get("native_film"))
-    if mode == "native" and recipe.get("highlight_controls"):
+    local = native_local_highlight(recipe) if mode == "native" else None
+    if local:
         result["highlight_reference"] = deepcopy(
-            (recipe["highlight_controls"].get("automatic_reference", False),
-             recipe["highlight_controls"]["reference_roi"])
+            (local.get("automatic_reference", False), local["reference_roi"])
         )
     return result
 
@@ -187,13 +227,24 @@ def _geometry_document(recipe, mode):
     return {"version": 1, "values": selected} if selected else None
 
 
+def defer_comparison(owner):
+    """Mark a draft that skipped only its secondary comparison input."""
+    if not getattr(owner, "_defer_reference", False):
+        return False
+    owner.reference_deferred = True
+    owner.reference_label = ""
+    return True
+
+
 class DraftPreview:
-    def __init__(self, path, digest, state_directory):
+    def __init__(self, path, digest, state_directory, *, authenticated_inputs=None):
         self.path = Path(path).resolve()
         self.digest = digest
-        if sha256(self.path) != digest:
+        self.manifest_identity = _identity(self.path)
+        payload = self.path.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != digest or _identity(self.path) != self.manifest_identity:
             raise ValueError("草稿预览来源清单已改变")
-        self.manifest = json.loads(self.path.read_text())
+        self.manifest = json.loads(payload)
         if self.manifest.get("state") != "complete":
             raise ValueError("草稿预览需要已完成的原始导入")
         from .native_draft_preview_v40 import resolved_saved_recipe
@@ -212,6 +263,7 @@ class DraftPreview:
         self.viewport_result = None
         self.density_preview = None
         self.identities = {}
+        self.authenticated_inputs = {}
         self.records = deepcopy(self.manifest["inputs"])
         expected_roles = (
             ["BW"] if self.recipe.get("source_mode") == "bw-single-v1" else list("RGB")
@@ -223,14 +275,26 @@ class DraftPreview:
         source_records = self.records + (
             [self.manifest["calibration"]] if self.recipe["flatfield"] else []
         )
+        previous = authenticated_inputs or {}
         for record in source_records:
-            before = _identity(record["path"])
+            path, digest = record["path"], record["sha256"]
+            before = _identity(path)
             if (
-                sha256(record["path"]) != record["sha256"]
-                or _identity(record["path"]) != before
+                (previous.get((path, digest)) != before and sha256(path) != digest)
+                or _identity(path) != before
             ):
                 raise ValueError("草稿预览的原始来源发生变化")
-            self.identities[record["path"]] = before
+            self.identities[path] = before
+            self.authenticated_inputs[path, digest] = before
+
+    def visible_engine_binding(self, request):
+        recipe = request["draft_recipe"]
+        if (request["mode"] != "native" or request.get("full_resolution") or request.get("viewport")
+                or request.get("crop_locator") or request.get("repair_plan") is not None
+                or any(recipe.get(key) for key in ("lens_profile", "native_film", "source_mode"))):
+            return None
+        return {"manifest": str(self.path), "identity": self.manifest_identity,
+                "sources": self.identities}
 
     def _validate(self, request):
         from .live_worker import _checked_preview_request
@@ -267,6 +331,9 @@ class DraftPreview:
         recipe, mode, _ = self._validate(request)
         self.preview_quality = None
         self.native_print = None
+        self.metering_receipt = {}
+        self._defer_reference = request.get("defer_reference") is True
+        self.reference_deferred = False
         if self.density_preview is not None:
             self.density_preview.last_receipt = None
         self.viewport_result = None
@@ -307,6 +374,8 @@ class DraftPreview:
         with span("preview_sampled_density", mode=mode):
             sampled = self.density_preview.try_render(request, recipe, mode)
         if sampled is not None:
+            if mode != "native" and "viewport" not in request:
+                return self._alternate_fit_frame(request, mode, *sampled)
             return sampled
         if "viewport" in request:
             from .viewport_preview_v43 import checked_viewport
@@ -329,6 +398,18 @@ class DraftPreview:
             self.output_size = [result[0].shape[1], result[0].shape[0]]
         return result
 
+    def _alternate_fit_frame(self, request, mode, current, reference, icc):
+        self.preview_quality = dict(
+            mode="nikon-screen" if mode == "cool-shared-rgb" else "flex-screen",
+            approximate=False,
+        )
+        edge = request.get("interactive_edge")
+        if edge and request.get("repair_plan") is None and max(current.shape[:2]) <= edge:
+            label = "引擎快速预览" if request.get("engine_proxy") else "拖动预览"
+            self.preview_quality.update(approximate=edge < 1400, interactive_frame=True, label=label)
+            return current, current, icc
+        return current, reference, icc
+
     def _render_frame(self, request):
         from .live_worker import Session
 
@@ -338,12 +419,14 @@ class DraftPreview:
                 from .nikon_draft_preview_v40 import NikonDraftPreview
 
                 self.nikon_preview = NikonDraftPreview(self.manifest, self.digest)
-            result = self.nikon_preview.render(recipe, full=full)
+            result = self.nikon_preview.render(recipe, full=full, interactive_edge=request.get("interactive_edge"))
             if result is not None:
                 self.sample_step = result.sample_step
                 self.reference_label = result.reference_label
                 self.metering_receipt = {}
                 self._validate(request)
+                if not full:
+                    return self._alternate_fit_frame(request, mode, result.pixels, result.reference, result.icc)
                 return result.pixels, result.reference, result.icc
         if mode == "flex-endpoint" and recipe.get("flex_research_controls"):
             if self.flex_preview is None:
@@ -357,6 +440,8 @@ class DraftPreview:
                 self.reference_label = receipt["preview"]["reference_label"]
                 self.metering_receipt = {}
                 self._validate(request)
+                if not full:
+                    return self._alternate_fit_frame(request, mode, pixels, reference, icc)
                 return pixels, reference, icc
         saved_crop = self._saved_crop(recipe, mode, full)
         if saved_crop is not None:
@@ -368,7 +453,7 @@ class DraftPreview:
         if (
             not saved_anchor
             and mode in self.manifest["results"]
-            and _saved_measurement_valid(self.manifest)
+            and _saved_color_valid(self.manifest, mode)
             and _replay_setup(recipe, mode) == _replay_setup(self.recipe, mode)
             and not (recipe.get("source_mode") == "bw-single-v1"
                      and recipe.get("post_controls") != self.recipe.get("post_controls"))
@@ -396,7 +481,8 @@ class DraftPreview:
             anchor_key=(self.anchor or {}).get("key", "-")[:12],
             anchor_owned=(self.anchor or {}).get("owned"),
         )
-        if self.anchor is None or self.anchor["key"] != key:
+        warm_anchor = self.anchor is not None and self.anchor["key"] == key
+        if not warm_anchor:
             if saved_anchor:
                 self._use_saved_anchor(mode, key)
             else:
@@ -416,14 +502,31 @@ class DraftPreview:
         if point_sample:
             # Point operations commute with this exact source-coordinate sample.
             # Avoid adjusting a full 96MP frame only to display ~1MP of it.
-            step = max(1, int(np.ceil(max(before.shape[:2]) / 1400)))
+            native_tone = mode == "native" and request.get("tone_edit") is True
+            fit_edge = request.get("fit_edge", 1400) if native_tone else 1400
+            longest = max(before.shape[:2])
+            step = max(1, (longest + fit_edge - 1) // fit_edge)
+            edge = request.get("interactive_edge")
+            drag_ready = bool(edge and warm_anchor and anchor.get("pixels") is not None)
+            factor = (longest + edge * step - 1) // (edge * step) if drag_ready else 1
+            step *= factor
             self.sample_step = step
             current = self._finish(
                 np.ascontiguousarray(sample_oriented(before, None, direction, step)),
-                recipe, mode,
+                recipe, mode, fit=True,
             )
-            reference = self._reference(before, rectangle, recipe, mode, icc)
-            reference = sample_oriented(reference, None, direction, step)
+            if factor > 1 or (native_tone and drag_ready):
+                self.reference_label = ""
+                self.preview_quality = dict(mode="draft-anchor-screen", approximate=True,
+                    interactive_frame=True, label="拖动预览", sample_step=step, full_output_size=self.output_size)
+                self._validate(request)
+                _verified_anchor_pixels(anchor, check_only=True)
+                return current, current, icc
+            if defer_comparison(self):
+                reference = current
+            else:
+                reference = self._reference(before, rectangle, recipe, mode, icc)
+                reference = sample_oriented(reference, None, direction, step)
             self._validate(request)
             _verified_anchor_pixels(anchor, check_only=True)
             return np.array(current, copy=True), np.array(reference, copy=True), icc
@@ -444,7 +547,7 @@ class DraftPreview:
 
     def _saved_neutral_eligible(self, anchor_recipe, mode):
         """A full saved output with identity finishing is already the anchor."""
-        if mode not in self.manifest["results"] or not _saved_measurement_valid(self.manifest):
+        if mode not in self.manifest["results"] or not _saved_color_valid(self.manifest, mode):
             return False
         if (
             self.recipe["exposure_ev"] != 0
@@ -504,7 +607,7 @@ class DraftPreview:
         """Crop-only edits inside a saved canvas need no RAW/color preparation."""
         from .preview_grid import post_requires_full_grid
 
-        if mode not in self.manifest["results"] or not _saved_measurement_valid(self.manifest):
+        if mode not in self.manifest["results"] or not _saved_color_valid(self.manifest, mode):
             return None
         old = _color_recipe(self.recipe, mode)
         new = _color_recipe(recipe, mode)
@@ -624,15 +727,9 @@ class DraftPreview:
                 # _validate already bound the draft's decode identity and RAW
                 # records to this completed manifest. The render cache also
                 # checks the frozen import receipt before restoring pixels.
-                anchor = {
-                    "source_shape": self.manifest.get("source_shape"),
-                    "raw_import_receipt": self.manifest.get("raw_import_receipt"),
-                }
-                if recipe.get("flatfield"):
-                    provenance = (request["calibration"] or {}).get("provenance") or {}
-                    capture = provenance.get("capture") or {}
-                    anchor["flatfield_reference_shape"] = capture.get("sensor_shape")
-                request["decode_anchor"] = deepcopy(anchor)
+                from .decoded_cache import source_anchor
+
+                request["decode_anchor"] = deepcopy(source_anchor(self.manifest))
             report = render(
                 request,
                 emit_callback=progress,
@@ -685,7 +782,7 @@ class DraftPreview:
             shutil.rmtree(old["directory"], ignore_errors=True)
 
     @staticmethod
-    def _finish(pixels, recipe, mode):
+    def _finish(pixels, recipe, mode, *, fit=False):
         from .common_positive import (
             apply_common_positive,
             checked_common_positive_controls,
@@ -701,17 +798,27 @@ class DraftPreview:
         )
         if common:
             pixels = apply_common_positive(pixels, common)
-        pixels, _ = preview_output_codes(
-            pixels, recipe.get("output_controls", {}).get(mode), recipe["exposure_ev"]
-        )
-        if (
+        output = recipe.get("output_controls", {}).get(mode)
+        post = recipe.get("post_controls", {}).get(mode)
+        cool_lift = (
             mode == "cool-shared-rgb"
             and not recipe.get("nikon_research_controls")
             and recipe["cool_tone"] == "soft-shoulder"
-        ):
+        )
+        if (fit and not cool_lift
+                and os.environ.get("PURE_RGB_COMPUTE_BACKEND", "auto") in {"auto", "cpu"}):
+            from .positive_lut import fit_point_codes
+
+            adjusted = fit_point_codes(pixels, output, recipe["exposure_ev"], post)
+            if adjusted is not None:
+                return adjusted
+        pixels, _ = preview_output_codes(
+            pixels, output, recipe["exposure_ev"]
+        )
+        if cool_lift:
             pixels = lift_codes(pixels, soft=True)
         pixels, _ = post_codes(
-            pixels, recipe.get("post_controls", {}).get(mode), sample_step=1
+            pixels, post, sample_step=1, collect_ranges=False,
         )
         return pixels
 
@@ -746,6 +853,7 @@ class DraftPreview:
                 reference = saved[y0 - b : y1 - b, x0 - a : x1 - a]
                 self.reference_label = "已保存版本"
         reference, _ = post_codes(
-            reference, _geometry_document(recipe, mode), sample_step=1
+            reference, _geometry_document(recipe, mode), sample_step=1,
+            collect_ranges=False,
         )
         return reference

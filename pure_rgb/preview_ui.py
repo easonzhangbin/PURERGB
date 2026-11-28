@@ -192,7 +192,10 @@ class Canvas(QWidget):
         super().__init__()
         self.setMinimumSize(200, 180)
         self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
         self.current = self.reference = None
+        self.interactive_image = None
+        self.interactive_mode_text = None
         self.empty_message = "正在载入已计算样片…"
         self.zoom = 1.0
         self.sample_scale = 1
@@ -217,6 +220,7 @@ class Canvas(QWidget):
         self._detail_step = 1
         self._detail_full_requested = False
         self.detail_timer = QTimer(self)
+        self._detail_suspended = False
         self.detail_timer.setSingleShot(True)
         self.detail_timer.setInterval(160)
         self.detail_timer.timeout.connect(self._request_detail)
@@ -225,6 +229,15 @@ class Canvas(QWidget):
         self.detail_enabled = bool(enabled)
         if not self.detail_enabled:
             self.clear_detail()
+
+    def suspend_detail(self, suspended):
+        if self._detail_suspended == suspended:
+            return
+        self._detail_suspended = suspended
+        if suspended:
+            self.detail_timer.stop()
+        elif not self.fit_mode or (self.photo_lens and self.photo_lens.active):
+            self._schedule_detail()
 
     def set_output_size(self, width, height):
         """Set the exact current output grid, after crop and orientation."""
@@ -314,10 +327,12 @@ class Canvas(QWidget):
         return a <= x0 and b <= y0 and c >= x1 and d >= y1
 
     def _schedule_detail(self, delay=160):
-        if self.detail_enabled:
+        if self.detail_enabled and not self._detail_suspended:
             self.detail_timer.start(delay)
 
     def _request_detail(self):
+        if self._detail_suspended:
+            return
         lens = self.photo_lens is not None and self.photo_lens.active
         if (not lens and self.detail_enabled and self.current and self.sample_scale > 1
                 and self._detail_output_size is None and not self._detail_full_requested
@@ -371,6 +386,8 @@ class Canvas(QWidget):
         return True
 
     def set_images(self, current, reference, text, reset=False):
+        self.interactive_image = None
+        self.interactive_mode_text = None
         self.clear_detail()
         self.current, self.reference, self.mode_text = current, reference, text
         if reset or self.fit_mode:
@@ -379,14 +396,44 @@ class Canvas(QWidget):
             self._schedule_detail()
         self.update()
 
+    def set_interactive_image(self, image, mode_text=None):
+        if self.interactive_image is image and self.interactive_mode_text == mode_text:
+            return
+        self.interactive_image = image
+        self.interactive_mode_text = mode_text if image is not None else None
+        if image is not None:
+            # This packet arrives on the GUI thread already colour-managed.
+            # Present it in this event instead of waiting for a second update.
+            if mode_text:
+                self.repaint()
+            else:
+                self.repaint_interactive_image()
+        else:
+            self.update()
+
+    def repaint_interactive_image(self):
+        if self.current is not None and self.interactive_image is not None:
+            self.repaint(self._photo_area().toAlignedRect())
+
+    def displayed_image(self):
+        if (self.current is not None and self.interactive_image is not None
+                and (self.fit_mode or not self.interactive_mode_text)
+                and not self.split
+                and not (self.photo_lens and self.photo_lens.active)):
+            return self.interactive_image
+        return self.current
+
+    def _photo_area(self):
+        return QRectF(self.origin, self.current.size().toSizeF() * self.zoom)
+
+    def _fit_scale(self, image):
+        return min((self.width() - 32) / image.width(), (self.height() - 60) / image.height())
+
     def fit(self):
         self.clear_detail()
         self.fit_mode = True
         if self.current:
-            self.zoom = min(
-                (self.width() - 32) / self.current.width(),
-                (self.height() - 60) / self.current.height(),
-            )
+            self.zoom = self._fit_scale(self.current)
             self.center()
             if self.photo_lens and self.photo_lens.active:
                 self._schedule_detail()
@@ -530,9 +577,18 @@ class Canvas(QWidget):
 
     def paint_photos(self, painter):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        target = QRectF(self.origin, self.current.size().toSizeF() * self.zoom)
-        painter.drawImage(target, self.current)
-        self._paint_detail(painter, self._detail_current)
+        image = self.displayed_image()
+        if image is self.interactive_image and self.interactive_mode_text:
+            # The selected engine can use a newly applied output crop. Fit
+            # its quick frame without changing the last exact image's geometry.
+            size = image.size().toSizeF() * self._fit_scale(image)
+            target = QRectF(QPointF((self.width() - size.width()) / 2,
+                                   (self.height() - size.height()) / 2), size)
+        else:
+            target = self._photo_area()
+        painter.drawImage(target, image)
+        if image is self.current:
+            self._paint_detail(painter, self._detail_current)
         if self.split and self.reference:
             painter.save()
             painter.setClipRect(
@@ -544,7 +600,7 @@ class Canvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#141517"))
+        painter.fillRect(event.rect(), QColor("#141517"))
         if not self.current:
             painter.setPen(QColor("#C4C4C4"))
             painter.drawText(
@@ -556,9 +612,12 @@ class Canvas(QWidget):
             x = self.width() * self.fraction
             painter.setPen(QPen(QColor("#F0A055"), 2))
             painter.drawLine(QPointF(x, 0), QPointF(x, self.height()))
+        current_caption = self.mode_text
+        if self.interactive_mode_text and self.displayed_image() is self.interactive_image:
+            current_caption = self.interactive_mode_text
         caption = (
             (f"左 {self.reference_name}  /  右 " if self.split else "")
-            + self.mode_text
+            + current_caption
         )
         if caption:
             # One shared badge design for every engine caption, fitted to its

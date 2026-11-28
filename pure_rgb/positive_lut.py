@@ -68,3 +68,57 @@ def exact_cpu_lut_codes(pixels, document, common_ev=0.0):
         below_zero_fraction=0.0,
         common_exposure_ev=common_ev,
     )
+
+
+@lru_cache(maxsize=8)
+def _temperature_lut(kelvin):
+    from .positive_post import TEMPERATURE_SPEC, post_codes
+
+    # With no additional post edits, the original positive transfer is
+    # separable by channel. Run that same implementation over all RGB16 codes.
+    ramp = np.arange(65536, dtype=np.uint16).reshape(256, 256, 1)
+    ramp = np.repeat(ramp, 3, axis=2)
+    adjusted, _ = post_codes(
+        ramp, {"version": 1, "values": {TEMPERATURE_SPEC.key: kelvin}},
+        collect_ranges=False,
+    )
+    result = adjusted.reshape(65536, 3)
+    result.flags.writeable = False
+    return result
+
+
+def fit_point_codes(pixels, output_document, common_ev, post_document):
+    """Apply exact separable output and temperature edits without GPU warmup."""
+    from .positive_post import POST_SPECS, TEMPERATURE_SPEC
+    from .professional_controls import OUTPUT_SPECS, checked_controls
+
+    output = output_document or {"version": 1, "values": {}}
+    values = checked_controls(output, OUTPUT_SPECS)["values"]
+    post = checked_controls(post_document, POST_SPECS)["values"] if post_document else {}
+    if values.get("saturation", 1) != 1 or post.keys() - {TEMPERATURE_SPEC.key}:
+        return None
+    lut = _temperature_lut(post[TEMPERATURE_SPEC.key]) if post else None
+    if values or common_ev:
+        output_lut = exact_output_lut(output, common_ev) & 65535
+        # Preserve the intermediate RGB16 encoder; reordering the two edits
+        # or combining their float arithmetic changes values near clipping.
+        lut = lut[output_lut, np.arange(3)] if lut is not None else output_lut
+    if lut is None:
+        return pixels
+    result = np.empty_like(pixels, order="C")
+    if pixels.shape[0] * pixels.shape[1] >= 256 * 1024:
+        try:
+            from negpy_core import lut_u16
+        except ImportError:
+            pass
+        else:
+            # Use the worker's existing Rayon budget for larger fit grids.
+            # Each table still addresses the exact 16-bit input code.
+            tables = np.ascontiguousarray(lut.T, dtype=np.uint16)
+            for channel, table in enumerate(tables):
+                plane = np.ascontiguousarray(pixels[..., channel])
+                result[..., channel] = lut_u16(plane, table)
+            return result
+    for channel in range(3):
+        result[..., channel] = lut[:, channel][pixels[..., channel]]
+    return result

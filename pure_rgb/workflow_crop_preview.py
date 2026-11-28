@@ -133,6 +133,69 @@ def refresh_crop_frame(window):
                     reference=cache.get("reference", False), scope_data=cache.get("scope_data"))
 
 
+def confirmed_crop_preview(window):
+    """Project the selected source rectangle onto a matching fit image."""
+    from .preview_grid import post_requires_full_grid
+    from .selection_mapping_v43 import SelectionMapping
+
+    canvas = window.canvas
+    if (window.tasks.busy or not canvas.current or not canvas.fit_mode or canvas.split or window.compare.isChecked()
+            or (canvas.photo_lens is not None and canvas.photo_lens.active)):
+        return None
+    context = locator_context(window)
+    if context is None or context["repair_plan"] or context["repair_source_view"]:
+        return None
+    photo, recipe = window.current_photo(), window.project.recipe()
+    if post_requires_full_grid(recipe.get("post_controls", {}).get(RESULT_MODES[context["engine"]])):
+        return None
+    cache = getattr(window, "crop_locator_cache", None)
+    shown = window.shown_context or {}
+    if (shown.get("photo") == context["photo"] and shown.get("engine") == context["engine"]
+            and shown.get("recipe") == recipe):
+        return None
+    if (cache and not cache["reference"] and cache["key"] == context["key"]):
+        image = cache["image"]
+    elif (shown.get("photo") == context["photo"] and shown.get("engine") == context["engine"]
+          and shown.get("recipe") == context["recipe"] and not shown.get("repair_plan_sha256")
+          and not shown.get("preview_quality", {}).get("approximate")
+          and getattr(window, "shown_display", None) == (window.display_revision, window.proof_space)):
+        image = canvas.current
+    else:
+        return None
+    if image.isNull():
+        return None
+
+    bounds = output_rectangle(recipe, photo["analysis_roi"], photo["source_shape"])
+    mapping = SelectionMapping(photo["source_shape"], output_orientation=recipe.get("output_orientation"))
+    size = image.width(), image.height()
+    width, height = mapping.output_size
+    if abs(size[0] / size[1] - width / height) > 2 / min(size):
+        return None
+    first = mapping.source_to_preview(bounds[:2], size)
+    last = mapping.source_to_preview(bounds[2:], size)
+    x, x1 = sorted(round(value) for value in (first[0], last[0]))
+    y, y1 = sorted(round(value) for value in (first[1], last[1]))
+    # Narrow crops can collapse to almost nothing on the sampled locator.
+    if min(x1 - x, y1 - y) < 2:
+        return None
+    return image.copy(x, y, x1 - x, y1 - y)
+
+
+def restore_crop_scopes(window):
+    backup = window.__dict__.pop("_crop_canvas_scopes", None)
+    if backup is None:
+        return
+    shown, scopes = backup
+    photo = window.current_photo()
+    if photo and photo["id"] == shown["photo"] and photo["engine"] == shown["engine"]:
+        current = window.shown_context or {}
+        if all(shown.get(key) == current.get(key) for key in (
+            "photo", "engine", "recipe_sha256", "repair_plan_sha256",
+        )):
+            window.scope_panel.set_scope_data(scopes)
+            window.scope_panel.caption.setText("输出 RGB · 预览取样")
+
+
 def _finished(window, token):
     window.crop_locator_pending = None
     if window.preview_activity.active and window.preview_activity.token == token:
@@ -153,6 +216,10 @@ def _finished(window, token):
 
 
 def begin_crop_selection(window):
+    if (window.geometry_role != "crop" and window.shown_context
+            and window.scope_panel.caption.text() == "输出 RGB · 预览取样"):
+        window._crop_canvas_scopes = window.shown_context, window.scope_panel.scope_data
+        window.preview_scopes.cancel()
     window.geometry_role = "crop"
     if refresh_crop_frame(window):
         window.canvas_stack.setCurrentWidget(window.selection)
@@ -180,6 +247,20 @@ def request_crop_frame(window):
         return True
     context = locator_context(window)
     if context is None:
+        return True
+    shown = window.shown_context or {}
+    repair = context["repair_plan"]
+    if (window.canvas.current is not None
+            and shown.get("photo") == context["photo"]
+            and shown.get("engine") == context["engine"]
+            and getattr(window, "shown_display", None) == (window.display_revision, window.proof_space)
+            and shown.get("recipe") == context["recipe"]
+            and not shown.get("preview_quality", {}).get("approximate")
+            and shown.get("repair_plan_sha256") == (repair["receipt_sha256"] if repair else None)):
+        window.preview_timer.stop()
+        scopes = getattr(getattr(window, "scope_panel", None), "scope_data", None)
+        _install(window, window.canvas.current, context, scope_data=scopes)
+        _finished(window, window.token)
         return True
     pending = getattr(window, "crop_locator_pending", None)
     if pending and pending["key"] == context["key"] and pending["token"] == window.token:
@@ -235,6 +316,7 @@ def display_crop_record(window, token, record, context, *, sample_step=1, tempor
     """ICC conversion is asynchronous and bound to photo, recipe and monitor."""
     from .preview_ui import Work
     from .output_orientation import _relative_document
+    from .preview_requests_v44 import read_preview_metering
     from .workflow_display import DisplayTarget, named_reference_profile, profile_description
 
     record = deepcopy(record)
@@ -251,6 +333,7 @@ def display_crop_record(window, token, record, context, *, sample_step=1, tempor
 
     def read():
         try:
+            metering = read_preview_metering(temporary) if temporary else None
             result = window.display_cache.get_image(record, target, proof=proof,
                 sample_step=sample_step, source_step=source_step, include_scopes=want_scopes,
                 scope_orientation=direction if want_scopes else None)
@@ -259,7 +342,7 @@ def display_crop_record(window, token, record, context, *, sample_step=1, tempor
                 image = image.transformed(QTransform().rotate(direction["quarter_turns"] * 90))
             if direction["flip_horizontal"] or direction["flip_vertical"]:
                 image = image.mirrored(direction["flip_horizontal"], direction["flip_vertical"])
-            return image, scopes
+            return image, scopes, metering
         finally:
             if temporary:
                 window.live.discard(temporary)
@@ -270,13 +353,16 @@ def display_crop_record(window, token, record, context, *, sample_step=1, tempor
         if result_token != window.token or not _matches(window, context):
             return
         try:
-            image, scopes = result
+            image, scopes, metering = result
             # A slower saved-reference conversion must never replace a fresh
             # current-color frame delivered by the same generation.
             existing = getattr(window, "crop_locator_cache", {})
             if reference and existing.get("key") == context["key"] and not existing.get("reference", True):
                 return
             if _install(window, image, context, reference=reference, scope_data=scopes):
+                if metering is not None:
+                    window.project.remember_preview_metering(context["recipe"], metering)
+                    window.refresh_metering_status()
                 if reference:
                     caption = "已保存正像参考" if window.current_photo()["source_mode"] == "bw" else "已保存彩色参考"
                     window.show_preview_notice(caption + " · 正在更新当前调色")

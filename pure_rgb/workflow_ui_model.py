@@ -70,6 +70,28 @@ def with_straighten(recipe, engine, settings):
     return result
 
 
+
+
+def _metering_recipe_identity(recipe):
+    """Keep every analysis input while ignoring output-only geometry."""
+    result = deepcopy(recipe)
+    for field in ("crop", "output_roi", "output_orientation"):
+        result.pop(field, None)
+    post = result.get("post_controls")
+    if post:
+        for mode in list(post):
+            document = post[mode]
+            values = document.get("values", {})
+            document["values"] = {
+                key: value for key, value in values.items()
+                if not key.startswith("geometry.")
+            }
+            if not document["values"] and set(document) == {"version", "values"}:
+                post.pop(mode)
+        if not post:
+            result.pop("post_controls", None)
+    return result
+
 def photo_key(paths, source_mode):
     return hashlib.sha256(
         json.dumps([source_mode, [str(Path(p).resolve()) for p in paths]]).encode()
@@ -337,7 +359,9 @@ class WorkflowProject:
             )
             self.data["selection_version"] = 1
         self.preview_metering = {}
-        self._highlight_policy_cache = {}
+        self.defer_recipe_autosave = False
+        self._recipe_autosave_pending = False
+        self._native_render_policy_cache = {}
         self._repair_documents = {}
         self._repair_candidates = {}
         self._repair_frames = {}
@@ -355,6 +379,7 @@ class WorkflowProject:
             self._restore_shared_straighten(photo)
             self._shared_measurement(photo, normalize=True)
             self._shared_flatfield(photo)
+        self._recover_completed_bindings()
         self.edit_histories = {
             photo["id"]: PhotoEditHistory(self._edit_snapshot(photo))
             for photo in self.photos
@@ -546,6 +571,11 @@ class WorkflowProject:
 
     def save(self):
         write_json(self.path, self.data)
+        self._recipe_autosave_pending = False
+
+    def flush_recipe_autosave(self):
+        if self._recipe_autosave_pending:
+            self.save()
 
     def _shared_flatfield(self, photo, *, strength=None):
         """One source gain per photo, without copying engine color controls."""
@@ -673,12 +703,19 @@ class WorkflowProject:
     def set_lens_correction(self, enabled):
         photo = self.photo()
         history = self._edit_history(photo)
-        photo["drafts"] = {engine: checked_recipe({**recipe, "lens_correction": enabled})
-                          for engine, recipe in photo["drafts"].items()}
+        drafts = {engine: checked_recipe({**recipe, "lens_correction": enabled})
+                  for engine, recipe in photo["drafts"].items()}
+        previous = dict(photo)
+        photo["drafts"] = drafts
         photo.pop("geometry", None)
+        try:
+            self.save()
+        except OSError:
+            photo.clear()
+            photo.update(previous)
+            raise
         self.preview_metering.pop(photo["id"], None)
         history.record(self._edit_snapshot(photo), "RAW 内嵌镜头矫正")
-        self.save()
 
     def set_chromatic_correction(self, enabled, *, profile=None, replace_profile=False):
         photo = self.photo()
@@ -691,10 +728,16 @@ class WorkflowProject:
                 if profile is not None:
                     updated["lens_profile"] = deepcopy(profile)
             drafts[engine] = checked_recipe(updated)
+        previous = dict(photo)
         photo["drafts"] = drafts
+        try:
+            self.save()
+        except OSError:
+            photo.clear()
+            photo.update(previous)
+            raise
         self.preview_metering.pop(photo["id"], None)
         history.record(self._edit_snapshot(photo), "镜头色差矫正")
-        self.save()
 
     def register_flatfield(self, report):
         """Index a computed gain for later reuse; one entry per gain content."""
@@ -734,7 +777,7 @@ class WorkflowProject:
         "protected_rois", "fixed_last_strength", "highlight_reference_origin",
         "highlight_reference_drawn_roi", "highlight_reference_aligned",
         "suspended_highlight_controls",
-        "flatfield_input", "repair_reset_index",
+        "flatfield_input", "repair_reset_index", "frame_detection_uncertain",
     )
 
     def _edit_snapshot(self, photo):
@@ -770,23 +813,35 @@ class WorkflowProject:
         if not self.data["current"]:
             return False
         photo = self.photo()
-        previous_source = source_recipe_identity(self.recipe(photo))
+        previous_recipe = self.recipe(photo)
+        previous_source = source_recipe_identity(previous_recipe)
         history = self._edit_history(photo)
+        previous_photo = deepcopy(photo)
+        previous_history = deepcopy(history.__dict__)
         state = history.move(redo)
         if state is None:
             return False
-        for key in self._EDIT_KEYS:
-            photo.pop(key, None)
-        photo.update(state)
-        # A meter workspace always displays Native, even if the undone command
-        # restores another remembered color route. Navigation is not an edit.
-        engine = "native" if self.data.get("stage") == 2 else self._color_engine(photo)
-        self._activate_engine(photo, engine)
-        if source_recipe_identity(self.recipe(photo)) != previous_source:
-            photo.pop("geometry", None)
-        history.current = self._edit_snapshot(photo)
-        self.preview_metering.pop(photo["id"], None)
-        self.save()
+        try:
+            for key in self._EDIT_KEYS:
+                photo.pop(key, None)
+            photo.update(state)
+            # A meter workspace always displays Native, even if the undone
+            # command restores another remembered color route.
+            engine = "native" if self.data.get("stage") == 2 else self._color_engine(photo)
+            self._activate_engine(photo, engine)
+            current_recipe = self.recipe(photo)
+            if source_recipe_identity(current_recipe) != previous_source:
+                photo.pop("geometry", None)
+            history.current = self._edit_snapshot(photo)
+            self.save()
+        except OSError:
+            photo.clear()
+            photo.update(previous_photo)
+            history.__dict__.clear()
+            history.__dict__.update(previous_history)
+            raise
+        if _metering_recipe_identity(previous_recipe) != _metering_recipe_identity(current_recipe):
+            self.preview_metering.pop(photo["id"], None)
         return True
 
     def undo(self):
@@ -829,12 +884,13 @@ class WorkflowProject:
                 flatfield_input=None,
                 source_shape=None,
                 analysis_roi=None,
-                measurement=dict(version=1, roi=None, density="negpy"),
+                measurement=self._measurement_from_recipe(recipe, "native"),
                 protected_rois=[],
                 fixed_last_strength=0.5,
             )
             if not restore:
                 self.inherit_flatfield(old)
+            self._shared_measurement(old, normalize=restore)
             self.photos.append(old)
             self.edit_histories[key] = PhotoEditHistory(self._edit_snapshot(old))
         self.data["current"] = key
@@ -855,22 +911,38 @@ class WorkflowProject:
         removed = [entry for entry in self.photos if entry["id"] in keys]
         if not removed:
             return []
-        self.data.setdefault("removed", {}).update(
-            (photo["id"], deepcopy(photo)) for photo in removed
-        )
-        self.photos[:] = [entry for entry in self.photos if entry["id"] not in keys]
-        self.data["checked"] = [
-            entry for entry in (self.data.get("checked") or []) if entry not in keys
-        ]
-        self.data["import_queue"] = [
-            entry for entry in self.data.get("import_queue", []) if entry not in keys
-        ]
+        previous_photos = list(self.photos)
+        previous_current = self.data["current"]
+        previous_fields = {
+            key: deepcopy(self.data[key])
+            for key in ("removed", "checked", "import_queue") if key in self.data
+        }
+        try:
+            self.data.setdefault("removed", {}).update(
+                (photo["id"], deepcopy(photo)) for photo in removed
+            )
+            self.photos[:] = [entry for entry in self.photos if entry["id"] not in keys]
+            self.data["checked"] = [
+                entry for entry in (self.data.get("checked") or []) if entry not in keys
+            ]
+            self.data["import_queue"] = [
+                entry for entry in self.data.get("import_queue", []) if entry not in keys
+            ]
+            if self.data["current"] in keys:
+                self.data["current"] = self.photos[0]["id"] if self.photos else None
+            self.save()
+        except Exception:
+            self.photos[:] = previous_photos
+            self.data["current"] = previous_current
+            for key in ("removed", "checked", "import_queue"):
+                if key in previous_fields:
+                    self.data[key] = previous_fields[key]
+                else:
+                    self.data.pop(key, None)
+            raise
         for key in keys:
             self.preview_metering.pop(key, None)
             self.edit_histories.pop(key, None)
-        if self.data["current"] in keys:
-            self.data["current"] = self.photos[0]["id"] if self.photos else None
-        self.save()
         return removed
 
     @staticmethod
@@ -921,11 +993,18 @@ class WorkflowProject:
     def select_engine(self, engine, *, remember_color=True):
         photo = self.photo()
         history = self._edit_history(photo)
-        self._activate_engine(photo, engine)
+        previous = deepcopy(photo)
+        try:
+            self._activate_engine(photo, engine)
+            if remember_color:
+                photo["color_engine"] = engine
+            self.save()
+        except Exception:
+            photo.clear()
+            photo.update(previous)
+            raise
         if remember_color:
-            photo["color_engine"] = engine
             history.record(self._edit_snapshot(photo), "切换转换引擎")
-        self.save()
 
     def enter_stage(self, index):
         """The combined frame/meter step retains the chosen color route."""
@@ -933,18 +1012,27 @@ class WorkflowProject:
         previous = canonical_stage(self.data.get("stage", 0))
         current = self.photo() if self.data["current"] else None
         before = current["engine"] if current else None
-        if index == 2 and current is not None:
-            self._color_engine(current)
-            self._activate_engine(current, "native")
-        elif previous == 2:
-            # Several photos may have been inspected in the metering stage.
-            # Restore every remembered route before batch review or export.
-            for photo in self.photos:
-                self._activate_engine(photo, self._color_engine(photo))
-        elif current is not None:
-            self._activate_engine(current, self._color_engine(current))
-        self.data["stage"] = index
-        self.save()
+        affected = self.photos if previous == 2 and index != 2 else ([current] if current else [])
+        snapshots = [(photo, deepcopy(photo)) for photo in affected]
+        previous_stage = self.data.get("stage", 0)
+        try:
+            if index == 2 and current is not None:
+                self._color_engine(current)
+                self._activate_engine(current, "native")
+            elif previous == 2:
+                # Restore remembered routes for all photos in the meter workspace.
+                for photo in self.photos:
+                    self._activate_engine(photo, self._color_engine(photo))
+            elif current is not None:
+                self._activate_engine(current, self._color_engine(current))
+            self.data["stage"] = index
+            self.save()
+        except Exception:
+            self.data["stage"] = previous_stage
+            for photo, snapshot in snapshots:
+                photo.clear()
+                photo.update(snapshot)
+            raise
         return bool(current and current["engine"] != before)
 
     def recipe(self, photo=None, engine=None):
@@ -954,12 +1042,17 @@ class WorkflowProject:
         self._shared_flatfield(photo)
         return self._with_orientation(photo["drafts"][engine or photo["engine"]], orientation)
 
-    def set_recipe(self, recipe, *, label="调整参数", record_edit=True):
+    def set_recipe(self, recipe, *, label="调整参数", record_edit=True, confirmed_frame=False):
         photo = self.photo()
         history = self._edit_history(photo)
         checked = checked_recipe(recipe)
         if checked["raw"] != photo["base"]["raw"]:
             raise ValueError("源文件变化需重新核对导入，不能覆盖已有照片")
+        if confirmed_frame and photo.get("frame_detection_uncertain"):
+            # Older projects can learn the import fallback after history is
+            # initialized. Make it part of the state that this edit replaces.
+            history.absorb(self._edit_snapshot(photo))
+            photo["frame_detection_uncertain"] = False
         photo["drafts"][photo["engine"]] = checked
         self._set_shared_crop(photo, checked)
         self._set_shared_straighten(photo, straighten_values(checked, photo["engine"]))
@@ -975,7 +1068,10 @@ class WorkflowProject:
             history.record(self._edit_snapshot(photo), label)
         else:
             history.absorb(self._edit_snapshot(photo))
-        self.save()
+        if self.defer_recipe_autosave:
+            self._recipe_autosave_pending = True
+        else:
+            self.save()
         return checked
 
     def reset_photo_adjustments(self, photo):
@@ -1058,6 +1154,7 @@ class WorkflowProject:
             self.save()
         except OSError:
             for photo, prior, _ in updates:
+                photo.clear()
                 photo.update(prior)
             raise
         for history, (photo, _, _) in zip(histories, updates):
@@ -1079,20 +1176,25 @@ class WorkflowProject:
         recipe, automatic = self._highlight_reference_recipe(photo)
         if automatic is None:
             return recipe
+        origin_changed = automatic and photo.get("highlight_reference_origin") != "automatic"
+        if not origin_changed and recipe == self.recipe(photo):
+            return recipe
         if automatic:
             photo["highlight_reference_origin"] = "automatic"
         return self.set_recipe(recipe, record_edit=False)
 
     def _highlight_reference_recipe(self, photo):
         """Prepare a detached recipe for a photo without changing its draft."""
+        from .native_headroom import native_local_highlight
+
         recipe = self.recipe(photo)
+        high = native_local_highlight(recipe)
         if (
             photo["engine"] != "native"
-            or not recipe.get("highlight_controls")
+            or not high
             or not recipe.get("native_spatial_controls")
         ):
             return recipe, None
-        high = recipe["highlight_controls"]
         origin = photo.get("highlight_reference_origin")
         automatic = origin == "automatic" or (
             origin is None and (high.get("automatic_reference") or high["reference_roi"] == recipe["roi"])
@@ -1140,12 +1242,19 @@ class WorkflowProject:
         self.workspace.set_state(job_id, "complete")
         binding = self.data["jobs"][job_id]
         photo = self.photo(binding["photo"])
-        photo["saved"][binding["engine"]] = job_id
+        if self._bind_completed_render(photo, binding["engine"], job, manifest):
+            self.edit_histories[photo["id"]] = PhotoEditHistory(self._edit_snapshot(photo))
+        self.save()
+        return sample, manifest
+
+    def _bind_completed_render(self, photo, engine, job, manifest):
+        photo["saved"][engine] = job["id"]
         if photo["initial_job"] is None:
             photo.update(
-                initial_job=job_id,
+                initial_job=job["id"],
                 source_shape=manifest["source_shape"],
                 analysis_roi=manifest["roi"],
+                frame_detection_uncertain=bool((manifest.get("picture_region") or {}).get("measurement_only_fallback")),
             )
             photo["base"]["roi"] = list(manifest["roi"])
             # The resolved auto ROI is not a user edit; synchronize the first draft.
@@ -1154,10 +1263,42 @@ class WorkflowProject:
             if photo["measurement"]["roi"] is None:
                 photo["measurement"]["roi"] = list(manifest["roi"])
                 self._shared_measurement(photo)
-            # Initial source geometry is derived, not a reversible user edit.
-            self.edit_histories[photo["id"]] = PhotoEditHistory(self._edit_snapshot(photo))
-        self.save()
-        return sample, manifest
+            return True
+        return False
+
+    def _recover_completed_bindings(self):
+        # Workspace completion is committed before UI metadata. A closed app
+        # or disk error between the two writes must not orphan a finished run.
+        from .diagnostics import event
+
+        jobs = self.workspace.data["jobs"]
+        order = {job["id"]: index for index, job in enumerate(jobs)}
+        photos = {photo["id"]: photo for photo in self.photos}
+        histories = {key: set(photo.get("history", ())) for key, photo in photos.items()}
+        for index, job in enumerate(jobs):
+            identifier = job["id"]
+            binding = self.data["jobs"].get(identifier)
+            if job["state"] != "complete" or not isinstance(binding, dict):
+                continue
+            key, engine = binding.get("photo"), binding.get("engine")
+            if (not isinstance(key, str) or not isinstance(engine, str)
+                    or key not in photos or engine not in RESULT_MODES or identifier not in histories[key]):
+                continue
+            photo = photos[key]
+            if photo["initial_job"] is not None and index <= order.get(photo["saved"].get(engine), -1):
+                continue
+            try:
+                sample = self.workspace.sample(job)
+                manifest = json.loads((sample.directory / "manifest.json").read_text())
+                if RESULT_MODES[engine] not in manifest["results"]:
+                    raise ValueError("已完成任务缺少对应引擎的成片")
+                recovered = deepcopy(photo)
+                if self._bind_completed_render(recovered, engine, job, manifest):
+                    recovered.pop("import_error", None)
+                photo.update(recovered)
+                event("render_binding_recovered", job=identifier, engine=engine)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                event("render_binding_recovery_failed", job=identifier, reason=str(error))
 
     def saved_job(self, photo=None):
         photo = photo or self.photo()
@@ -1177,35 +1318,57 @@ class WorkflowProject:
         # normalization when their representation differs from the draft.
         if old != current and checked_recipe(old, verify_resources=False) != current:
             return True
-        return self.highlight_reprocess_required(photo, saved=job)
+        return bool(self.native_render_updates(photo, saved=job))
 
     def highlight_reprocess_required(self, photo=None, *, saved=None):
-        """Identify saved local-highlight results produced by an older algorithm."""
+        return "highlight" in self.native_render_updates(photo, saved=saved)
+
+    def native_render_updates(self, photo=None, *, saved=None):
+        """Find which processing operations need to regenerate the saved Native result."""
+        from .draft_preview import (
+            saved_highlight_recovery_current, saved_print_exposure_current, uses_direct_highlight_recovery,
+        )
+        from .native_headroom import native_local_highlight
+        from .professional_controls import native_print_ev
+
         photo = photo or self.photo()
         if not photo or photo["engine"] != "native":
-            return False
+            return ()
         job = saved if saved is not None else self.saved_job(photo)
         if not job:
-            return False
-        highlight = job["recipe"].get("highlight_controls") or {}
-        if not highlight.get("effect_area") and not highlight.get("protection"):
-            return False
+            return ()
+        recipe = job["recipe"]
+        highlight = native_local_highlight(recipe) or {}
+        local = bool(highlight.get("effect_area") or highlight.get("protection"))
+        recovery = uses_direct_highlight_recovery(recipe)
+        relevant = ()
+        if local or recovery:
+            relevant += ("highlight",)
+        if native_print_ev(recipe):
+            relevant += ("print_exposure",)
+        if not relevant:
+            return ()
         path = self.workspace.root / "runs" / job["id"] / "manifest.json"
         try:
             stat = path.stat()
             identity = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
-            cached = self._highlight_policy_cache.get(job["id"])
+            cached = self._native_render_policy_cache.get(job["id"])
             if cached and cached[0] == identity:
                 return cached[1]
             manifest = json.loads(path.read_text())
             spatial = manifest.get("native_spatial_processing") or {}
             direct = manifest.get("highlight_processing") or {}
             processing = spatial.get("high_processing") or direct.get("highlight_processing") or {}
-            stale = processing.get("local_selection_policy") != "highlight-luminance-soft-v2"
-            self._highlight_policy_cache[job["id"]] = (identity, stale)
+            stale = ()
+            if ((local and processing.get("local_selection_policy") != "highlight-luminance-soft-v2")
+                    or (recovery and not saved_highlight_recovery_current(manifest))):
+                stale += ("highlight",)
+            if "print_exposure" in relevant and not saved_print_exposure_current(manifest):
+                stale += ("print_exposure",)
+            self._native_render_policy_cache[job["id"]] = (identity, stale)
             return stale
         except (OSError, ValueError, TypeError, AttributeError):
-            return True
+            return relevant
 
     def source_job(self, photo=None):
         """Find a completed source with the current decode/gain identity."""
@@ -1318,7 +1481,9 @@ class WorkflowProject:
     def metering_receipt(self):
         photo = self.photo()
         transient = self.preview_metering.get(photo["id"])
-        if transient and transient["recipe"] == self.recipe(photo):
+        current = self.recipe(photo)
+        if (transient and _metering_recipe_identity(transient["recipe"])
+                == _metering_recipe_identity(current)):
             return deepcopy(transient["receipt"])
         key = photo["saved"].get("native")
         if not key:
@@ -1326,7 +1491,12 @@ class WorkflowProject:
         manifest = json.loads(
             (self.workspace.root / "runs" / key / "manifest.json").read_text()
         )
-        spatial = manifest["recipe"].get("native_spatial_controls", {})
+        saved_recipe = deepcopy(manifest["recipe"])
+        if saved_recipe.get("roi") is None:
+            saved_recipe["roi"] = manifest.get("roi")
+        if _metering_recipe_identity(saved_recipe) != _metering_recipe_identity(current):
+            return {}
+        spatial = saved_recipe.get("native_spatial_controls", {})
         from .metering_hover_v45 import metering_zone_records
 
         processing = manifest.get("native_spatial_processing", {})
@@ -1339,12 +1509,13 @@ class WorkflowProject:
             report=processing.get("automatic_avoidance") or {},
             **({"zones": zones} if zones else {}),
             **({"highlight_reference_roi": reference_roi}
-               if reference_roi and manifest["recipe"] == self.recipe(photo) else {}),
+               if reference_roi else {}),
         )
 
     def remember_preview_metering(self, recipe, receipt):
         """Keep an accepted draft analysis in memory, without a saved version."""
-        if self.photo()["engine"] != "native" or recipe != self.recipe():
+        if (self.photo()["engine"] != "native"
+                or _metering_recipe_identity(recipe) != _metering_recipe_identity(self.recipe())):
             return
         spatial = recipe.get("native_spatial_controls", {})
         if not isinstance(receipt, dict) or (
@@ -1430,7 +1601,8 @@ class WorkflowProject:
             for receipt_path in reversed(paths):
                 try:
                     receipt, _ = self._repair_json(receipt_path)
-                    if receipt.get("state") == "confirmed":
+                    if (isinstance(receipt, dict) and receipt.get("state") == "confirmed"
+                            and isinstance(receipt.get("source"), dict)):
                         candidates.append((receipt_path, receipt))
                 except (OSError, ValueError, TypeError):
                     continue
@@ -1442,7 +1614,8 @@ class WorkflowProject:
                     path = self.workspace.root / "runs" / identifier / "manifest.json"
                     try:
                         data, identity = self._repair_json(path)
-                        if data.get("state") == "complete":
+                        if (isinstance(data, dict) and data.get("state") == "complete"
+                                and isinstance(data.get("results"), dict)):
                             manifests.append((path, data, identity))
                     except (OSError, ValueError, TypeError):
                         continue
@@ -1451,9 +1624,12 @@ class WorkflowProject:
                 source = receipt.get("source", {})
                 anchor = next(((path, data, identity, old_mode)
                     for path, data, identity in manifests
-                    for old_mode, record in data.get("results", {}).items()
-                    if record.get("sha256") == source.get("sha256")
-                    and Path(record.get("path", "")).resolve() == Path(source.get("path", "")).resolve()), None)
+                    for old_mode, record in data["results"].items()
+                    if isinstance(record, dict)
+                    and isinstance(record.get("path"), str) and record["path"]
+                    and isinstance(source.get("path"), str) and source["path"]
+                    and record.get("sha256") == source.get("sha256")
+                    and Path(record["path"]).resolve() == Path(source["path"]).resolve()), None)
                 if anchor is None:
                     continue
                 path, parent, identity, old_mode = anchor
@@ -1515,7 +1691,14 @@ class WorkflowProject:
         if not paths:
             return source
         for path in reversed(paths):
-            receipt, _ = self._repair_json(path)
+            try:
+                receipt, _ = self._repair_json(path)
+                if not isinstance(receipt, dict) or not isinstance(receipt.get("source"), dict):
+                    continue
+            except (OSError, ValueError, TypeError):
+                # A removed or damaged review for another photo must not
+                # prevent finding a valid review for this source.
+                continue
             if receipt.get("source", {}).get("sha256") != source["sha256"]:
                 continue
             if (receipt.get("source", {}).get("path")
@@ -1564,8 +1747,8 @@ class WorkflowProject:
         """Export the current photo's explicitly requested saved legacy result."""
         photo = self.photo()
         job = self.saved_job(photo)
-        if not job or not self.highlight_reprocess_required(photo, saved=job):
-            raise ValueError("当前照片没有需要更新的旧版高光成片")
+        if not job or not self.native_render_updates(photo, saved=job):
+            raise ValueError("当前照片没有需要更新的旧版成片")
         mode = RESULT_MODES[photo["engine"]]
         sample = self.workspace.sample(job)
         record = self.confirmed_record(sample.record(mode, "baseline"), photo)

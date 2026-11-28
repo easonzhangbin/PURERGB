@@ -1,297 +1,239 @@
-"""Offline vector teaching illustrations; sample curves/data are not measurements."""
+"""Offline photo and diagram panels for the first-use introduction."""
 
+from functools import lru_cache
 import math
+from pathlib import Path
 
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt
-from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF, QRadialGradient
+from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
 
-
-PAGE_KEYS = ("welcome", "science", "prepare", "workflow", "sources")
-PAGE_TITLES = dict(welcome="三色采集流程", science="染料吸收与窄波段示意", prepare="片基和平场参考",
-                   workflow="线性信号与相对密度", sources="参考资料的不同用途")
-COLORS = ("#ff453a", "#32d74b", "#0a84ff")
+from .workflow_onboarding_theme import _luminance, theme_tokens
 
 
-def _luminance(value):
+ASSETS = Path(__file__).resolve().parents[1] / "assets/ui/onboarding"
+PAGE_KEYS = ("welcome", "science", "prepare", "workflow")
+DESCRIPTIONS = {
+    "welcome": ("实拍三色与正像", "同一格底片的红光、绿光、蓝光 RAW 灰度预览，以及 PURE RGB 转换后的正像。"),
+    "science": ("染料吸收与窄波段", "概念示意，非实测曲线。黄色、品红、青色染料对不同波长的吸收有重叠。"),
+    "prepare": ("橙色片基框和蓝色画幅框", "橙框在两帧之间并避开齿孔，比较三路片基信号。蓝框圈定保留画幅，检查原始 RAW 白位。"),
+    "workflow": ("有效画幅中心测量", "白框是有效画幅，绿色内框是居中且保持长宽比的约百分之八十的密度测量面积。"),
+}
+
+
+def _readable(value, background):
+    """Retain a channel hue while keeping annotation text legible."""
     color = QColor(value)
-    linear = [part / 12.92 if part <= .04045 else ((part + .055) / 1.055) ** 2.4
-              for part in (color.redF(), color.greenF(), color.blueF())]
-    return sum(part * weight for part, weight in zip(linear, (.2126, .7152, .0722)))
-
-
-def _readable_channel(value, background):
-    """Keep the system hue while making small chart annotations readable."""
-    color = QColor(value)
-    background_luma = _luminance(background)
+    target = _luminance(background)
     hue, saturation, lightness, alpha = color.getHslF()
     for _ in range(40):
-        low, high = sorted((_luminance(color), background_luma))
+        low, high = sorted((_luminance(color.name()), target))
         if (high + .05) / (low + .05) >= 4.5:
             break
-        lightness = max(0., min(1., lightness + (.025 if background_luma < .4 else -.025)))
+        lightness = min(1, max(0, lightness + (.025 if target < .4 else -.025)))
         color.setHslF(hue, saturation, lightness, alpha)
     return color.name()
 
 
 def visual_theme(dark, colors=None):
-    """Semantic surfaces and accessible annotation colours for both appearances."""
     if type(dark) is not bool:
         raise ValueError("图示外观需要深色或浅色布尔值")
-    result = (dict(background="#1c1c1e", card="#2c2c2e", divider="#48484a",
-                 text="#f5f5f7", secondary="#a1a1a6", accent="#ffd089",
-                 channels=COLORS, curves=("#e8c867", "#e292cb", "#78cad5"),
-                 lens="#121214", lens_edge="#98989d") if dark else
-            dict(background="#f5f5f7", card="#ffffff", divider="#d2d2d7",
-                 text="#1d1d1f", secondary="#6e6e73", accent="#8a5700",
-                 channels=("#d70015", "#248a3d", "#0066cc"),
-                 curves=("#967000", "#a72e79", "#007785"),
-                 lens="#dce3eb", lens_edge="#818995"))
-    if colors is None:
-        try:
-            from .workflow_onboarding_theme import theme_tokens
+    colors = colors or theme_tokens(dark)
+    card = colors["card"]
+    return dict(
+        background=colors["surface"], card=card, divider=colors["edge"],
+        text=colors["text"], secondary=colors["secondary"],
+        channels=tuple(_readable(colors[key], card) for key in ("red", "green", "blue")),
+        curves=("#ebca6b", "#ed9bd3", "#82d6e1") if dark else ("#876300", "#943277", "#006e83"),
+        film_base="#cba57e", orange="#ffad42", blue="#76bcff", mint="#72e1af",
+    )
 
-            colors = theme_tokens(dark)
-        except ImportError:
-            colors = None
-    if colors is not None:
-        for target, source in (("background", "surface"), ("card", "card"), ("divider", "edge"),
-                               ("text", "text"), ("secondary", "secondary")):
-            if source in colors:
-                result[target] = colors[source]
-        result["channels"] = tuple(colors.get(key, value) for key, value in
-                                    zip(("red", "green", "blue"), result["channels"]))
-    result["channels"] = tuple(_readable_channel(color, result["card"]) for color in result["channels"])
-    return result
+
+@lru_cache(maxsize=4)
+def _image(name):
+    return QImage(str(ASSETS / f"{name}.jpg"))
 
 
 class _Illustration(QWidget):
+    WIDTH = 900
+    HEIGHT = 326
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.page_key = "welcome"
-        self.dark = True
         self.colors = visual_theme(True)
-        self.setMinimumSize(560, 250)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumSize(560, 222)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
     def sizeHint(self):
-        return QSize(840, 310)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor(self.colors["background"]))
-        scale = min(self.width() / 960, self.height() / 340)
-        painter.translate((self.width() - 960 * scale) / 2, (self.height() - 340 * scale) / 2)
-        painter.scale(scale, scale)
-        getattr(self, "_" + self.page_key)(painter)
+        return QSize(870, 316)
 
     def set_theme(self, dark, *, colors=None):
         self.colors = visual_theme(dark, colors)
-        self.dark = dark
         self.update()
 
-    @property
-    def channel_colors(self):
-        return self.colors["channels"]
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        painter.fillRect(self.rect(), QColor(self.colors["background"]))
+        scale = min(self.width() / self.WIDTH, self.height() / self.HEIGHT)
+        painter.translate((self.width() - self.WIDTH * scale) / 2, (self.height() - self.HEIGHT * scale) / 2)
+        painter.scale(scale, scale)
+        self._panel(painter, (5, 5, 890, 316))
+        getattr(self, "_" + self.page_key)(painter)
 
-    def _color(self, value, default):
-        if isinstance(value, QColor):
-            return value
-        secondary = {"#d1c8bb", "#bfc6d2", "#b7beca", "#c4c9d2", "#e1c6a5",
-                     "#d3dbe6", "#bdc5d1", "#c6cbd5", "#c4cad3", "#bfc6d1"}
-        cards = {"#2c2f35", "#303239", "#32363b", "#4f5662", "#303740", "#3b3430"}
-        accents = {"#ffca79", "#ffbd65"}
-        role = ("secondary" if value in secondary else "card" if value in cards
-                else "accent" if value in accents else "divider" if value in {"#555961", "#515660", "#b5bdc9"}
-                else "text" if value == "#f2ede4" else None)
-        return QColor(self.colors[role or default] if value is None or role else value)
-
-    def _text(self, painter, box, text, *, color=None, size=20, bold=False):
-        font = painter.font()
+    def _text(self, p, box, text, *, color=None, size=21, bold=False, center=False):
+        font = p.font()
         font.setPixelSize(size)
         font.setWeight(QFont.Weight.DemiBold if bold else QFont.Weight.Normal)
-        painter.setFont(font)
-        painter.setPen(self._color(color, "text"))
-        painter.drawText(QRectF(*box), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, text)
+        p.setFont(font)
+        p.setPen(QColor(color or self.colors["text"]))
+        alignment = Qt.AlignmentFlag.AlignVCenter | (
+            Qt.AlignmentFlag.AlignHCenter if center else Qt.AlignmentFlag.AlignLeft)
+        p.drawText(QRectF(*box), alignment, text)
 
-    def _panel(self, painter, box, color=None, edge=None, radius=12):
-        painter.setPen(QPen(self._color(edge, "divider"), .7) if edge is not False else Qt.PenStyle.NoPen)
-        painter.setBrush(self._color(color, "card"))
-        painter.drawRoundedRect(QRectF(*box), radius, radius)
+    def _line(self, p, x0, y0, x1, y1, color, width=1):
+        p.setPen(QPen(QColor(color), width))
+        p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
 
-    def _arrow(self, painter, x0, y, x1, color=None):
-        painter.setPen(QPen(self._color(color, "secondary"), 2))
-        painter.drawLine(QPointF(x0, y), QPointF(x1 - 7, y))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(self._color(color, "secondary"))
-        painter.drawPolygon(QPolygonF((QPointF(x1, y), QPointF(x1 - 10, y - 7), QPointF(x1 - 10, y + 7))))
+    def _panel(self, p, box, *, fill=None, border=None, radius=18):
+        p.setPen(QPen(QColor(border or self.colors["divider"]), 1))
+        p.setBrush(QColor(fill or self.colors["card"]))
+        p.drawRoundedRect(QRectF(*box), radius, radius)
 
-    def _film(self, painter, box, *, image=True):
-        x, y, w, h = box
-        self._panel(painter, box, "#624133", "#ba8061", 5)
-        for i in range(6):
-            for py in (y + 5, y + h - 13):
-                painter.setBrush(QColor("#1b1e24"))
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.drawRoundedRect(QRectF(x + 9 + i * (w - 27) / 5, py, 10, 8), 2, 2)
-        if image:
-            painter.setBrush(QColor("#997156"))
-            painter.drawRect(QRectF(x + 13, y + 21, w - 26, h - 42))
-            painter.setBrush(QColor("#4c6472"))
-            painter.drawEllipse(QPointF(x + w * .7, y + h * .4), 11, 11)
-            painter.setBrush(QColor("#4f7165"))
-            painter.drawPolygon(QPolygonF((QPointF(x + 15, y + h - 21), QPointF(x + w * .4, y + h * .42),
-                                           QPointF(x + w - 13, y + h - 21))))
+    def _photo(self, p, box, name, *, radius=9):
+        image = _image(name)
+        rect = QRectF(*box)
+        if image.isNull():
+            self._panel(p, box)
+            self._text(p, box, "样片暂不可用", size=14, center=True)
+            return
+        scale = max(rect.width() / image.width(), rect.height() / image.height())
+        w, h = rect.width() / scale, rect.height() / scale
+        source = QRectF((image.width() - w) / 2, (image.height() - h) / 2, w, h)
+        clip = QPainterPath()
+        clip.addRoundedRect(rect, radius, radius)
+        p.save()
+        p.setClipPath(clip)
+        p.drawImage(rect, image, source)
+        p.restore()
+
+    def _outline(self, p, box, color, *, width=2, dashed=False):
+        style = Qt.PenStyle.DashLine if dashed else Qt.PenStyle.SolidLine
+        p.setPen(QPen(QColor(color), width, style))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(QRectF(*box))
 
     def _welcome(self, p):
-        self._text(p, (18, 8, 924, 26), "依次照明  ·  固定底片和相机  ·  保留三张 RAW", color="#bfc6d2", size=17)
-        for i, (channel, color) in enumerate(zip("RGB", self.channel_colors)):
-            y = 71 + i * 61
-            tint = QColor(color)
-            tint.setAlpha(28 if self.dark else 18)
-            self._panel(p, (32, y, 95, 44), tint, False)
-            self._text(p, (32, y, 95, 44), channel + " 灯", color=color, bold=True)
-            self._arrow(p, 143, y + 22, 192, color)
-        self._film(p, (207, 76, 152, 170))
-        self._text(p, (200, 254, 166, 30), "固定底片", color="#d1c8bb")
-        self._arrow(p, 378, 160, 419)
-        self._panel(p, (433, 107, 127, 106))
-        self._panel(p, (461, 92, 48, 20), "#4f5662")
-        p.setPen(QPen(QColor(self.colors["lens_edge"]), 3))
-        p.setBrush(QColor(self.colors["lens"]))
-        p.drawEllipse(QPointF(496, 160), 31, 31)
-        p.setPen(QPen(QColor(self.colors["lens_edge"]), 1))
-        p.drawEllipse(QPointF(496, 160), 22, 22)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(self.colors["card"]))
-        p.drawEllipse(QPointF(487, 151), 5, 5)
-        self._text(p, (418, 254, 158, 30), "相机保持不动", color="#d1c8bb")
-        self._arrow(p, 578, 160, 620)
-        for i, (channel, color) in enumerate(zip("RGB", self.channel_colors)):
-            self._panel(p, (638, 63 + i * 67, 98, 49))
-            self._text(p, (638, 63 + i * 67, 98, 49), channel + " RAW", color=color)
-        self._arrow(p, 756, 160, 800)
-        self._panel(p, (815, 103, 115, 114), "#32363b")
-        p.fillRect(QRectF(831, 119, 82, 56), QColor("#b6c5cf"))
-        p.setBrush(QColor("#ecd5a1"))
-        p.drawEllipse(QPointF(892, 134), 8, 8)
-        p.setBrush(QColor("#728b70"))
-        p.drawPolygon(QPolygonF((QPointF(831, 175), QPointF(857, 139), QPointF(886, 175))))
-        p.setBrush(QColor("#526d65"))
-        p.drawPolygon(QPolygonF((QPointF(857, 175), QPointF(886, 148), QPointF(913, 175))))
-        self._text(p, (818, 180, 109, 28), "合成影像", size=18)
-        self._text(p, (126, 297, 708, 28), "三个光谱观测，进入同一套转换流程", color="#bfc6d2", size=18)
+        muted = self.colors["secondary"]
+        for index, (name, cn, letter, color) in enumerate(
+            zip(("red", "green", "blue"), ("红光", "绿光", "蓝光"), "RGB", self.colors["channels"])
+        ):
+            y = 25 + index * 94
+            self._photo(p, (28, y, 112, 86), name)
+            self._text(p, (164, y + 5, 184, 39), cn, color=color, size=25, bold=True)
+            self._text(p, (164, y + 43, 184, 34), letter + " 路 RAW", color=muted, size=18)
+        self._line(p, 319, 163, 387, 163, muted, 1.5)
+        self._line(p, 378, 155, 387, 163, muted, 1.5)
+        self._line(p, 378, 171, 387, 163, muted, 1.5)
+        self._photo(p, (420, 25, 449, 232), "positive")
+        self._text(p, (420, 268, 220, 35), "合成并转换后的正像", size=20, bold=True)
+        self._text(p, (687, 268, 180, 35), "同一格实拍底片", color=muted, size=16)
 
     def _science(self, p):
-        self._text(p, (28, 2, 904, 28), "概念示意 · 非实测曲线", color="#bfc6d2", size=17)
-        x, y, w, h = 90, 72, 792, 150
-        for center, color in ((.23, self.channel_colors[2]), (.51, self.channel_colors[1]), (.79, self.channel_colors[0])):
-            band_color = QColor(color)
-            band_color.setAlpha(35 if self.dark else 22)
-            p.fillRect(QRectF(x + (center - .018) * w, y, .036 * w, h), band_color)
-        curves = ((.23, .14, .11, .56, self.colors["curves"][0], "黄染料"),
-                  (.51, .13, .14, .78, self.colors["curves"][1], "品红染料"),
-                  (.79, .15, .13, .47, self.colors["curves"][2], "青染料"))
-        # Smooth invented side-absorption curves teach overlap only. They do
-        # not encode any stock's wavelength, spectral power, or measured data.
-        for center, sigma, side, side_center, color, _ in curves:
-            path = QPainterPath()
-            for step in range(161):
-                u = step / 160
-                value = .08 + .78 * math.exp(-.5 * ((u - center) / sigma) ** 2)
-                value += side * math.exp(-.5 * ((u - side_center) / .19) ** 2)
-                point = QPointF(x + u * w, y + h * (1 - value))
-                path.moveTo(point) if step == 0 else path.lineTo(point)
+        muted = self.colors["secondary"]
+        self._text(p, (31, 17, 280, 37), "相对吸收", size=20, bold=True)
+        self._text(p, (678, 17, 195, 37), "概念示意", color=muted, size=16)
+        x, y, w, h = 69, 63, 758, 154
+        for line in range(4):
+            level = y + h * line / 3
+            self._line(p, x, level, x + w, level, self.colors["divider"])
+        bands = (.22, .52, .79)
+        for center, color in zip(bands, reversed(self.colors["channels"])):
+            tint = QColor(color)
+            tint.setAlpha(38)
+            p.fillRect(QRectF(x + (center - .027) * w, y, .054 * w, h), tint)
+        for center, width, shoulder, color in zip(bands, (.15, .13, .16), (.58, .81, .48), self.colors["curves"]):
+            curve = QPainterPath()
+            for i in range(145):
+                u = i / 144
+                strength = .08 + .78 * math.exp(-.5 * ((u - center) / width) ** 2)
+                strength += .13 * math.exp(-.5 * ((u - shoulder) / .17) ** 2)
+                point = QPointF(x + w * u, y + h * (1 - strength))
+                curve.moveTo(point) if i == 0 else curve.lineTo(point)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(QPen(QColor(color), 3))
-            p.drawPath(path)
-        p.setPen(QPen(QColor(self.colors["divider"]), 1))
-        p.drawLine(QPointF(x, y + h), QPointF(x + w, y + h))
-        p.drawLine(QPointF(x, y), QPointF(x, y + h))
-        self._text(p, (14, 102, 65, 80), "相对\n吸收", size=18)
-        self._text(p, (x - 10, y + h + 3, 140, 28), "短波", color=self.channel_colors[2], size=18)
-        self._text(p, (x + w - 130, y + h + 3, 140, 28), "长波", color=self.channel_colors[0], size=18)
-        self._text(p, (288, y + h + 3, 390, 28), "波长方向（不标定具体波长）", color="#b7beca", size=18)
-        for index, item in enumerate(curves):
-            self._text(p, (156 + index * 240, 37, 205, 30), item[-1], color=item[-2], size=18)
-        self._text(p, (70, 267, 820, 28), "光源光谱  ×  胶片透射  ×  传感器响应", bold=True, size=21)
-        self._text(p, (60, 306, 840, 24), "共同决定信号；窄波段有助于分离，但不会使侧吸收归零。", color="#c4c9d2", size=17)
+            p.drawPath(curve)
+        self._text(p, (69, 222, 170, 31), "短波", color=muted, size=17)
+        self._text(p, (364, 222, 173, 31), "波长方向", color=muted, size=17, center=True)
+        self._text(p, (776, 222, 51, 31), "长波", color=muted, size=17)
+        for x0, name, color in zip((132, 383, 644), ("黄染料", "品红染料", "青染料"), self.colors["curves"]):
+            self._line(p, x0, 283, x0 + 30, 283, color, 3)
+            self._text(p, (x0 + 41, 263, 155, 40), name, size=19)
 
     def _prepare(self, p):
-        for box in ((24, 10, 438, 315), (498, 10, 438, 315)):
-            self._panel(p, box)
-        self._text(p, (36, 22, 414, 35), "片基参考 · 放入片基", bold=True, size=22)
-        self._text(p, (510, 22, 414, 35), "平场参考 · 移开底片", bold=True, size=23)
-        p.fillRect(QRectF(56, 77, 374, 164), QColor("#c5c9cb"))
-        self._film(p, (145, 108, 195, 104), image=False)
-        p.setPen(QPen(QColor("#ff9f0a"), 3))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRect(QRectF(203, 136, 80, 47))
-        for x in (203, 283):
-            for y in (136, 183):
-                p.fillRect(QRectF(x - 4, y - 4, 8, 8), QColor("#ff9f0a"))
-        gradient = QRadialGradient(QPointF(717, 159), 245)
-        gradient.setColorAt(0, QColor("#eef0ec"))
-        gradient.setColorAt(1, QColor("#a3acb9"))
-        p.fillRect(QRectF(530, 77, 374, 164), gradient)
-        self._text(p, (72, 251, 342, 62), "R / G / B 各拍一次\n小块片基也可局部采样", color="#e1c6a5", size=20)
-        self._text(p, (544, 251, 346, 62), "均匀白光参考\n用于修正空间亮度不均", color="#d3dbe6", size=20)
-
-    def _workflow(self, p):
-        self._text(p, (20, 4, 920, 27), "保留采集信息，再决定正像怎样呈现", color="#bfc6d2", size=17)
-        names = ("线性 RAW", "平场校正", "密度测量", "印相／显示", "16 位输出")
-        for index, label in enumerate(names):
-            x = 23 + index * 188
-            self._panel(p, (x, 55, 162, 69), "#303740" if index < 3 else "#3b3430")
-            self._text(p, (x + 5, 60, 152, 59), label, size=21, bold=True)
-            if index < 4:
-                self._arrow(p, x + 169, 89, x + 181)
-        self._panel(p, (25, 148, 910, 172))
-        self._text(p, (46, 157, 870, 29), "相对片基密度 · 扣除暗信号后", bold=True, size=20)
-        self._text(p, (43, 199, 422, 48), "T_rel = (I − I_dark) / (I_base − I_dark)", size=21)
-        self._text(p, (43, 257, 422, 39), "D_rel = −log₁₀(T_rel)", size=25)
-        for index, (transmission, density) in enumerate(((1., 0.), (.5, .301), (.1, 1.))):
-            x = 490 + index * 140
-            level = round(45 + 200 * transmission)
-            self._panel(p, (x + 28, 196, 74, 26), QColor(level, level, level), radius=4)
-            self._text(p, (x, 230, 130, 30), f"T_rel = {transmission:g}", size=19)
-            self._text(p, (x, 268, 130, 33), f"D_rel = {density:g}", size=20, bold=True)
-
-    def _sources(self, p):
-        self._text(p, (20, 4, 920, 28), "参考资料各有适用范围", color="#bfc6d2", size=17)
-        cards = (("片基", "采集曝光与透射参考", "没有画面的底片\n不是中灰目标", self.colors["accent"]),
-                 ("LAD", "印相／流程质控", "规定条件下的中间调\n不等同于片基", self.colors["text"]),
-                 ("编码", "数字文件容纳多少信息", "16 位能更细地记录\n不能补回采集丢失", self.channel_colors[2]))
-        for index, (name, purpose, caption, color) in enumerate(cards):
-            x = 25 + index * 313
-            self._panel(p, (x, 62, 283, 234))
+        muted = self.colors["secondary"]
+        self._text(p, (30, 18, 437, 36), "片间空隙取样示意", size=22, bold=True)
+        self._panel(p, (30, 66, 458, 175), fill=self.colors["film_base"], border="#987358", radius=9)
+        for index in range(12):
+            for y in (75, 221):
+                p.setBrush(QColor("#302b28"))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawRoundedRect(QRectF(44 + index * 36, y, 18, 11), 2, 2)
+        self._photo(p, (41, 94, 192, 117), "red", radius=2)
+        self._photo(p, (256, 94, 221, 117), "green", radius=2)
+        self._outline(p, (239, 118, 11, 69), self.colors["orange"], width=2.6)
+        self._outline(p, (265, 102, 203, 100), self.colors["blue"], dashed=True)
+        for x, hue, name in ((32, "orange", "片基量区"), (251, "blue", "保留画幅")):
+            color = self.colors[hue]
+            self._line(p, x, 277, x + 25, 277, color, 3)
+            self._text(p, (x + 39, 258, 159, 38), name, size=20)
+        self._line(p, 515, 31, 515, 291, self.colors["divider"])
+        self._text(p, (549, 27, 288, 34), "灯光配平", size=22, bold=True)
+        self._text(p, (549, 61, 314, 29), "比较三路片基信号", color=muted, size=17)
+        self._line(p, 724, 99, 724, 169, self.colors["divider"])
+        for i, (letter, color, end) in enumerate(zip("RGB", self.colors["channels"], (703, 724, 741))):
+            y = 109 + 25 * i
+            self._text(p, (549, y - 12, 37, 24), letter, color=color, size=17, bold=True)
+            self._line(p, 589, y, 855, y, self.colors["divider"])
+            self._line(p, 724, y, end, y, color, 4)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(color))
-            if index == 0:
-                p.drawRoundedRect(QRectF(x + 112, 91, 59, 47), 4, 4)
-            elif index == 1:
-                for cell in range(5):
-                    value = 48 + cell * 42
-                    p.fillRect(QRectF(x + 42 + cell * 40, 98, 38, 33), QColor(value, value, value))
-            else:
-                for cell in range(12):
-                    p.fillRect(QRectF(x + 41 + cell * 17, 98, 16, 33), QColor(43 + cell * 17, 55 + cell * 16, 72 + cell * 15))
-            self._text(p, (x + 10, 150, 263, 35), name, color=color, bold=True, size=25)
-            self._text(p, (x + 10, 190, 263, 32), purpose, size=19)
-            self._text(p, (x + 10, 236, 263, 48), caption, color="#c4cad3", size=18)
-        self._text(p, (60, 310, 840, 25), "资料出处可展开阅读；示意图与演示数字不是设备标定结果。", color="#bfc6d1", size=18)
+            p.drawEllipse(QPointF(end, y), 4, 4)
+        self._text(p, (549, 183, 288, 34), "RAW 曝光余量", size=22, bold=True)
+        self._line(p, 549, 232, 855, 232, self.colors["divider"], 3)
+        self._line(p, 549, 232, 772, 232, self.colors["blue"], 4)
+        self._line(p, 855, 222, 855, 242, muted, 2)
+        self._text(p, (549, 250, 317, 36), "100% 是原始 RAW 白电平上限", color=muted, size=17)
+
+    def _workflow(self, p):
+        muted = self.colors["secondary"]
+        self._photo(p, (36, 25, 348, 276), "positive")
+        x, y, w, h = 51, 48, 318, 230
+        self._outline(p, (x, y, w, h), "#ffffff", dashed=True)
+        inset = (1 - math.sqrt(.8)) / 2
+        self._outline(p, (x + w * inset, y + h * inset, w * (1 - 2 * inset), h * (1 - 2 * inset)),
+                      self.colors["mint"], width=3)
+        self._text(p, (439, 29, 412, 51), "中心约 80%", size=40, bold=True)
+        self._text(p, (439, 83, 412, 37), "按有效画幅面积计算", color=muted, size=21)
+        for y, color, label in ((147, muted, "有效画幅"), (186, self.colors["mint"], "默认密度测量区")):
+            self._line(p, 439, y, 467, y, color, 3)
+            self._text(p, (484, y - 19, 372, 38), label, size=19)
+        self._line(p, 439, 219, 856, 219, self.colors["divider"])
+        self._text(p, (439, 230, 417, 28), "导入 → 测量 → 转换调色", size=19)
+        self._text(p, (439, 266, 417, 27), "修整 → 审阅 → 导出", color=muted, size=19)
 
 
 class OnboardingVisual(QWidget):
-    """A responsive illustration for an introduction page."""
+    """A scalable, accessible illustration for an introduction page."""
+
     def __init__(self, parent=None, page_key="welcome"):
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.canvas = _Illustration(self)
-        layout.addWidget(self.canvas, 1)
+        layout.addWidget(self.canvas)
         self.set_page(page_key)
 
     @property
@@ -306,19 +248,10 @@ class OnboardingVisual(QWidget):
         if key not in PAGE_KEYS:
             raise ValueError("未知首次介绍图示")
         self.canvas.page_key = key
-        self.setAccessibleName("首次使用图示：" + PAGE_TITLES[key])
-        self._update_description()
+        name, description = DESCRIPTIONS[key]
+        self.setAccessibleName("首次使用图示：" + name)
+        self.setAccessibleDescription(description)
         self.canvas.update()
-
-    def _update_description(self):
-        if self.page_key == "science":
-            self.setAccessibleDescription("概念示意，非实测曲线：三种染料主吸收与侧吸收，三个可选窄波段。")
-        elif self.page_key == "workflow":
-            self.setAccessibleDescription("线性RAW经平场、密度、印相显示到16位输出；以片基归一化透射率0.5对应相对密度约0.301。")
-        elif self.page_key == "sources":
-            self.setAccessibleDescription("片基用于采集曝光与透射参考，LAD用于印相流程质控，编码用于记录已采得信息；三者不能互相替代。")
-        else:
-            self.setAccessibleDescription("离线矢量示意；不使用照片、光谱实测或设备标定数据。")
 
 
 def create_page_visual(page_key, parent=None):

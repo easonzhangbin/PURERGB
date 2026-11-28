@@ -5,7 +5,9 @@ from PyQt6.QtWidgets import QApplication, QDialog, QFrame, QLabel, QPushButton, 
 
 from .branding import application_icon
 from .release import version_description
+from .workflow_border_beam import WorkflowBorderBeam
 from .workflow_branding import header_logo
+from .workflow_glass import observe_appearance
 from .workflow_onboarding_theme import body_font, theme_tokens
 from .workflow_support import DONORS
 
@@ -26,6 +28,12 @@ class AboutDialog(QDialog):
             QVBoxLayout.SizeConstraint.SetNoConstraint, QVBoxLayout.SizeConstraint.SetFixedSize,
         )
 
+        header = QFrame()
+        header.setObjectName("aboutHeader")
+        self.header_layout = QVBoxLayout(header)
+        self.header_layout.setSpacing(4)
+        layout.addWidget(header)
+
         icon = QLabel()
         icon.setAccessibleName("PURE RGB 应用图标")
         ratio = self.devicePixelRatioF()
@@ -33,18 +41,19 @@ class AboutDialog(QDialog):
         pixmap = application_icon().pixmap(QSize(icon_pixels, icon_pixels), 1.0)
         pixmap.setDevicePixelRatio(ratio)
         icon.setPixmap(pixmap)
-        layout.addWidget(icon, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.header_layout.addWidget(icon, alignment=Qt.AlignmentFlag.AlignHCenter)
 
         wordmark = QLabel()
         wordmark.setObjectName("aboutWordmark")
         wordmark.setAccessibleName("PURE RGB")
         wordmark.setAlignment(Qt.AlignmentFlag.AlignCenter)
         wordmark.setPixmap(header_logo(44))
-        layout.addWidget(wordmark, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.header_layout.addWidget(wordmark, alignment=Qt.AlignmentFlag.AlignHCenter)
 
         version = self._text(f"版本 {version_description()}", "aboutVersion")
         version.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(version)
+        self.header_layout.addWidget(version)
+        self.header_beam = WorkflowBorderBeam(header)
 
         layout.addSpacing(10)
         layout.addWidget(self._text("StudioPURE 出品", "aboutCredit"))
@@ -69,6 +78,7 @@ class AboutDialog(QDialog):
 
         self.apply_appearance()
         QApplication.instance().styleHints().colorSchemeChanged.connect(self._appearance_changed)
+        observe_appearance(self, self._appearance_changed)
 
     @staticmethod
     def _text(value, name=""):
@@ -78,14 +88,21 @@ class AboutDialog(QDialog):
         label.setWordWrap(True)
         return label
 
-    def _appearance_changed(self, _scheme):
+    def _appearance_changed(self, *_):
         self.apply_appearance()
 
     def apply_appearance(self, dark=None):
         colors = theme_tokens(dark)
+        obsidian = colors["obsidian"]
         wordmark_background = "transparent" if colors["dark"] else "#1c1c1e"
+        header_background = colors["card"] if obsidian else "transparent"
+        header_border = f"1px solid {colors['edge']}" if obsidian else "0"
+        header_padding = 8 if obsidian else 0
+        self.header_layout.setContentsMargins(0, header_padding, 0, header_padding)
         self.setStyleSheet(f"""
             QDialog#aboutWindow {{ background: {colors['surface']}; }}
+            QFrame#aboutHeader {{ background: {header_background}; border: {header_border};
+                border-radius: 12px; }}
             QDialog#aboutWindow QLabel {{ background: transparent; color: {colors['text']};
                 font-size: 13px; font-weight: 400; }}
             QDialog#aboutWindow QLabel#aboutWordmark {{
@@ -104,6 +121,7 @@ class AboutDialog(QDialog):
             QDialog#aboutWindow QPushButton:pressed {{ background: {colors['selected']}; }}
             QDialog#aboutWindow QPushButton:focus {{ border-color: {colors['link']}; }}
         """)
+        self.header_beam.set_visible_for_theme(obsidian)
 
 
 def about_dialog(parent=None):

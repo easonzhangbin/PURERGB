@@ -34,7 +34,7 @@ from .workspace import (
     checked_nikon_research_controls,
 )
 from .flatfield import FILE_FILTER, RAW_EXTENSIONS
-from .native import sha256
+from .raw_import import file_identity
 from .preview_data import ROOT
 from .tasks import Tasks
 from .workflow_combo import WorkflowComboBox as QComboBox
@@ -305,7 +305,7 @@ class RecipeDialog(QDialog):
         self.flat_tasks.start(
             {
                 "action": "flatfield_import",
-                "calibration": {"path": str(path), "sha256": sha256(path)},
+                "calibration": {"path": str(path), "file_identity": file_identity(path)},
                 "directory": str(directory),
                 "targets": [p for group in self.groups for p in group],
             }

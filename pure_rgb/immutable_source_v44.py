@@ -65,7 +65,13 @@ class ImmutableSourceCertificate:
         instance._leaf_lock = threading.Lock()
         instance._leaf_pool = None
         instance.checkpoint = None
-        _CERTIFICATES[id(frozen)] = weakref.ref(instance)
+        source_id = id(frozen)
+
+        def forget(reference):
+            if _CERTIFICATES.get(source_id) is reference:
+                _CERTIFICATES.pop(source_id, None)
+
+        _CERTIFICATES[source_id] = weakref.ref(instance, forget)
         return instance
 
     def validate(self, source=None, identity=None):

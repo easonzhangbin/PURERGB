@@ -3,6 +3,20 @@
 from contextlib import contextmanager
 
 
+def native_print_values(settings, metrics):
+    from negpy.features.exposure.auto_sliders import print_shown_values
+    from negpy.features.exposure.papers import effective_paper_profile
+
+    shown = print_shown_values(settings.exposure, settings.process.process_mode, metrics)
+    return dict(
+        paper=effective_paper_profile(settings.exposure.paper_profile,
+                                      settings.process.process_mode).label,
+        density=float(shown.get("density", settings.exposure.density)),
+        grade=float(shown.get("grade", settings.exposure.grade)),
+        auto_density="density" in shown, auto_grade="grade" in shown,
+    )
+
+
 @contextmanager
 def collect_print_values(processor):
     processor.pure_native_print = None
@@ -16,17 +30,7 @@ def collect_print_values(processor):
         pixels, metrics = original(*args, **kwargs)
         settings = args[1] if len(args) > 1 else kwargs.get("settings")
         if settings is not None and metrics:
-            from negpy.features.exposure.auto_sliders import print_shown_values
-            from negpy.features.exposure.papers import effective_paper_profile
-
-            shown = print_shown_values(settings.exposure, settings.process.process_mode, metrics)
-            processor.pure_native_print = dict(
-                paper=effective_paper_profile(settings.exposure.paper_profile,
-                                              settings.process.process_mode).label,
-                density=float(shown.get("density", settings.exposure.density)),
-                grade=float(shown.get("grade", settings.exposure.grade)),
-                auto_density="density" in shown, auto_grade="grade" in shown,
-            )
+            processor.pure_native_print = native_print_values(settings, metrics)
         return pixels, metrics
 
     processor.run_pipeline = run

@@ -33,6 +33,21 @@ def normalized_box(rect, shape, inset):
     return box, inner
 
 
+
+def metering_region_from_frame(bounds, shape):
+    """Center the automatic metering region within a confirmed source frame."""
+    h, w = shape[:2]
+    if (len(bounds) != 4 or any(type(v) is not int for v in bounds)
+            or not (0 <= bounds[0] < bounds[2] <= w and 0 <= bounds[1] < bounds[3] <= h)):
+        raise ValueError("有效画幅范围无效")
+    x0, y0, x1, y1 = bounds
+    dx = math.ceil((x1 - x0) * AUTO_PICTURE_INSET)
+    dy = math.ceil((y1 - y0) * AUTO_PICTURE_INSET)
+    inner = [x0 + dx, y0 + dy, x1 - dx, y1 - dy]
+    if inner[2] - inner[0] < 16 or inner[3] - inner[1] < 16:
+        raise ValueError("有效画幅太小，无法测量中心区域")
+    return inner
+
 def detect_picture(image, inset=AUTO_PICTURE_INSET):
     from negpy.features.geometry.logic import resolve_meter_rect
     from negpy.features.geometry.models import GeometryConfig

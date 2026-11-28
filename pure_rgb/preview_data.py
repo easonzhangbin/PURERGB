@@ -5,6 +5,7 @@ import ctypes
 import errno
 import hashlib
 import json
+from math import prod
 import os
 from pathlib import Path
 import sys
@@ -93,6 +94,83 @@ def _checked_pixels(path):
     return pixels, icc
 
 
+def _rgb_page(tif):
+    if len(tif.series) != 1 or len(tif.pages) != 1:
+        return None
+    series = tif.series[0]
+    page = tif.pages[0]
+    shape = series.shape
+    tag = page.tags.get(34675)
+    if (series.axes != "YXS" or shape != page.shape or len(shape) != 3
+            or min(shape) <= 0 or shape[2] != 3 or series.dtype != np.dtype(np.uint16)
+            or tag is None or not tag.value or page.planarconfig != 1 or page.photometric != 2):
+        return None
+    return series, page, bytes(tag.value)
+
+
+def contiguous_rgb_layout(tif, file_size):
+    """Describe an uncompressed RGB16 TIFF that can be consumed by rows."""
+    rgb = _rgb_page(tif)
+    if rgb is None:
+        return None
+    series, page, icc = rgb
+    if not page.is_final:
+        return None
+    offset = series.dataoffset
+    pixel_bytes = prod(series.shape) * 2
+    if (offset is None or offset <= 0 or offset + pixel_bytes > file_size
+            or sum(page.databytecounts) != pixel_bytes):
+        return None
+    return series.shape, icc, offset, np.dtype(tif.byteorder + "u2")
+
+
+def deflate_rgb_strips(tif, file_size):
+    """Decode each strip of an ordinary compressed RGB16 TIFF in order."""
+    rgb = _rgb_page(tif)
+    if rgb is None:
+        return None
+    series, page, icc = rgb
+    height, width, channels = series.shape
+    rows_per_strip = page.rowsperstrip
+    if (page.compression not in (8, 32946) or page.is_tiled or not rows_per_strip
+            or min(rows_per_strip, height) * width * channels * 2 > 16 * 1024**2):
+        return None
+    strip_count = (height + rows_per_strip - 1) // rows_per_strip
+    if (len(page.dataoffsets) != strip_count or len(page.databytecounts) != strip_count
+            or any(not 0 < start < start + size <= file_size
+                   for start, size in zip(page.dataoffsets, page.databytecounts))):
+        return None
+
+    def strips():
+        row = 0
+        for pixels, position, _ in page.segments(maxworkers=min(4, page.maxworkers), buffersize=2 * 1024**2):
+            rows = min(rows_per_strip, height - row)
+            if (rows <= 0 or position != (0, 0, row, 0, 0) or pixels is None
+                    or pixels.shape != (1, rows, width, channels) or pixels.dtype != np.uint16):
+                raise ValueError("RGB16 TIFF 的压缩像素区不完整")
+            yield pixels[0]
+            row += rows
+        if row != height:
+            raise ValueError("RGB16 TIFF 的压缩像素区不完整")
+
+    return series.shape, icc, strips()
+
+
+def validate_rgb_file(path, file_size):
+    """Check an RGB16 TIFF, using bounded memory for standard strip layouts."""
+    import tifffile
+
+    with tifffile.TiffFile(path) as tif:
+        if contiguous_rgb_layout(tif, file_size) is not None:
+            return
+        compressed = deflate_rgb_strips(tif, file_size)
+        if compressed is not None:
+            for _ in compressed[2]:
+                pass
+            return
+    _checked_pixels(path)
+
+
 def _publish_exclusive(temporary, destination):
     """Atomically publish a complete same-directory file without replacement.
 
@@ -145,7 +223,7 @@ def copy_verified_tiff(record, destination):
             os.fsync(dst.fileno())
         # Validate the copied bytes before making the final filename visible.
         # Hashing while copying avoids a separate full pass over the source.
-        _checked_pixels(temporary)
+        validate_rgb_file(temporary, temporary.stat().st_size)
         _publish_exclusive(temporary, destination)
     finally:
         if created:

@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import QuartzCore
 
 // PURE RGB uses the same Chinese vocabulary in its Qt and native controls.
 enum L10n {
@@ -11,6 +12,8 @@ enum L10n {
     static let amber = NSColor(srgbRed: 1, green: 0.49, blue: 0.29, alpha: 1)
     static let charcoal = NSColor(white: 0.08, alpha: 1)
     static let secondaryText = NSColor.secondaryLabelColor
+    private static let obsidianChassis = NSColor(srgbRed: 11 / 255.0, green: 11 / 255.0,
+                                                 blue: 12 / 255.0, alpha: 1)
 
     static func embed(_ view: NSView, in host: NSView, horizontal: CGFloat, vertical: CGFloat) {
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -23,7 +26,12 @@ enum L10n {
         ])
     }
 
-    static func installBackdrop(in window: NSWindow, root: NSView) {
+    static func installBackdrop(in window: NSWindow, root: NSView, obsidian: Bool) {
+        if obsidian {
+            window.isOpaque = true
+            window.backgroundColor = obsidianChassis
+            return
+        }
         window.isOpaque = false
         window.backgroundColor = .clear
         embed(PUREUltraThinBridge.makeThickView(), in: root, horizontal: 0, vertical: 0)
@@ -53,7 +61,13 @@ enum L10n {
         return view
     }
 
-    static func panel(_ view: NSView, horizontal: CGFloat, vertical: CGFloat) -> NSView {
+    static func panel(_ view: NSView, horizontal: CGFloat, vertical: CGFloat,
+                      obsidian: Bool, accented: Bool = false) -> NSView {
+        if obsidian {
+            let panel = ObsidianLightTableBar(accented: accented)
+            embed(view, in: panel, horizontal: horizontal, vertical: vertical)
+            return panel
+        }
         let host = NSView()
         embed(view, in: host, horizontal: horizontal, vertical: vertical)
         #if compiler(>=6.2)
@@ -89,5 +103,46 @@ enum L10n {
         button.image = NSImage(systemSymbolName: "chevron.left", accessibilityDescription: nil)
         button.imagePosition = .imageLeading
         return actionControl(button)
+    }
+}
+
+private final class ObsidianLightTableBar: NSView {
+    private let accent: CAGradientLayer?
+
+    init(accented: Bool) {
+        accent = accented ? CAGradientLayer() : nil
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.backgroundColor = CGColor(srgbRed: 20 / 255.0, green: 21 / 255.0,
+                                         blue: 23 / 255.0, alpha: 1)
+        layer?.borderColor = CGColor(srgbRed: 52 / 255.0, green: 54 / 255.0,
+                                     blue: 60 / 255.0, alpha: 1)
+        layer?.borderWidth = 1
+        layer?.cornerRadius = 12
+        if let accent {
+            accent.startPoint = CGPoint(x: 0, y: 0.5)
+            accent.endPoint = CGPoint(x: 1, y: 0.5)
+            accent.locations = [0, 0.48, 0.82, 1]
+            accent.colors = [
+                CGColor(srgbRed: 0.44, green: 0.49, blue: 0.86, alpha: 0),
+                CGColor(srgbRed: 0.57, green: 0.55, blue: 0.88, alpha: 0.38),
+                CGColor(srgbRed: 0.94, green: 0.63, blue: 0.59, alpha: 0.66),
+                CGColor(srgbRed: 0.94, green: 0.63, blue: 0.59, alpha: 0),
+            ]
+            layer?.addSublayer(accent)
+        }
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() {
+        super.layout()
+        guard let accent else { return }
+        let width = min(172, bounds.width * 0.24)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        accent.frame = CGRect(x: bounds.maxX - width - 24, y: bounds.maxY - 1.6,
+                              width: width, height: 1.1)
+        CATransaction.commit()
     }
 }

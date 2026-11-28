@@ -7,23 +7,71 @@ from dataclasses import replace
 from PyQt6.QtCore import QIODevice, QObject, QPointF, QRectF, QRunnable, QSaveFile, Qt, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPalette, QPen
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QFileDialog, QHBoxLayout,
+    QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QPushButton, QScrollArea, QSizePolicy, QTableWidget,
     QTableWidgetItem, QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
 )
 
+from .rgb_balance_gap import suggest_frame_gap
 from .rgb_balance_reference import BalanceReference, MAX_LAMP_VALUE_LENGTH
 from .rgb_light_balance import (
-    CHANNELS, DEFAULT_REGION, FULL_REGION, analyze_triplet, checked_region, combine_readings,
+    CHANNELS, DEFAULT_REGION, FULL_REGION, _file_stat_identity, analyze_triplet, checked_region,
+    combine_readings, read_triplet_previews,
 )
+from .workflow_border_beam import WorkflowBorderBeam
 from .workflow_combo import WorkflowComboBox
-from .workflow_glass import GlassMenu, prepare_glass, stylesheet
+from .workflow_glass import GlassMenu, obsidian_enabled, observe_appearance, prepare_glass, stylesheet
 from .workflow_indicators import ReviewCheckBox
 from .workflow_rgb_balance_chart import RgbBalanceChart
 
 
 DEFAULT_CAPTURE_REGION = (0.10, 0.10, 0.90, 0.90)
+DEFAULT_GAP_REGION = (0.48, 0.33, 0.52, 0.67)
 DESIGN_NOTES = Path(__file__).resolve().parents[1] / "docs/RGB_LIGHT_BALANCE_BILINGUAL.md"
+
+
+def _balance_stylesheet(obsidian):
+    if obsidian:
+        background, field, button, surface, table_header, edge, selection = (
+            "#0b0b0c", "#1e2024", "#222428", "#141517", "#202227", "#34363c", "#48251f",
+        )
+    else:
+        background, field, button, surface, table_header, edge, selection = (
+            "#242322", "#303135", "#3b3a3e", "#252628", "#393a3d", "#55565a", "#63503f",
+        )
+    button_selector = "QPushButton" if obsidian else "QDialog#workflowRoot QPushButton"
+    rules = f"""
+        QDialog#workflowRoot {{ background:{background}; }}
+        QDialog#workflowRoot QLineEdit, QDialog#workflowRoot QComboBox {{
+            background:{field}; }}
+        QCheckBox#rgbBalanceFlatfield::indicator,
+        QCheckBox#rgbBalanceFlatfield::indicator:checked {{
+            width:17px; height:17px; border:0; background:transparent; }}
+        QCheckBox#rgbBalanceFlatfield:disabled {{ color:#98989b; }}
+        {button_selector} {{ background:{button}; }}
+        QDialog#workflowRoot QPushButton:disabled {{ color:#98989b; }}
+        QTableWidget, QTextEdit, QTextBrowser {{ background:{surface};
+            border:1px solid {edge}; border-radius:6px; gridline-color:{edge}; }}
+        QTextBrowser {{ border-radius:8px; }}
+        QHeaderView::section {{ background:{table_header}; padding:4px; border:0; }}
+        QTableWidget::item:selected {{ background:{selection}; color:#fff5ef; }}
+        QScrollArea, QWidget#rgbBalanceContent {{ background:{background}; border:0; }}
+    """
+    if obsidian:
+        rules += f"""
+            QFrame#rgbBalanceHeader, QFrame#rgbBalanceGuide, QFrame#rgbBalanceReference {{
+                background:{surface}; border:1px solid {edge}; border-radius:12px; }}
+            QDialog#workflowRoot QPushButton:disabled {{
+                background:{surface}; color:#98989b; }}
+            QDialog#workflowRoot QPushButton:checked {{
+                background:{selection}; color:#fff; }}
+        """
+    else:
+        rules += """
+            QDialog#workflowRoot[nativeMaterial="true"] { background:transparent; }
+            QDialog#workflowRoot QPushButton#primary { background:#d93722; color:white; }
+        """
+    return stylesheet(False, dark=True, obsidian=obsidian) + rules
 
 
 class RawReferenceButton(QPushButton):
@@ -76,6 +124,7 @@ class BalanceRegionView(QWidget):
         self.region = DEFAULT_REGION
         self.capture_region = DEFAULT_CAPTURE_REGION
         self.local = True
+        self.reference_visible = True
         self.capture_visible = False
         self.edit_capture = False
         self._drag = None
@@ -83,10 +132,9 @@ class BalanceRegionView(QWidget):
         self.setToolTip("拖动橙框，把它完整放在同一块干净的空白片基内。"
                         "橙框可以在蓝框外。拖框内移动，拖边缘缩放。")
 
-    def set_previews(self, readings):
+    def set_previews(self, previews):
         images = []
-        for reading in readings:
-            pixels = reading.preview
+        for pixels in previews:
             if pixels is None:
                 images.append(None)
             else:
@@ -138,7 +186,7 @@ class BalanceRegionView(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#18191b"))
+        painter.fillRect(self.rect(), QColor("#0e0f11" if obsidian_enabled() else "#18191b"))
         for index, canvas in enumerate(self.image_rects()):
             painter.setPen(QColor("#e4e4e4"))
             painter.drawText(QRectF(canvas.x(), 0, canvas.width(), 24), Qt.AlignmentFlag.AlignCenter, CHANNELS[index])
@@ -149,7 +197,8 @@ class BalanceRegionView(QWidget):
             if self.capture_visible:
                 self._draw_region(painter, self.region_rect(canvas, self.capture_region), "#6cb9ff",
                                   active=self.edit_capture, dashed=True)
-            self._draw_region(painter, self.region_rect(canvas), "#ffb347", active=self.local)
+            if self.reference_visible:
+                self._draw_region(painter, self.region_rect(canvas), "#ffb347", active=self.local)
 
     @staticmethod
     def _fraction(point, canvas):
@@ -178,7 +227,7 @@ class BalanceRegionView(QWidget):
             if self.images[index] is None or not canvas.contains(event.position()):
                 continue
             point = event.position()
-            hit = self._rectangle_hit(self.region_rect(canvas), point) if self.local else None
+            hit = self._rectangle_hit(self.region_rect(canvas), point) if self.local and self.reference_visible else None
             capture = self.edit_capture and hit is None
             region = self.capture_region if capture else self.region
             if capture:
@@ -254,6 +303,24 @@ class _MeterWork(QRunnable):
             self.signals.done.emit(result)
 
 
+class _GapWork(QRunnable):
+    def __init__(self, paths, previews):
+        super().__init__()
+        self.paths = paths
+        self.previews = previews
+        self.signals = _MeterSignals()
+
+    def run(self):
+        try:
+            previews = self.previews if self.previews is not None else read_triplet_previews(
+                self.paths, progress=self.signals.progress.emit)
+            proposal = suggest_frame_gap(previews)
+        except Exception as error:
+            self.signals.failed.emit(str(error))
+        else:
+            self.signals.done.emit((previews, proposal))
+
+
 class RgbBalanceDialog(QDialog):
     def __init__(self, parent=None, source_paths=None, flatfield=None, flatfield_library=()):
         super().__init__(parent)
@@ -263,28 +330,14 @@ class RgbBalanceDialog(QDialog):
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.resize(850, 850)
         prepare_glass(self)
-        self.setStyleSheet(stylesheet(False, dark=True) + """
-            QDialog#workflowRoot { background:#242322; }
-            QDialog#workflowRoot QLineEdit, QDialog#workflowRoot QComboBox {
-                background:#303135; color:#f2ede4; }
-            QCheckBox#rgbBalanceFlatfield::indicator,
-            QCheckBox#rgbBalanceFlatfield::indicator:checked {
-                width:17px; height:17px; border:0; background:transparent; }
-            QCheckBox#rgbBalanceFlatfield:disabled { color:#98989b; }
-            QDialog#workflowRoot QPushButton { background:#3b3a3e; color:#f2ede4; }
-            QDialog#workflowRoot QPushButton:disabled { color:#98989b; }
-            QDialog#workflowRoot QPushButton#primary { background:#d93722; color:white; }
-            QTableWidget, QTextEdit { background:#252628; color:#f2ede4;
-                border:1px solid #55565a; border-radius:6px; gridline-color:#55565a; }
-            QHeaderView::section { background:#393a3d; color:#f2ede4;
-                padding:4px; border:0; }
-            QTableWidget::item:selected { background:#63503f; color:#fff5ef; }
-            QScrollArea, QWidget#rgbBalanceContent { background:#242322; border:0; }
-        """)
         self.analysis = None
         self.disposed = False
         self._work = None
         self._loaded_paths = None
+        self._loaded_source_token = None
+        self._preview_pixels = None
+        self._gap_region_ready = False
+        self._requested_source_token = None
         self._capture_confirmed = False
         self.saved_reference = None
         self.saved_reference_path = None
@@ -316,10 +369,16 @@ class RgbBalanceDialog(QDialog):
         content.setSpacing(8)
         self.scroll.setWidget(body)
         outer.addWidget(self.scroll, 1)
-        intro = QLabel("把同卷已冲洗、未曝光的片基放在翻拍台上，固定 ISO、快门和光圈，分别拍摄 R、G、B 三张 RAW。\n每次调灯后按同一设置复拍，用同一片基区域复测。")
+        header = QFrame()
+        header.setObjectName("rgbBalanceHeader")
+        self.header_layout = QVBoxLayout(header)
+        self.header_layout.setSpacing(8)
+        self.header_beam = WorkflowBorderBeam(header)
+        content.addWidget(header)
+        intro = QLabel("用同卷已冲洗、未曝光的空白片基或片间空隙作参照。固定 ISO、快门和光圈，分别拍摄 R、G、B 三张 RAW。\n每次调灯后按同一设置复拍，用同一量区复测。")
         intro.setWordWrap(True)
         intro.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        content.addWidget(intro)
+        self.header_layout.addWidget(intro)
         basis = QLabel(
             '参考柯达 <a style="color:#ffcc91" href="https://www.kodak.com/content/products-brochures/Film/'
             'LAD-for-KODAK-Color-Negative-Film-H-61a.pdf">D-min 片基参照</a>与'
@@ -341,7 +400,7 @@ class RgbBalanceDialog(QDialog):
         self.guide_button.setCheckable(True)
         self.guide_button.setToolTip("查看三色采集、画框、调整与复测步骤。")
         basis_row.addWidget(self.guide_button)
-        content.addLayout(basis_row)
+        self.header_layout.addLayout(basis_row)
         self._add_balance_guide(content)
         files = QHBoxLayout()
         self.path_fields, self.file_buttons = [], []
@@ -356,14 +415,16 @@ class RgbBalanceDialog(QDialog):
         content.addLayout(files)
         controls = QHBoxLayout()
         self.mode = WorkflowComboBox()
-        self.mode.addItems(("局部片基", "全幅片基"))
+        for label, mode in (("局部片基", "local"), ("全幅片基", "full"), ("片间空隙", "gap")):
+            self.mode.addItem(label, mode)
+        self._reference_regions = {"local": DEFAULT_REGION, "gap": DEFAULT_GAP_REGION}
         self.mode.setMinimumWidth(110)
         self.mode.setAccessibleName("片基采样范围")
         self.mode.currentIndexChanged.connect(self._mode_changed)
         controls.addWidget(self.mode)
         self.reset_region = QPushButton("片基框回到中心")
         self.reset_region.setToolTip("将橙框放回起始位置。复位后请将橙框拖到实际的空白片基内。")
-        self.reset_region.clicked.connect(lambda: self.region_view.set_region(DEFAULT_REGION))
+        self.reset_region.clicked.connect(self._reset_reference_region)
         controls.addWidget(self.reset_region)
         controls.addStretch()
         self.analyze_button = QPushButton("载入并分析")
@@ -466,6 +527,19 @@ class RgbBalanceDialog(QDialog):
         outer.addLayout(footer)
         self._capture_tool_changed()
         self.set_project_flatfield(flatfield, flatfield_library)
+        self._apply_appearance()
+        observe_appearance(self, self._apply_appearance)
+
+    def _apply_appearance(self):
+        obsidian = obsidian_enabled()
+        self.setStyleSheet(_balance_stylesheet(obsidian))
+        chrome_padding = (10, 8, 10, 8)
+        self.header_layout.setContentsMargins(*(chrome_padding if obsidian else (0, 0, 0, 0)))
+        self.guide_panel.layout().setContentsMargins(*(chrome_padding if obsidian else (8, 4, 8, 8)))
+        self.reference_panel.layout().setContentsMargins(*(chrome_padding if obsidian else (4, 0, 4, 4)))
+        self.header_beam.set_visible_for_theme(obsidian)
+        self.region_view.update()
+        self.chart.update()
 
     def open_design_notes(self):
         if self._design_notes_dialog is not None:
@@ -486,12 +560,12 @@ class RgbBalanceDialog(QDialog):
         dialog.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
         dialog.resize(740, 685)
         prepare_glass(dialog)
-        dialog.setStyleSheet(stylesheet(False, dark=True) + """
-            QDialog#workflowRoot { background: #242322; }
-            QTextBrowser { background: #252628; color: #f2ede4;
-                border: 1px solid #55565a; border-radius: 8px; }
-            QPushButton { background: #3b3a3e; color: #f2ede4; }
-        """)
+
+        def apply_appearance():
+            dialog.setStyleSheet(_balance_stylesheet(obsidian_enabled()))
+
+        apply_appearance()
+        observe_appearance(dialog, apply_appearance)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(14, 14, 14, 12)
         viewer = QTextBrowser()
@@ -511,7 +585,8 @@ class RgbBalanceDialog(QDialog):
         dialog.show()
 
     def _add_balance_guide(self, content):
-        self.guide_panel = QWidget()
+        self.guide_panel = QFrame()
+        self.guide_panel.setObjectName("rgbBalanceGuide")
         layout = QVBoxLayout(self.guide_panel)
         layout.setContentsMargins(8, 4, 8, 8)
         self.guide_next = QLabel()
@@ -519,9 +594,10 @@ class RgbBalanceDialog(QDialog):
         self.guide_next.setStyleSheet("font-weight: 600;")
         layout.addWidget(self.guide_next)
         steps = (
-            "1. 拍片基　用同卷已冲洗的空白片基。锁定机位、ISO、快门和光圈，仅切换红、绿、蓝灯各拍一张 RAW。",
+            "1. 拍片基　优先用同卷已冲洗的空白片基。没有单独片基时，翻拍包含空隙的相邻两帧，选择「片间空隙」。"
+            "锁定机位、ISO、快门和光圈，仅切换红、绿、蓝灯各拍一张 RAW。",
             "2. 画范围　初始橙框用于定位。把整个橙框移入同一块干净、已冲洗的未曝光片基，避开画面、齿孔、字样和片外。"
-            "如果左侧有独立的空白片基，就在左侧均匀区内取样，与影像边界留出距离。"
+            "片间空隙须避开两侧帧边，可直接拖出新的窄框，人工核对三路。"
             "橙框可以在蓝框外。蓝框圈住最终保留的整张照片，再点「确认保留画幅」。",
             "3. 看两图　右图的 100% 是上限。遇到削顶先缩短三路快门。「可试加」供比较密部噪声。"
             "左图正偏差表示该路信号偏强，负偏差表示偏弱。"
@@ -545,8 +621,14 @@ class RgbBalanceDialog(QDialog):
     def _guide_action(self):
         result = self.analysis
         if self._work is not None:
+            if isinstance(self._work, _GapWork):
+                return "正在从三路预览寻找共同的片间空隙。"
             return "正在分析三路 RAW。完成后先看右图的保留画幅曝光。"
         if result is None:
+            if self._gap_mode():
+                if all(image is not None for image in self.region_view.images):
+                    return "把窄橙框完整放进三路共用的未曝光片间空隙，避开两侧帧边，再分析所选空隙。"
+                return "载入包含同一处片间空隙的 R、G、B 三张 RAW，先识别建议框。"
             if all(field.text() for field in self.path_fields):
                 return "分析已选的三张 RAW，再核对橙框片基和蓝框画幅。"
             return "按红、绿、蓝加载同一块空白片基的三张 RAW。"
@@ -559,6 +641,8 @@ class RgbBalanceDialog(QDialog):
         if result.deviations_percent is None:
             return "查看左图列出的量区或拍摄设置问题，修正后再分析。"
         if not result.reference_confirmed:
+            if self._gap_mode():
+                return "核对三路橙框均在同卷已冲洗的未曝光空隙内，再勾选「确认是同卷未曝光片间空隙」。"
             return "确认三张的橙框都只包含同一块空白片基，再勾选「确认是同卷空白片基」。"
         if result.imbalance_percent <= 5:
             return "三路配平已进入保持区。保留当前灯光比例，可记录灯具读数并保存报告。"
@@ -580,7 +664,8 @@ class RgbBalanceDialog(QDialog):
         row.addWidget(self.load_reference_button)
         content.addLayout(row)
 
-        self.reference_panel = QWidget()
+        self.reference_panel = QFrame()
+        self.reference_panel.setObjectName("rgbBalanceReference")
         panel = QVBoxLayout(self.reference_panel)
         panel.setContentsMargins(4, 0, 4, 4)
         lamps = QHBoxLayout()
@@ -640,6 +725,14 @@ class RgbBalanceDialog(QDialog):
     def _current_capture_reference(self):
         return BalanceReference.from_analysis(self.analysis, tuple(field.text() for field in self.lamp_fields))
 
+    def _analysis_report(self):
+        report = self.analysis.report_text()
+        if self._gap_mode():
+            state = "已人工确认" if self.analysis.reference_confirmed else "待人工确认"
+            title, _, detail = report.partition("\n")
+            report = f"{title}\n片基参考类型：同卷片间空隙 · {state}\n{detail}"
+        return report
+
     def _lamp_values_changed(self):
         self.reference_feedback.hide()
         self._update_capture_reference()
@@ -652,11 +745,11 @@ class RgbBalanceDialog(QDialog):
         if self.analysis is not None:
             try:
                 current = self._current_capture_reference()
-                report = current.append_to_report(self.analysis.report_text(), include_reference_data=False)
+                report = current.append_to_report(self._analysis_report(), include_reference_data=False)
             except ValueError as error:
                 current = None
                 exposure_note = f"请核对拍摄参考 · {error}"
-                self.details.setPlainText(self.analysis.report_text())
+                self.details.setPlainText(self._analysis_report())
             else:
                 exposure_note = f"本次 RAW · {current.exposure_summary_text()}"
                 self.details.setPlainText(report)
@@ -683,7 +776,7 @@ class RgbBalanceDialog(QDialog):
         self.lamp_adjustment_note.setVisible(bool(lamp_adjustment))
 
     def load_capture_reference(self):
-        path, _ = QFileDialog.getOpenFileName(self, "载入拍摄参考", "", "配平报告 (*.txt);;所有文件 (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "载入拍摄参考", "", "配平报告 (*.txt *.json);;所有文件 (*)")
         if not path:
             return
         self.reference_expander.setChecked(True)
@@ -746,10 +839,19 @@ class RgbBalanceDialog(QDialog):
             entry for entry in library
             if entry.get("gain_path") and Path(entry["gain_path"]).is_file()
         )
+        setting = self._project_flatfield
+        if setting and not setting.get("sha256"):
+            checksum = next(
+                (entry["gain_sha256"] for entry in self._flatfield_profiles
+                 if entry["gain_path"] == setting.get("path") and entry.get("gain_sha256")),
+                None,
+            )
+            if checksum is not None:
+                setting["sha256"] = checksum
         if self._local_flatfield:
             self._update_flatfield_choices()
         else:
-            self.set_flatfield(config)
+            self.set_flatfield(setting)
 
     def _update_flatfield_choices(self):
         self.flatfield_existing.setEnabled(self._work is None and bool(
@@ -763,12 +865,15 @@ class RgbBalanceDialog(QDialog):
         strength = float(config.get("strength", 1.0))
         normalized = dict(path=path, strength=strength, enabled=bool(config.get("enabled", bool(path))),
                           name=str(config.get("name") or (Path(path).name if path else "")))
+        checksum = config.get("sha256")
+        if checksum is not None:
+            normalized["sha256"] = checksum
         try:
             stat = Path(path).stat() if path else None
-            identity = (stat.st_size, stat.st_mtime_ns) if stat is not None else None
+            identity = _file_stat_identity(stat) if stat is not None else None
         except OSError:
             identity = None
-        token = (path, strength, normalized["enabled"], normalized["name"], identity)
+        token = (path, strength, normalized["enabled"], normalized["name"], checksum, identity)
         previous = self._flatfield_token
         changed = token != previous
         self.flatfield, self._flatfield_token = normalized, token
@@ -804,12 +909,12 @@ class RgbBalanceDialog(QDialog):
         if path:
             self._select_local_flatfield(path, Path(path).name)
 
-    def _select_local_flatfield(self, path, name):
+    def _select_local_flatfield(self, path, name, checksum=None):
         current, inherited = self.flatfield or {}, self._project_flatfield or {}
         strength = next((item.get("strength", 1.0) for item in (current, inherited)
                          if item.get("path") == path), 1.0)
         self._local_flatfield = True
-        self.set_flatfield(dict(path=path, name=name, strength=strength, enabled=True))
+        self.set_flatfield(dict(path=path, name=name, strength=strength, enabled=True, sha256=checksum))
 
     def _follow_project_flatfield(self):
         self._local_flatfield = False
@@ -827,7 +932,10 @@ class RgbBalanceDialog(QDialog):
             path = str(entry["gain_path"])
             name = str(entry.get("name") or Path(path).name)
             label = " · ".join(str(part) for part in (name, *(entry.get("camera") or ())) if part)
-            action = menu.addAction(label, lambda checked=False, p=path, n=name: self._select_local_flatfield(p, n))
+            checksum = entry.get("gain_sha256")
+            action = menu.addAction(
+                label, lambda checked=False, p=path, n=name, sha=checksum: self._select_local_flatfield(p, n, sha),
+            )
             action.setToolTip(path)
         menu.exec(self.flatfield_existing.mapToGlobal(self.flatfield_existing.rect().bottomLeft()))
         menu.deleteLater()
@@ -835,7 +943,10 @@ class RgbBalanceDialog(QDialog):
     def _choose_file(self, index):
         path, _ = QFileDialog.getOpenFileName(self, f"选择 {CHANNELS[index]} 片基 RAW", "", "相机 RAW (*.rw2 *.RW2 *.dng *.DNG *.nef *.NEF *.arw *.ARW *.cr2 *.CR2 *.cr3 *.CR3 *.raf *.RAF *.orf *.ORF *.pef *.PEF *.srw *.SRW);;所有文件 (*)")
         if path:
+            had_triplet = all(field.text().strip() for field in self.path_fields)
             self.path_fields[index].setText(path)
+            if self._gap_mode() and not had_triplet and all(field.text().strip() for field in self.path_fields):
+                self._start_gap_suggestion()
 
     def _invalidate(self):
         self.analysis = None
@@ -857,24 +968,80 @@ class RgbBalanceDialog(QDialog):
         self._forget_reference()
         self._capture_confirmed = False
         self._loaded_paths = None
+        self._loaded_source_token = None
+        self._preview_pixels = None
+        self._gap_region_ready = False
+        self._reference_regions["gap"] = DEFAULT_GAP_REGION
         self.region_view.images = [None] * 3
-        self.edit_capture.setChecked(self.capture_scope.currentIndex() == 1)
+        if self._gap_mode():
+            self.region_view.set_region(DEFAULT_GAP_REGION, emit=False)
+        self.edit_capture.setChecked(self.capture_scope.currentIndex() == 1 and not self._gap_mode())
+        self._sync_reference_check()
         self._capture_tool_changed()
         self._invalidate()
-        self.status.setText("参考已改变，请载入并分析。")
-        self.analyze_button.setText("载入并分析")
+        self.status.setText("参考已改变，请重新识别空隙。" if self._gap_mode() else "参考已改变，请载入并分析。")
+        self.analyze_button.setText("识别片间空隙" if self._gap_mode() else "载入并分析")
+
+    def _gap_mode(self):
+        return self.mode.currentData() == "gap"
+
+    def _reset_reference_region(self):
+        if self._gap_mode():
+            self._start_gap_suggestion()
+        else:
+            self.region_view.set_region(DEFAULT_REGION)
+
+    def _sync_reference_check(self):
+        gap = self._gap_mode()
+        visible = all(image is not None for image in self.region_view.images)
+        self.region_view.reference_visible = not gap or self._gap_region_ready
+        self.region_view.update()
+        self.reference_check.setEnabled(self._work is None and (not gap or (visible and self._gap_region_ready)))
+        self.analyze_button.setEnabled(self._work is None and (not gap or self._gap_region_ready or not visible))
+        self.reset_region.setVisible(not gap or visible)
+        self.reset_region.setEnabled(self._work is None and self.region_view.local)
 
     def _mode_changed(self):
-        self.region_view.local = self.mode.currentIndex() == 0
-        self.reset_region.setEnabled(self.region_view.local and self._work is None)
+        mode = self.mode.currentData()
+        self.region_view.local = mode in self._reference_regions
+        if self.region_view.local:
+            self.region_view.set_region(self._reference_regions[mode], emit=False)
+        gap = self._gap_mode()
+        if gap:
+            self.edit_capture.setChecked(False)
+            self.reference_check.setText("确认是同卷未曝光片间空隙")
+            self.reference_check.setToolTip("核对三路橙框均在同卷已冲洗的未曝光帧间空隙内，避开帧边、字样、齿孔和片外。")
+        else:
+            if self.capture_scope.currentIndex() == 1 and not self._capture_confirmed:
+                self.edit_capture.setChecked(True)
+            self.reference_check.setText("确认是同卷空白片基")
+            self.reference_check.setToolTip("核对三路橙框内只有同卷已冲洗的未曝光片基，避开画面、文字和齿孔。")
+        self._sync_reference_check()
+        self._capture_tool_changed()
         self.region_view.update()
-        self._region_changed()
+        self.reset_region.setText("重新识别空隙" if gap else "片基框回到中心")
+        self.reset_region.setToolTip("重新寻找三路共用的橙色建议框。" if gap else "将橙框放回片基预览中心。")
+        if gap and not self._gap_region_ready:
+            self._forget_reference()
+            self._invalidate()
+            self.analyze_button.setText("识别片间空隙")
+            self.status.setText("载入拍到同一片间空隙的三张 RAW。")
+            if all(Path(field.text()).is_file() for field in self.path_fields):
+                self._start_gap_suggestion()
+        else:
+            self._region_changed()
 
     def _region_changed(self, *args):
+        if self._gap_mode():
+            self._gap_region_ready = True
+            self._sync_reference_check()
+        if self.region_view.local:
+            self._reference_regions[self.mode.currentData()] = self.region_view.region
         self._forget_reference()
         self._invalidate()
-        self.status.setText("片基范围已改变，请重新分析。")
-        self.analyze_button.setText("分析所选片基")
+        scope = "空隙" if self._gap_mode() else "片基"
+        self.status.setText(f"{scope}范围已改变，请重新分析。")
+        self.analyze_button.setText(f"分析所选{scope}")
 
     def _capture_scope_changed(self):
         self.edit_capture.setChecked(self.capture_scope.currentIndex() == 1)
@@ -897,6 +1064,11 @@ class RgbBalanceDialog(QDialog):
             note = "橙框用于片基配平 · 蓝框决定 RAW 曝光检查和快门建议"
         else:
             note = "橙框为片基取样范围 · 三路共用 · 按 RAW 方向显示"
+        if self._gap_mode():
+            if editing:
+                note = "蓝框正在编辑。确认保留画幅后可重画橙框；橙框可在蓝框外。"
+            else:
+                note = "橙框可移动和缩放，三路都应完全落在同一段片间空隙内，避开帧线、字样、齿孔和片外。"
         self.region_note.setText(note)
 
     def _capture_button_clicked(self, editing):
@@ -912,7 +1084,7 @@ class RgbBalanceDialog(QDialog):
             self.edit_capture.setChecked(True)
         self._invalidate()
         self.status.setText("RAW 检查范围已改变，请重新分析。")
-        self.analyze_button.setText("重新分析")
+        self.analyze_button.setText("识别片间空隙" if self._gap_mode() and not self._gap_region_ready else "重新分析")
 
     def _reference_changed(self, confirmed):
         self._refresh_confirmation(confirmed)
@@ -924,16 +1096,15 @@ class RgbBalanceDialog(QDialog):
         updated = combine_readings(current.readings, current.region, capture_region=current.capture_region,
                                    reference_confirmed=reference_confirmed,
                                    capture_confirmed=self.capture_scope.currentIndex() == 0 or self._capture_confirmed)
-        self._show_analysis(replace(updated, flatfield=current.flatfield))
+        self._show_analysis(replace(updated, flatfield=current.flatfield, generated_at=current.generated_at))
 
     def _busy(self, busy):
         self.analyze_button.setEnabled(not busy)
         self.mode.setEnabled(not busy)
         self.region_view.setEnabled(not busy)
-        self.reference_check.setEnabled(not busy)
+        self._sync_reference_check()
         self.capture_scope.setEnabled(not busy)
         self._capture_tool_changed()
-        self.reset_region.setEnabled(not busy and self.mode.currentIndex() == 0)
         self.flatfield_check.setEnabled(not busy and bool((self.flatfield or {}).get("path"))
                                         and Path(self.flatfield["path"]).is_file())
         self.flatfield_choose.setEnabled(not busy)
@@ -941,19 +1112,82 @@ class RgbBalanceDialog(QDialog):
         for control in self.path_fields + self.file_buttons:
             control.setEnabled(not busy)
 
+    @staticmethod
+    def _source_token(paths):
+        identities = []
+        for path in paths:
+            try:
+                stat = Path(path).expanduser().stat() if path else None
+            except OSError:
+                stat = None
+            identities.append((path, _file_stat_identity(stat) if stat is not None else None))
+        return tuple(identities)
+
+    def _start_gap_suggestion(self):
+        if self.disposed or self._work is not None:
+            return
+        paths = tuple(field.text().strip() for field in self.path_fields)
+        self._requested_source_token = self._source_token(paths)
+        if self._loaded_source_token is not None and self._requested_source_token != self._loaded_source_token:
+            self._input_changed()
+        self._gap_region_ready = False
+        self._forget_reference()
+        self._invalidate()
+        work = _GapWork(paths, self._preview_pixels)
+        self._work = work
+        work.signals.progress.connect(self.status.setText)
+        work.signals.done.connect(self._gap_finished)
+        work.signals.failed.connect(self._failed)
+        self._busy(True)
+        self.status.setText("正在识别三路共用的片间空隙…")
+        self._update_balance_guide()
+        self._pool.start(work)
+
+    def _gap_finished(self, result):
+        if self.disposed:
+            return
+        self._work = None
+        requested, self._requested_source_token = self._requested_source_token, None
+        paths = tuple(field.text().strip() for field in self.path_fields)
+        source_token = self._source_token(paths)
+        if requested != source_token:
+            self._input_changed()
+            self._busy(False)
+            self.status.setText("RAW 文件在识别期间发生变化，请重新识别空隙。")
+            return
+        previews, region = result
+        self._loaded_paths, self._loaded_source_token = paths, source_token
+        self._preview_pixels = previews
+        self.region_view.set_previews(previews)
+        if region is not None:
+            self.region_view.set_region(region)
+            self.status.setText("已给出橙色建议框，可拖动或缩放。确认三路都在同一段未曝光空隙内后再分析。")
+        else:
+            self.status.setText("未找到三路一致的空隙。可在预览中手动拖出橙框。")
+        self._busy(False)
+        self._update_balance_guide()
+
     def start_analysis(self):
         if self.disposed or self._work is not None:
             return
-        self._invalidate()
         paths = tuple(field.text().strip() for field in self.path_fields)
-        region = self.region_view.region if self.mode.currentIndex() == 0 else FULL_REGION
+        source_token = self._source_token(paths)
+        if self._loaded_source_token is not None and source_token != self._loaded_source_token:
+            self._input_changed()
+        if self._gap_mode() and not self._gap_region_ready:
+            self._start_gap_suggestion()
+            return
+        self._invalidate()
+        region = self.region_view.region if self.region_view.local else FULL_REGION
         full_frame = self.capture_scope.currentIndex() == 0
         capture = FULL_REGION if full_frame else self.region_view.capture_region
         config = deepcopy(self.flatfield) if self.flatfield_check.isChecked() else None
-        work = _MeterWork(paths, region, paths != self._loaded_paths, config, capture_region=capture,
+        with_previews = paths != self._loaded_paths or source_token != self._loaded_source_token
+        work = _MeterWork(paths, region, with_previews, config, capture_region=capture,
                           reference_confirmed=self.reference_check.isChecked(),
                           capture_confirmed=full_frame or self._capture_confirmed)
         self._work = work
+        self._requested_source_token = source_token
         self._requested_flatfield_token = self._flatfield_token
         work.signals.progress.connect(self.status.setText)
         work.signals.done.connect(self._finished)
@@ -967,6 +1201,16 @@ class RgbBalanceDialog(QDialog):
         if self.disposed:
             return
         self._work = None
+        requested_source_token = self._requested_source_token
+        self._requested_source_token = None
+        paths = tuple(field.text().strip() for field in self.path_fields)
+        source_token = self._source_token(paths)
+        if requested_source_token is not None and requested_source_token != source_token:
+            self._requested_flatfield_token = None
+            self._input_changed()
+            self._busy(False)
+            self.status.setText("RAW 文件在分析期间发生变化，请重新载入并分析。")
+            return
         self._busy(False)
         if self._requested_flatfield_token is not None and self._requested_flatfield_token != self._flatfield_token:
             self._requested_flatfield_token = None
@@ -978,9 +1222,12 @@ class RgbBalanceDialog(QDialog):
         self.flatfield_note.setText(
             f"量化基准：平场后 · {flatfield.get('name', '')} · {flatfield.get('strength', 1.0):.0%}"
             if flatfield.get("applied") else "量化基准：未套用平场")
-        self._loaded_paths = tuple(field.text().strip() for field in self.path_fields)
+        self._loaded_paths = paths
+        self._loaded_source_token = source_token
         if any(item.preview is not None for item in analysis.readings):
-            self.region_view.set_previews(analysis.readings)
+            self._preview_pixels = tuple(item.preview for item in analysis.readings)
+            self.region_view.set_previews(self._preview_pixels)
+        self._sync_reference_check()
         self._capture_tool_changed()
         self._show_analysis(analysis)
 
@@ -1015,6 +1262,10 @@ class RgbBalanceDialog(QDialog):
         if self.disposed:
             return
         self._work = None
+        paths = tuple(field.text().strip() for field in self.path_fields)
+        if self._requested_source_token is not None and self._requested_source_token != self._source_token(paths):
+            self._input_changed()
+        self._requested_source_token = None
         self._busy(False)
         if self.flatfield_check.isChecked():
             self.flatfield_note.setText("量化基准：未套用平场（分析未完成）")
@@ -1031,11 +1282,25 @@ class RgbBalanceDialog(QDialog):
     def save_report(self):
         if self.analysis is None or not self.save_button.isEnabled():
             return
-        path, _ = QFileDialog.getSaveFileName(self, "保存配平报告", "RGB 拍摄灯光配平.txt", "文本报告 (*.txt)")
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "保存配平报告", "RGB 拍摄灯光配平.txt", "文本报告 (*.txt);;JSON 联动报告 (*.json)")
         if path:
             self.status.show()
             try:
-                report = self._current_capture_reference().append_to_report(self.analysis.report_text())
+                try:
+                    self.analysis.verify_sources_current()
+                except ValueError:
+                    self._input_changed()
+                    raise
+                reference = self._current_capture_reference()
+                is_json = Path(path).suffix.lower() == ".json" or selected_filter.startswith("JSON")
+                if not Path(path).suffix:
+                    path += ".json" if is_json else ".txt"
+                if is_json:
+                    report = self.analysis.measurement_json(capture_reference=reference.to_dict())
+                else:
+                    report = reference.append_to_report(self._analysis_report())
+                    report += "\n" + self.analysis.measurement_text_block(capture_reference=reference.to_dict())
                 self._write_report_file(path, report)
             except (OSError, ValueError) as error:
                 self.status.setText(f"报告未保存：{error}")

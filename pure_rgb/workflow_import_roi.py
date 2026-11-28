@@ -44,7 +44,7 @@ def offer_import_roi(window, request, message):
     window.canvas_stack.setCurrentWidget(window.selection)
     window.show_region_exit()
     window.sync_controls()
-    window.status_message("自动画面定位未通过。请在正像上拖框圈出有效画面，松开后自动继续导入与密度测量。")
+    window.status_message("自动画面定位未通过。请在正像上拖框圈出有效画面，松开后测量该画面中心约 80%。")
     return True
 
 
@@ -59,8 +59,10 @@ def accept_import_roi(window, bounds):
     if not (0 <= x0 < x1 <= geometry["width"] and 0 <= y0 < y1 <= geometry["height"]
             and x1 - x0 >= 16 and y1 - y0 >= 16):
         raise ValueError("请框选至少 16 × 16 源像素的有效图像区域")
+    from .picture import metering_region_from_frame
+
     recipe = window.project.recipe()
-    recipe["roi"] = list(bounds)
+    recipe["roi"] = metering_region_from_frame(bounds, [geometry["height"], geometry["width"], 3])
     window.project.set_recipe(recipe, label="首次导入手动画面范围")
     window.__dict__.pop("_import_roi_retry", None)
     window.finish_selection()

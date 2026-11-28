@@ -226,6 +226,7 @@ class FlexDraftPreview:
 
     def _eligible(self, recipe):
         from .preview_grid import post_requires_full_grid
+        from .workspace import source_recipe_identity
 
         saved, manifest = self.owner.recipe, self.owner.manifest
         if (
@@ -237,18 +238,31 @@ class FlexDraftPreview:
             # density_window in this legacy source-sample adapter.
             or recipe.get("density_metering")
             or saved.get("density_metering")
+            or saved.get("native_spatial_controls")
             or post_requires_full_grid(recipe.get("post_controls", {}).get(MODE))
         ):
             return False
-        if any(recipe.get(key) != saved.get(key) for key in (
-            "raw", "raw_import", "flatfield", "registration_check", "source_mode",
-        )):
+        if source_recipe_identity(recipe) != source_recipe_identity(saved):
             return False
+        if (manifest.get("native_metering_window") is not None
+                and manifest.get("native_metering_window") == manifest.get("density_window")):
+            # A Native-only save may replace the neutral window with its own
+            # edited process window. Do not use that as the Flex source meter.
+            from dataclasses import fields
+
+            from negpy.features.process.models import ProcessConfig
+
+            native = manifest.get("native_config")
+            neutral = manifest.get("native_reference_config")
+            if (not isinstance(native, dict) or not isinstance(neutral, dict)
+                    or any(native.get(field.name) != neutral.get(field.name) for field in fields(ProcessConfig))):
+                return False
         saved_roi = saved.get("roi") or manifest["roi"]
         requested_roi = recipe.get("roi") or manifest["roi"]
         return (
             list(saved_roi) == list(requested_roi)
             and recipe["density"] == saved["density"]
+            and recipe.get("measurement_method") == saved.get("measurement_method")
             and recipe["paper"] == saved["paper"]
         )
 
@@ -269,6 +283,12 @@ class FlexDraftPreview:
         from .workflow_render import _export_source_key
 
         owner = self.owner
+        density = getattr(owner, "density_preview", None)
+        if density is not None and density.certificate is not None:
+            session = density.prepare_source()
+            density.certificate.validate(session.source)
+            owner.processor = session.processor
+            return session.source, density.source_key
         if owner.saved_session is None:
             owner.saved_session = Session(owner.path, owner.digest, owner.directory)
         session = owner.saved_session
@@ -284,11 +304,14 @@ class FlexDraftPreview:
         return session.source, self.source_key
 
     def _reference(self, rectangle, direction, step, icc, fallback):
+        from .draft_preview import defer_comparison
         from .output_orientation import orient_reference, sample_oriented
         from .preview_data import verified_pixels
         from .workspace import output_rectangle
 
         owner = self.owner
+        if defer_comparison(owner):
+            return fallback, ""
         record = owner.manifest["results"].get("native")
         if record is None or any(
             key.startswith("geometry.")
@@ -349,7 +372,9 @@ class FlexDraftPreview:
         before = orient_codes(pixels, direction)
         # This branch excludes neighbourhood/geometry post. Point finishing
         # commutes with exact orthogonal pixel permutation and grid sampling.
-        current = orient_codes(self.owner._finish(pixels, recipe, MODE), direction)
+        current = orient_codes(self.owner._finish(
+            pixels, recipe, MODE, fit=not full and sample_step_override is None,
+        ), direction)
         reference, label = self._reference(rectangle, direction, step, icc, before)
         if current.shape != reference.shape or actual_icc != icc:
             raise ValueError("Flex快速预览／调整前几何或ICC不一致")

@@ -245,18 +245,9 @@ def measure_avoiding_regions(
     ), selection
 
 
-def metering_process(process, window, selection):
-    """Freeze the window and exact selected ROI for Native's auxiliary meters.
-
-    Only this opt-in path adjusts normalized edges by the smallest necessary
-    float step. JSON preserves those Python floats. The original fixed_process
-    and existing saved-job behavior remain untouched.
-    """
-    from .density_matrix import fixed_process
-
-    if tuple(window.analysis.roi) != selection.analysis_roi:
-        raise ValueError("Frozen density window and metering selection disagree")
-    h, w = selection.source_shape[:2]
+def normalized_metering_edges(rectangle, source_shape):
+    """Encode half-open pixel edges for NegPy's normalized, truncated ROI."""
+    h, w = source_shape[:2]
 
     def exact_edge(pixel, length):
         edge = pixel / length
@@ -269,10 +260,18 @@ def metering_process(process, window, selection):
             )
         raise ValueError("Metering edge cannot round-trip to its source pixel")
 
-    edges = tuple(
-        exact_edge(pixel, length)
-        for pixel, length in zip(selection.analysis_roi, (w, h, w, h))
+    return tuple(
+        exact_edge(pixel, length) for pixel, length in zip(rectangle, (w, h, w, h))
     )
+
+
+def metering_process(process, window, selection):
+    """Freeze the window and exact selected ROI for Native's auxiliary meters."""
+    from .density_matrix import fixed_process
+
+    if tuple(window.analysis.roi) != selection.analysis_roi:
+        raise ValueError("Frozen density window and metering selection disagree")
+    edges = normalized_metering_edges(selection.analysis_roi, selection.source_shape)
     return replace(
         fixed_process(process, window, selection.source_shape), analysis_rect=edges
     )

@@ -545,6 +545,8 @@ def validate_frozen_import(processor, manifest, source):
     validate_registration_requirement(expected, requirement)
     validate_registration_requirement(actual, requirement)
     if requirement is not None:
+        from .immutable_source_v44 import certificate_for
+
         if getattr(processor, "pure_registration_check", None) != requirement:
             raise ValueError("Processor registration check differs from frozen recipe")
         for receipt in (expected, actual):
@@ -570,10 +572,16 @@ def validate_frozen_import(processor, manifest, source):
             or source.shape[-1] != 3
             or not source.flags.c_contiguous
             or source.flags.writeable
-            or not np.isfinite(source).all()
-            or hashlib.sha256(memoryview(source).cast("B")).hexdigest()
-            != actual.get("source_pixels_sha256")
         ):
+            raise ValueError("Checked registration actual source identity differs")
+        certificate = certificate_for(source)
+        if certificate is None:
+            if not np.isfinite(source).all():
+                raise ValueError("Checked registration actual source identity differs")
+            digest = hashlib.sha256(memoryview(source).cast("B")).hexdigest()
+        else:
+            digest = certificate.sha256
+        if digest != actual.get("source_pixels_sha256"):
             raise ValueError("Checked registration actual source identity differs")
         for receipt in (expected, actual):
             if (

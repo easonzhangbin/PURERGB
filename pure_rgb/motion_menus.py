@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import QPushButton, QWidget
 
 from .motion_spring import Spring
 from .workflow_combo import WorkflowComboBox
-from .workflow_glass import sync_popup_materials, system_reduce_motion
+from .workflow_glass import obsidian_enabled, sync_popup_materials, system_reduce_motion
 
 
 def _clamp(value, low=0.0, high=1.0):
@@ -227,14 +227,17 @@ class _SpringPopup(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         light_text = self.combo.palette().buttonText().color().lightnessF() > 0.5
         alpha = 56 if self.property("nativeMaterial") else 245
-        painter.setBrush(QColor(64, 61, 59, alpha) if light_text else QColor(255, 255, 255, alpha))
+        obsidian = obsidian_enabled()
+        trigger_color = QColor(64, 61, 59, alpha) if light_text else QColor(255, 255, 255, alpha)
+        painter.setBrush(QColor("#1e2024") if obsidian else trigger_color)
         painter.drawRoundedRect(trigger, 16, 16)
         self.combo._paint_caption(painter, trigger, self.chevron.value)
         painter.restore()
         menu = QRectF(8, trigger.bottom() + self.GAP, self.width() - 16, max(0, self.height_motion.value))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setOpacity(_clamp(self.opacity.value))
-        painter.setBrush(QColor(49, 47, 46, alpha) if light_text else QColor(247, 248, 250, alpha))
+        menu_color = QColor(49, 47, 46, alpha) if light_text else QColor(247, 248, 250, alpha)
+        painter.setBrush(QColor("#1a1c20") if obsidian else menu_color)
         painter.drawRoundedRect(menu, 18, 18)
         painter.setClipRect(menu)
         top = _clamp(min(self.highlight_top.value, self.highlight_bottom.value - 16), self.PAD, self.full_height - self.PAD - 16)

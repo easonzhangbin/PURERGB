@@ -21,6 +21,7 @@ private struct Manifest: Decodable {
     let canExport: Bool
     let current: UUID?
     let displayID: CGDirectDisplayID?
+    let obsidian: Bool?
     let items: [Frame]
 }
 
@@ -58,7 +59,8 @@ private struct Reply: Encodable {
         } else {
             frames = manifest.items
         }
-        controller = BatchLightTableController(viewingRepair: manifest.mode == .single)
+        controller = BatchLightTableController(viewingRepair: manifest.mode == .single,
+                                               obsidian: manifest.obsidian ?? false)
         super.init()
         controller.onNext = { [weak self] in
             guard let self, self.manifest.canExport else { return }

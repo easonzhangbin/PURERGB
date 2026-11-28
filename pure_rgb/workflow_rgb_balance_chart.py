@@ -7,6 +7,7 @@ from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import QSizePolicy, QWidget
 
 from .rgb_light_balance import FULL_REGION, MeterAdvice
+from .workflow_glass import obsidian_enabled
 
 
 CHANNEL_COLORS = ("#ff8983", "#7addad", "#91baff")
@@ -17,6 +18,10 @@ PANEL = QColor("#2b2927")
 EDGE = QColor("#514c47")
 GRID = QColor("#4d4843")
 RAIL = QColor("#625d57")
+OBSIDIAN_PANEL = QColor("#141517")
+OBSIDIAN_EDGE = QColor("#34363c")
+OBSIDIAN_GRID = QColor("#3e4148")
+OBSIDIAN_RAIL = QColor("#555962")
 TEXT = QColor("#f2ede4")
 MUTED = QColor("#c6bfb6")
 WARNING = QColor("#ffd18f")
@@ -208,11 +213,12 @@ class RgbBalanceChart(QWidget):
                    label, color, size=10, alignment=Qt.AlignmentFlag.AlignHCenter)
 
     def _rows(self, painter, panel, track):
+        rail = OBSIDIAN_RAIL if obsidian_enabled() else RAIL
         for index, (channel, color) in enumerate(zip("RGB", map(QColor, CHANNEL_COLORS))):
             y = track.top() + (index + 0.5) / 3 * track.height()
             self._text(painter, QRectF(panel.left() + 13, y - 11, 18, 22),
                        channel, color, size=12, weight=QFont.Weight.DemiBold)
-            self._line(painter, track.left(), y, track.right(), y, RAIL)
+            self._line(painter, track.left(), y, track.right(), y, rail)
             yield index, y, color
 
     def _value(self, painter, panel, track, y, text, color, *, size=12):
@@ -228,9 +234,10 @@ class RgbBalanceChart(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         left, right = self._panels()
+        fill, edge = (OBSIDIAN_PANEL, OBSIDIAN_EDGE) if obsidian_enabled() else (PANEL, EDGE)
+        painter.setPen(QPen(edge, 1))
+        painter.setBrush(fill)
         for panel in (left, right):
-            painter.setPen(QPen(EDGE, 1))
-            painter.setBrush(PANEL)
             painter.drawRoundedRect(panel, 11, 11)
         self._deviation_plot(painter, left)
         self._capture_plot(painter, right)
@@ -250,9 +257,10 @@ class RgbBalanceChart(QWidget):
             return
         painter.fillRect(QRectF(x_of(-HOLD_RANGE), track.top(),
                                 x_of(HOLD_RANGE) - x_of(-HOLD_RANGE), track.height()), QColor("#304c40"))
+        grid = OBSIDIAN_GRID if obsidian_enabled() else GRID
         for tick in (-DEVIATION_LIMIT, -HOLD_RANGE, 0.0, HOLD_RANGE, DEVIATION_LIMIT):
             x = x_of(tick)
-            grid_color = MUTED if tick == 0 else GRID
+            grid_color = MUTED if tick == 0 else grid
             self._line(painter, x, track.top(), x, track.bottom(), grid_color)
             if abs(tick) != HOLD_RANGE:
                 label = "0%" if tick == 0 else f"{tick:+.0f}%"
@@ -290,10 +298,11 @@ class RgbBalanceChart(QWidget):
         self._text(painter, QRectF(panel.left() + CARD_PADDING, track.top() - CAPTURE_CAPTION_HEIGHT - 2,
                                    panel.width() - 2 * CARD_PADDING, CAPTURE_CAPTION_HEIGHT),
                    RAW_OCCUPANCY, MUTED, size=11)
+        grid = OBSIDIAN_GRID if obsidian_enabled() else GRID
         for tick in (0, 25, 50, 75, 100):
             x = track.left() + tick * track.width() / 100
             is_limit = tick == 100
-            self._line(painter, x, track.top(), x, track.bottom(), WARNING if is_limit else GRID,
+            self._line(painter, x, track.top(), x, track.bottom(), WARNING if is_limit else grid,
                        1.6 if is_limit else 1.0)
             if tick in (0, 50, 100):
                 self._axis_label(painter, track, x, f"{tick}%", WARNING if is_limit else MUTED)

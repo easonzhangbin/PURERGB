@@ -19,6 +19,7 @@ class PreviewActivity(QObject):
         self.fraction = None
         self.started = self.updated = self.clock()
         self.finished = None
+        self.quiet_until = self.started
         self.timer = QTimer(self)
         self.timer.setInterval(250)
         self.timer.timeout.connect(self.publish)
@@ -27,10 +28,11 @@ class PreviewActivity(QObject):
     def active(self):
         return self.state == "running"
 
-    def start(self, token, message="正在准备预览…", *, stage="queued", fraction=None):
+    def start(self, token, message="正在准备预览…", *, stage="queued", fraction=None, quiet_for=0):
         self.token, self.state = token, "running"
         self.stage, self.message, self.fraction = stage, str(message), fraction
         self.started = self.updated = self.clock()
+        self.quiet_until = self.started + quiet_for
         self.finished = None
         self.timer.start()
         self.publish()
@@ -66,6 +68,8 @@ class PreviewActivity(QObject):
 
     def publish(self):
         now = self.finished if self.finished is not None else self.clock()
+        if self.active and now < self.quiet_until:
+            return
         self.changed.emit(dict(
             token=self.token, state=self.state, active=self.active,
             stage=self.stage, message=self.message, fraction=self.fraction,

@@ -6,6 +6,8 @@ from PyQt6.QtCore import QEvent, QSize, Qt, QTimer
 from PyQt6.QtGui import QAction, QIcon, QKeySequence
 from PyQt6.QtWidgets import QBoxLayout, QFrame, QHBoxLayout, QLayout, QPushButton, QWidget
 
+_RECIPE_AUTOSAVE_INTERVAL_MS = 1000
+
 
 class PreviewToolbar(QFrame):
     def __init__(self):
@@ -63,6 +65,9 @@ class EditHistoryUI:
         self._history_slider_timer.setSingleShot(True)
         self._history_slider_timer.setInterval(250)
         self._history_slider_timer.timeout.connect(self.end_history_gesture)
+        self._recipe_autosave_timer = QTimer(self)
+        self._recipe_autosave_timer.setSingleShot(True)
+        self._recipe_autosave_timer.timeout.connect(self.flush_recipe_autosave)
 
     def history_toolbar_buttons(self, layout):
         icons = Path(__file__).resolve().parents[1] / "assets/ui"
@@ -150,21 +155,53 @@ class EditHistoryUI:
                 self.end_history_gesture()
                 self.project.begin_edit("调整“" + watched.parentWidget().label.text() + "”")
                 self._history_slider = watched
-            if kind == QEvent.Type.Wheel:
+            if kind == QEvent.Type.MouseButtonPress and self._tone_drag is not watched:
+                # A click on the slider may follow a wheel adjustment already
+                # grouped on this control. Continue its history, not its timer.
+                self._history_slider_timer.stop()
+                self.begin_tone_drag(watched)
+                if self._tone_drag is watched:
+                    self.project.defer_recipe_autosave = True
+                    if not self._recipe_autosave_timer.isActive():
+                        self._recipe_autosave_timer.start(_RECIPE_AUTOSAVE_INTERVAL_MS)
+            elif kind == QEvent.Type.Wheel and self._tone_drag is not watched:
                 self._history_slider_timer.start()
         elif finish and self._history_slider is watched:
-            self.end_history_gesture()
+            if kind != QEvent.Type.MouseButtonRelease or self._tone_drag is not watched:
+                self.end_history_gesture()
 
-    def end_history_gesture(self):
+    def end_history_gesture(self, *, immediate_tone=False):
         if not getattr(self, "_history_slider", None):
             return
         self._history_slider = None
         self._history_slider_timer.stop()
+        self._tone_releasing = immediate_tone
         try:
             self.flush_advanced()
         finally:
+            self._tone_releasing = False
             self.project.end_edit()
+            self.end_tone_drag(immediate=immediate_tone)
+            if self.project.defer_recipe_autosave:
+                self.project.defer_recipe_autosave = False
+                # Dispatch the final preview before writing the latest recipe.
+                # Any intervening project save drains the same in-memory state.
+                self._recipe_autosave_timer.start(0)
             self.sync_history_actions()
+
+    def flush_recipe_autosave(self):
+        try:
+            self.project.flush_recipe_autosave()
+        except (OSError, ValueError) as error:
+            from .diagnostics import failure
+
+            failure("recipe_autosave_failed", error)
+            self.status_message("当前调整尚未写入项目，稍后会自动重试。")
+            self._recipe_autosave_timer.start(_RECIPE_AUTOSAVE_INTERVAL_MS)
+            return False
+        if self.project.defer_recipe_autosave:
+            self._recipe_autosave_timer.start(_RECIPE_AUTOSAVE_INTERVAL_MS)
+        return True
 
     def undo_edit(self):
         self.restore_edit(False)

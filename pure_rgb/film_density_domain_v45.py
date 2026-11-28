@@ -23,6 +23,8 @@ DOMAIN = "native-c41-sdk-unmixed-log-density-v45"
 SCHEMA = "pure-rgb-native-film-spatial-v45"
 LEAF_STATISTIC = "float64 median of original SDK unmixed log10(T); no exp/log round trip, including even-sized leaves"
 LOG_POLICY = "original SDK log_density_open(T), then forward unmix_log_image; no upper clamp or exp/log round trip"
+_PRE_PRINT_EV_ADAPTER = "9d54ec77b685fb059c9f7baa75f849a352c684cb2fbfb4b1905219db866276b0"
+_FIRST_PRINT_EV_ADAPTER = "359d0a6883950d39dad084308909ffc70723ba1b96e37fd36b095168926ecda1"
 _DOMAINS = {}
 
 
@@ -178,14 +180,18 @@ def _load(snapshot, domain, config, source_key):
         raise ValueError("Film spatial snapshot requires a versioned object")
     expected = _packet(domain, config, source_key, data.get("inner_snapshot"))
     body = {key: value for key, value in data.items() if key != "sha256"}
+    candidates = [expected]
+    for adapter in (_PRE_PRINT_EV_ADAPTER, _FIRST_PRINT_EV_ADAPTER):
+        # These adapters have the same immutable density-domain contract.
+        candidates.append({**expected, "runtime": {**expected["runtime"], "adapter": adapter}})
     if (set(data) != set(expected) | {"sha256"} or data.get("sha256") != _digest(body)
-            or _canonical(body) != _canonical(expected)):
+            or _canonical(body) not in map(_canonical, candidates)):
         raise ValueError("Film spatial source, matrix, configuration or snapshot changed")
     return data
 
 
 def encode_film_spatial(processor, source, config, records, roi, document, *, film,
-                        source_key, snapshot=None, highlight=None, point=None):
+                        source_key, snapshot=None, highlight=None, point=None, print_ev=0.0):
     from .spatial_workflow_v31 import encode_spatial_workflow
     from .frozen_native_cpu import _config_document
 
@@ -197,7 +203,7 @@ def encode_film_spatial(processor, source, config, records, roi, document, *, fi
         payload, export, info, inner = encode_spatial_workflow(
             processor, domain.source, domain.neutral_config, records, roi, document,
             source_key=packet["inner_source_key"], snapshot=saved["inner_snapshot"] if saved else None,
-            highlight=highlight, point=point,
+            highlight=highlight, point=point, print_ev=print_ev,
         )
         domain.validate()
         packet["inner_snapshot"] = inner

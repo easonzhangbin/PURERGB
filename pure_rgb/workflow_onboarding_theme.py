@@ -1,11 +1,11 @@
-"""System typography and semantic colors for the first-use content surface."""
+"""Shared typography and semantic colors for the introduction and About surfaces."""
 
 import sys
 
 from PyQt6.QtGui import QColor, QFontDatabase
 from PyQt6.QtWidgets import QApplication
 
-from .workflow_glass import system_dark
+from .workflow_glass import obsidian_enabled, system_dark
 
 
 def body_font():
@@ -26,11 +26,13 @@ def accent_text(accent):
 
 
 def theme_tokens(dark=None):
-    """Explicit modes support previews; normal use resolves macOS NSColor roles."""
+    """Use the app appearance unless an explicit light or dark preview was requested."""
     explicit = dark is not None
-    dark = system_dark() if dark is None else bool(dark)
+    obsidian = not explicit and obsidian_enabled()
+    dark = (obsidian or system_dark()) if dark is None else bool(dark)
     result = dict(
         dark=dark,
+        obsidian=obsidian,
         background="#1c1c1e" if dark else "#f5f5f7",
         surface="#1c1c1e" if dark else "#f5f5f7",
         card="#2c2c2e" if dark else "#ffffff",
@@ -45,7 +47,11 @@ def theme_tokens(dark=None):
         blue="#0a84ff" if dark else "#007aff",
     )
     app = QApplication.instance()
-    if not explicit and sys.platform == "darwin" and app is not None and app.platformName() == "cocoa":
+    if obsidian:
+        result.update(background="#0b0b0c", surface="#0b0b0c", card="#141517", edge="#34363c",
+                      text="#f0f0ef", secondary="#b1b4bb", accent="#a72820", link="#ff946f",
+                      selected="#1e2024")
+    elif not explicit and sys.platform == "darwin" and app is not None and app.platformName() == "cocoa":
         try:
             from AppKit import NSColor, NSColorSpace
 

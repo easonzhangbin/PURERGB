@@ -13,6 +13,10 @@ def shutdown_window(window):
         return
     window._event_filters_active = False
     window.closing = True
+    end_tone_drag = getattr(window, "end_tone_drag", None)
+    if end_tone_drag is not None:
+        end_tone_drag()
+    window._discard_pending_tone_frame()
     auto_import = getattr(window, "auto_import", None)
     if auto_import is not None:
         auto_import.close()
@@ -31,6 +35,9 @@ def shutdown_window(window):
     window.canvas.removeEventFilter(window)
     window.stage_navigation.dispose()
     window.preview_timer.stop()
+    window.tone_preview_timer.stop()
+    window._recipe_autosave_timer.stop()
+    window.preview_scopes.close()
     import_preview_timer = getattr(window, "import_preview_timer", None)
     if import_preview_timer is not None:
         import_preview_timer.stop()
@@ -59,6 +66,7 @@ def shutdown_window(window):
         balance.dispose()
         balance.close()
     window.pool.waitForDone()
+    window.tone_display_pool.waitForDone()
     window.idle_pool.waitForDone()
     window.light_table.close()
     window.snapshot_store.close(force=True)

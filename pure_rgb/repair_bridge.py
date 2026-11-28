@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
 import subprocess
 
@@ -10,7 +10,8 @@ import numpy as np
 import tifffile
 
 from .native import sha256
-from .preview_data import verified_pixels
+from .preview_data import _checked_pixels, contiguous_rgb_layout, deflate_rgb_strips, validate_rgb_file
+from .raw_import import file_identity
 from .workspace import write_json
 
 DEFAULT_BACKEND = Path("/Applications/PURE Neg.app/Contents/Resources")
@@ -36,7 +37,9 @@ def backend_identity(root=DEFAULT_BACKEND):
     ):
         for path in sorted(directory.rglob("*")):
             if path.is_file():
-                assets[str(path.relative_to(root))] = sha256(path)
+                name = str(path.relative_to(root))
+                if name not in assets:
+                    assets[name] = sha256(path)
     return {
         "root": str(root),
         "files": assets,
@@ -104,32 +107,105 @@ def run_cli(root, work_root, command, flags, on_progress=lambda event: None):
     return final
 
 
-def verify_repair(source, cleaned, mask):
-    original, oi = verified_pixels(source)
-    actual, ai = verified_pixels({"path": str(cleaned), "sha256": sha256(cleaned)})
+def _bind_source(record):
+    path = Path(record["path"])
+    before = file_identity(path)
+    if sha256(path) != record["sha256"]:
+        raise ValueError("样片 TIFF 已变化，哈希核验失败")
+    validate_rgb_file(path, before[2])
+    if file_identity(path) != before:
+        raise ValueError("审核源 TIFF 在读取期间改变")
+    return before
+
+
+@contextmanager
+def _repair_rows(path, file_size):
+    with path.open("rb") as stream, tifffile.TiffFile(stream) as tif:
+        layout = contiguous_rgb_layout(tif, file_size)
+        if layout is None:
+            compressed = deflate_rgb_strips(tif, file_size)
+            if compressed is None:
+                pixels, icc = _checked_pixels(path)
+                yield pixels.shape, icc, pixels.__getitem__
+                return
+            shape, icc, strips = compressed
+            rest = None
+
+            def read_strips(rows):
+                nonlocal rest
+                output = np.empty((rows.stop - rows.start, *shape[1:]), dtype=np.uint16)
+                start = 0
+                while start < len(output):
+                    if rest is None or not len(rest):
+                        rest = next(strips, None)
+                        if rest is None:
+                            raise ValueError("除尘 TIFF 的压缩像素区不完整")
+                    copied = min(len(rest), len(output) - start)
+                    output[start : start + copied] = rest[:copied]
+                    rest = rest[copied:]
+                    start += copied
+                return output
+
+            try:
+                yield shape, icc, read_strips
+                if next(strips, None) is not None:
+                    raise ValueError("除尘 TIFF 的压缩像素区尺寸不匹配")
+            finally:
+                strips.close()
+            return
+
+        shape, icc, offset, dtype = layout
+        row_bytes = shape[1] * shape[2] * dtype.itemsize
+        stream.seek(offset)
+
+        def read(rows):
+            size = (rows.stop - rows.start) * row_bytes
+            packed = stream.read(size)
+            if len(packed) != size:
+                raise ValueError("除尘 TIFF 的像素区不完整")
+            return np.frombuffer(packed, dtype=dtype).reshape(-1, *shape[1:])
+
+        yield shape, icc, read
+
+
+def verify_repair(source, cleaned, mask, *, source_identity=None):
+    paths = Path(source["path"]), Path(cleaned), Path(mask)
+    if source_identity is None:
+        source_identity = _bind_source(source)
+    before = tuple(map(file_identity, paths))
+    if before[0] != source_identity:
+        raise ValueError("审核源 TIFF 在除尘期间改变")
     coverage = tifffile.imread(mask)
     if coverage.ndim == 3 and coverage.shape[2] == 1:
         coverage = coverage[..., 0]
-    if (
-        actual.shape != original.shape
-        or ai != oi
-        or coverage.shape != original.shape[:2]
-        or coverage.dtype != np.uint8
-    ):
-        raise ValueError("除尘结果尺寸、RGB16、ICC 或蒙版不匹配")
-    changed = np.any(original != actual, axis=2)
-    outside = int(np.count_nonzero(changed & (coverage == 0)))
-    if outside:
-        raise ValueError(f"除尘蒙版外有 {outside} 像素变化，结果未通过")
+    with (_repair_rows(paths[0], before[0][2]) as (shape, original_icc, original),
+          _repair_rows(paths[1], before[1][2]) as (actual_shape, actual_icc, actual)):
+        if (actual_shape != shape or min(shape[:2]) <= 0 or actual_icc != original_icc
+                or coverage.shape != shape[:2] or coverage.dtype != np.uint8):
+            raise ValueError("除尘结果尺寸、RGB16、ICC 或蒙版不匹配")
+        changed_pixels = mask_pixels = outside = 0
+        rows = max(1, (1024 * 1024) // shape[1])
+        for start in range(0, shape[0], rows):
+            band = slice(start, min(start + rows, shape[0]))
+            mask_band = coverage[band]
+            changed = np.any(original(band) != actual(band), axis=2)
+            changed_pixels += int(np.count_nonzero(changed))
+            mask_pixels += int(np.count_nonzero(mask_band))
+            outside += int(np.count_nonzero(changed & (mask_band == 0)))
+        if outside:
+            raise ValueError(f"除尘蒙版外有 {outside} 像素变化，结果未通过")
+    cleaned_sha, mask_sha = sha256(paths[1]), sha256(paths[2])
+    if tuple(map(file_identity, paths)) != before:
+        raise ValueError("除尘 TIFF 或蒙版在核验期间改变")
     return {
         "path": str(cleaned),
-        "sha256": sha256(cleaned),
-        "icc_sha256": hashlib.sha256(ai).hexdigest(),
-        "shape": list(actual.shape),
+        "sha256": cleaned_sha,
+        "icc_sha256": hashlib.sha256(actual_icc).hexdigest(),
+        "shape": list(shape),
         "mask_path": str(mask),
-        "mask_sha256": sha256(mask),
-        "changed_pixels": int(changed.sum()),
-        "mask_pixels": int(np.count_nonzero(coverage)),
+        "mask_sha256": mask_sha,
+        "changed_pixels": changed_pixels,
+        "mask_pixels": mask_pixels,
         "outside_mask_changed_pixels": outside,
     }
 
@@ -139,7 +215,7 @@ def prepare(request, on_progress):
     root.mkdir(parents=True, exist_ok=False)
     identity = backend_identity(request.get("backend", DEFAULT_BACKEND))
     source = request["source"]
-    verified_pixels(source)
+    source_identity = _bind_source(source)
     receipt = {
         "state": "preparing",
         "source": source,
@@ -164,7 +240,8 @@ def prepare(request, on_progress):
     review = result["review"]
     if review["depth"] != 16:
         raise ValueError("PURE Neg 审核源位深发生变化")
-    validation = verify_repair(source, review["cleanedPath"], review["maskPath"])
+    validation = verify_repair(source, review["cleanedPath"], review["maskPath"],
+                               source_identity=source_identity)
     receipt.update(
         state="ready",
         review_path=result["reviewPath"],
@@ -214,7 +291,7 @@ def redetect(request, on_progress):
     current = backend_identity(receipt["backend"]["root"])
     if current["fingerprint"] != receipt["backend"]["fingerprint"]:
         raise ValueError("PURE Neg 引擎自分析后发生变化，请重新除尘")
-    verified_pixels(receipt["source"])
+    source_identity = _bind_source(receipt["source"])
     edits = request.get("edits", receipt["edits"])
     if set(edits) - {"excludedRegions", "strokes"}:
         raise ValueError("本桥接只支持灰尘排除与补修，不包含牛顿环")
@@ -249,7 +326,8 @@ def redetect(request, on_progress):
         if review["depth"] != 16:
             raise ValueError("PURE Neg 重新检测源位深发生变化")
         validation = verify_repair(
-            receipt["source"], review["cleanedPath"], review["maskPath"]
+            receipt["source"], review["cleanedPath"], review["maskPath"],
+            source_identity=source_identity,
         )
     except BaseException as error:
         receipt.update(state="uncertain", error=str(error))
@@ -286,7 +364,7 @@ def revise(request, on_progress, confirm=False):
     current = backend_identity(receipt["backend"]["root"])
     if current["fingerprint"] != receipt["backend"]["fingerprint"]:
         raise ValueError("PURE Neg 引擎自分析后发生变化，请重新分析")
-    verified_pixels(receipt["source"])
+    source_identity = _bind_source(receipt["source"])
     edits = request.get("edits", receipt["edits"])
     if set(edits) - {"excludedRegions", "strokes"}:
         raise ValueError("本桥接只支持灰尘排除与补修，不包含牛顿环")
@@ -325,7 +403,7 @@ def revise(request, on_progress, confirm=False):
         )
         cleaned = result["paths"]["cleaned"] if confirm else result["cleanedPath"]
         mask = result["paths"]["mask"] if confirm else result["maskPath"]
-        validation = verify_repair(receipt["source"], cleaned, mask)
+        validation = verify_repair(receipt["source"], cleaned, mask, source_identity=source_identity)
     except BaseException as error:
         if confirm:
             receipt.update(state="uncertain", error=str(error))

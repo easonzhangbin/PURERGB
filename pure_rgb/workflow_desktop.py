@@ -19,7 +19,7 @@ if __name__ == "__main__":
     prepare_application_identity()
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QLockFile, QPointF, QSize, Qt, QThreadPool, QTimer, pyqtSignal  # noqa: E402
-from PyQt6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen  # noqa: E402
+from PyQt6.QtGui import QAction, QActionGroup, QColor, QIcon, QKeySequence, QPainter, QPen  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
     QApplication,
     QAbstractItemView,
@@ -49,14 +49,21 @@ from .diagnostics import event as diagnostic_event, set_debug_logging, setup  # 
 from .live_preview import LivePreview  # noqa: E402
 from .live_worker import EDITING_DOCUMENT_KEYS  # noqa: E402
 from .native import sha256  # noqa: E402
+from .native_headroom import (  # noqa: E402
+    HEADROOM_CONTROL, HEADROOM_STRENGTH, headroom_selected, native_headroom_active,
+    native_headroom_strength, native_headroom_supported,
+)
 from .positive_post import HUE_SPEC, TEMPERATURE_SPEC  # noqa: E402
+from .professional_controls import PRINT_EXPOSURE_SPEC  # noqa: E402
 from .preview_ui import Canvas, Work, display_image, prepare_plugins  # noqa: E402
 from .tasks import Tasks  # noqa: E402
 from .workflow_glass import (  # noqa: E402
     GlassMenu,
     GlassMessageBox,
-    WORKSPACE_GAP, WORKSPACE_INSET, attach_glass, install_glass_surfaces, prepare_glass, stylesheet,
+    WORKSPACE_GAP, WORKSPACE_INSET, apply_solid_window_chrome, attach_glass,
+    detach_glass, install_glass_surfaces, prepare_glass, set_obsidian_enabled, stylesheet,
 )
+from .workflow_border_beam import WorkflowBorderBeam  # noqa: E402
 from .workflow_progress import WorkflowProgressBar  # noqa: E402
 from .workflow_notices import NoticeLabel, center_notice_text  # noqa: E402
 from .workflow_selection import SelectionView  # noqa: E402
@@ -91,15 +98,43 @@ from .workflow_history_ui import EditHistoryUI, PreviewToolbar  # noqa: E402
 from .workflow_flatfield import FlatfieldUI  # noqa: E402
 from .workflow_combo import WorkflowComboBox as QComboBox  # noqa: E402
 from .motion_menus import SpringComboBox  # noqa: E402
-from .release import APP_VERSION, version_description  # noqa: E402
+from .release import APP_VERSION, is_stable_package, version_description  # noqa: E402
 from .workflow_display import DisplayTracker  # noqa: E402
 from .workflow_performance import (  # noqa: E402
     load_performance_settings, save_performance_settings, resolve_performance,
-    process_rss_bytes, should_release_preview,
+    GIB, hardware_info, process_rss_bytes, should_release_preview, system_memory_pressure,
 )
 
 
 RGB_LIGHT_BALANCE_ENABLED = True
+APPEARANCES = {"system": "跟随系统"}
+if not is_stable_package():
+    APPEARANCES["obsidian"] = "曜石黑"
+APPEARANCE_PATH = Path("outputs/workflow-ui-state/appearance.json")
+_NATIVE_RENDER_UPDATE_LABELS = {"highlight": "高光", "print_exposure": "印相曝光"}
+
+
+def _retryable_task(request):
+    action = request.get("action")
+    return (action in ("render", "probe", "geometry_prepare", "flatfield_import")
+            or (action == "export_batch" and request.get("retry_partial_export") is True))
+
+
+def native_fit_preview_edge(performance):
+    if sys.platform != "darwin" or os.uname().machine != "arm64" or performance["backend"] == "cpu":
+        return None
+    memory = hardware_info().get("total_memory_bytes") or 0
+    if memory >= (16 if performance["mode"] == "high" else 32) * GIB:
+        return 1500
+    return None
+
+
+def _saved_appearance(path):
+    try:
+        appearance = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return "system"
+    return appearance if isinstance(appearance, str) and appearance in APPEARANCES else "system"
 
 
 def text(value, muted=False):
@@ -182,13 +217,22 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         # Enable it only after build(), and disable before detaching filters.
         self._event_filters_active = False
         setup("workflow-ui")
-        self.project = WorkflowProject(
-            directory, create=not (Path(directory) / "workspace.json").exists()
-        )
-        self.flatfield_defaults_path = Path(import_settings_path) if import_settings_path is not None else None
-        self.lock = QLockFile(str(self.project.workspace.root / ".ui.lock"))
+        directory = Path(directory).resolve()
+        create = not (directory / "workspace.json").exists()
+        if create:
+            # The new workspace reserves its directory via an exclusive mkdir.
+            self.project = WorkflowProject(directory, create=True)
+        self.lock = QLockFile(str(directory / ".ui.lock"))
         if not self.lock.tryLock(0):
             raise ValueError("此项目已在另一个窗口打开")
+        if not create:
+            try:
+                # Loading a workspace can mark unfinished jobs interrupted.
+                self.project = WorkflowProject(directory)
+            except BaseException:
+                self.lock.unlock()
+                raise
+        self.flatfield_defaults_path = Path(import_settings_path) if import_settings_path is not None else None
         self.closing = self.loading = False
         self.last_error = None
         self.token = 0
@@ -198,6 +242,21 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.shown_context = None
         self.preview_contexts = {}
         self.preview_reusable = False
+        self._tone_drag = None
+        self._tone_stroke = 0
+        self._tone_releasing = False
+        self._tone_needs_settle = False
+        self._tone_settle_generation = None
+        self._tone_settle_full = False
+        self._tone_release_token = None
+        self._tone_sync_pending = False
+        self._print_kelvin_anchor = None
+        self._tone_display_work = None
+        self._tone_display_pending = None
+        self.tone_display_pool = QThreadPool(self)
+        self.tone_display_pool.setMaxThreadCount(1)
+        self.tone_display_pool.setExpiryTimeout(-1)
+        self.tone_visible_context = None
         self.detail_contexts = {}
         self.pending_probe = []
         self.geometry_role = None
@@ -215,8 +274,12 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             proof = json.loads(self.display_preferences.read_text()).get("proof", "off")
             if proof in {"off", "srgb", "display-p3", "adobe-rgb"}:
                 self.proof_space = proof
+        self.appearance_path = ROOT / APPEARANCE_PATH
+        self.appearance = _saved_appearance(self.appearance_path)
+        set_obsidian_enabled(self.appearance == "obsidian")
         self.performance_path = ROOT / "outputs/workflow-ui-state/performance.json"
         self.performance = load_performance_settings(self.performance_path)
+        self.native_fit_edge = native_fit_preview_edge(self.performance)
         set_debug_logging(self.performance["debug_logging"])
         self._logged_preview_wait = None
         self.session_events = []
@@ -236,8 +299,18 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self._make_live()
         self.preview_timer = QTimer(self)
         self.preview_timer.setSingleShot(True)
-        self.preview_timer.setInterval(450)
+        self.preview_timer.setInterval(220)
         self.preview_timer.timeout.connect(self.request_preview)
+        self.tone_preview_timer = QTimer(self)
+        self.tone_preview_timer.setSingleShot(True)
+        self.tone_preview_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.tone_preview_timer.setInterval(16)
+        self.tone_preview_timer.timeout.connect(self.dispatch_tone_preview)
+        self.tone_settle_timer = QTimer(self)
+        self.tone_settle_timer.setSingleShot(True)
+        self.tone_settle_timer.setInterval(300)
+        self.tone_settle_timer.timeout.connect(self.dispatch_tone_preview)
+        self._tone_preview_generation = None
         self.import_preview_timer = QTimer(self)
         self.import_preview_timer.setSingleShot(True)
         self.import_preview_timer.setInterval(70)
@@ -285,6 +358,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
 
     def _make_live(self):
         self.live = LivePreview(self)
+        self.live.fit_transport = True
         self.live.performance = self.performance
         self.live.prewarm_gate = getattr(self, "prewarm_gate", None)
         self.live.ready.connect(self.live_ready)
@@ -292,19 +366,20 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.live.progress.connect(self.preview_progress)
         self.live.progress_detail.connect(self.preview_activity.progress)
 
-    def preview_context(self):
+    def preview_context(self, *, recipe=None, repair_plan=None):
         photo = self.current_photo()
         if not photo:
             return None
         import hashlib
 
-        recipe = self.project.recipe()
-        repair = self.project.repair_context(recipe=recipe)
+        if recipe is None:
+            recipe = self.project.recipe()
+            repair_plan = self.project.repair_context(recipe=recipe)
         return dict(
             photo=photo["id"], engine=photo["engine"],
             recipe_sha256=hashlib.sha256(json.dumps(recipe, sort_keys=True, allow_nan=False).encode()).hexdigest(),
             recipe=deepcopy(recipe),
-            repair_plan_sha256=repair["receipt_sha256"] if repair else None,
+            repair_plan_sha256=repair_plan["receipt_sha256"] if repair_plan else None,
             generation=self.token,
         )
 
@@ -312,12 +387,20 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         lease = self.snapshot_store.acquire()
         if lease is not None:
             photo = self.current_photo()
-            if not photo or lease.context.get("photo") != photo["id"]:
+            context = lease.context
+            if not photo or context.get("photo") != photo["id"]:
                 lease.release()
                 return False
+            shown = self.shown_context or {}
+            if (shown.get("generation", -1) > context.get("generation", -1)
+                    and shown.get("visible_engine_binding")
+                    and all(shown.get(key) == context.get(key) for key in (
+                        "photo", "engine", "recipe_sha256", "repair_plan_sha256", "visible_engine_binding",
+                    ))):
+                context["generation"] = shown["generation"]
             self.load_records(
                 lease.current, lease.reference, sample_step=lease.sample_step,
-                context=lease.context, display_only=True, lease=lease,
+                context=context, display_only=True, lease=lease,
             )
             return True
         if self.current_record is not None and hasattr(self, "last_display_records"):
@@ -330,6 +413,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         return False
 
     def preview_progress(self, message):
+        if self.preview_activity.active:
+            return  # The generation-bound progress handler updates the same widgets.
         if not self.tasks.busy:
             self.status_message(message)
         if self.preview_overlay.isVisible():
@@ -358,8 +443,13 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                     )
                     diagnostic_event("preview_waiting", **details)
                     self.session_events.append(dict(event="preview_waiting", **details))
-            self.preview_overlay.setText(message)
-            self.set_preview_updating(True)
+            context = self.preview_contexts.get(event["token"], {})
+            refining = context.get("tone_stroke") is not None or context.get("settled_drag")
+            if not refining or self.canvas.current is None:
+                self.preview_overlay.setText(message)
+                self.set_preview_updating(True)
+            else:
+                self.set_preview_updating(False)
         else:
             self.set_preview_updating(False)
             if event["state"] != "idle":
@@ -373,18 +463,17 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self._failed_preview = False
             if event["state"] == "failed":
                 self._failed_preview = True
-            failed_action = getattr(self, "failed_request", {}).get("action")
             self.retry_button.setEnabled(not active and (
                 getattr(self, "_failed_preview", False)
-                or failed_action in ("render", "probe", "geometry_prepare", "flatfield_import")
+                or _retryable_task(getattr(self, "failed_request", {}))
             ))
             if message:
                 self.status_message(message)
 
-    def begin_preview_activity(self, token, message="正在准备预览…", *, stage="queued"):
+    def begin_preview_activity(self, token, message="正在准备预览…", *, stage="queued", quiet_for=0):
         queued = bool(self.live.active and self.live.active.get("token") != token)
         self.preview_activity.start(token, "正在等待上一项处理让出资源…" if queued else message,
-                                    stage=stage)
+                                    stage=stage, quiet_for=quiet_for)
 
     def show_preview_notice(self, message=None):
         if not hasattr(self, "preview_notice"):
@@ -407,11 +496,32 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.canvas.clear_detail()
         photo = self.current_photo()
         if photo and self.canvas.current is not None:
+            if self.canvas.interactive_mode_text and self.canvas.displayed_image() is self.canvas.interactive_image:
+                self.show_preview_notice("快速预览 · 正在准备精确画面")
+                return
             old = ENGINES.get((self.shown_context or {}).get("engine"), "上一版本")
             self.show_preview_notice(f"当前显示：{old} · 最新调整正在更新")
 
+    def invalidate_engine_preview(self):
+        self.preview_timer.stop()
+        self.tone_preview_timer.stop()
+        self.tone_settle_timer.stop()
+        self._discard_pending_tone_frame()
+        self.canvas.set_interactive_image(None)
+        self.tone_visible_context = None
+        self.preview_reusable = False
+        self.pending_actual = False
+        self.preview_scopes.cancel()
+        self.scope_panel.set_scope_data(None)
+        self.scope_panel.caption.setText("正在更新当前引擎的 RGB 取样")
+        self.token += 1
+        self.live.invalidate(self.token)
+        self.mark_preview_pending()
+
     def schedule_preview(self):
         """Make an edit visible automatically; saving is a separate action."""
+        self.tone_preview_timer.stop()
+        self.tone_settle_timer.stop()
         if (self.geometry_role == "crop" or
                 (self.geometry_role in ("highlight", "highlight_effect", "highlight_protect")
                  and getattr(self, "highlight_full_source", False))):
@@ -424,11 +534,189 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.begin_preview_activity(self.token, "正在准备当前调整…", stage="debounce")
         # A warm session reuses its transient anchor; waiting the full cold
         # debounce only adds latency to every slider tick.
-        self.preview_timer.setInterval(120 if self.preview_reusable else 450)
+        self.preview_timer.setInterval(70 if self.preview_reusable else 220)
         self.preview_timer.start()
 
-    def stop_preview(self):
+    def _can_show_tone_frame(self):
+        lens = self.canvas.photo_lens
+        return (self.step in (2, 3) and self.geometry_role is None
+                and self.canvas_stack.currentWidget() is self.canvas
+                and self.display_target is not None and self.canvas.current is not None
+                and not self.canvas.split and not (lens and lens.active))
+
+    def begin_tone_drag(self, slider):
+        photo = self.current_photo()
+        if photo and photo["engine"] == "native" and slider is self.print_kelvin.slider:
+            self._print_kelvin_anchor = self._print_kelvin_pair(self.project.recipe())
+        if photo and photo["initial_job"] and self._can_show_tone_frame():
+            self._tone_drag = slider
+            self._tone_stroke += 1
+            self.tone_settle_timer.stop()
+            self._tone_needs_settle = self._tone_settle_generation == self.token
+            if self._tone_needs_settle:
+                # A newer stroke still owes the newest exact frame, but must
+                # not let the previous stroke start it while the mouse is held.
+                self._tone_settle_generation = self._tone_release_token = None
+            self.canvas.suspend_detail(True)
+            if not getattr(slider, "_tone_release_bound", False):
+                slider._tone_release_bound = True
+                slider.sliderReleased.connect(self.tone_slider_released)
+
+    def tone_slider_released(self):
+        if self.sender() is self._tone_drag:
+            self.end_history_gesture(immediate_tone=True)
+
+    def end_tone_drag(self, *, immediate=False):
+        self._print_kelvin_anchor = None
+        if self._tone_drag is None:
+            return
+        slider, self._tone_drag = self._tone_drag, None
+        self.canvas.suspend_detail(False)
+        if self.closing:
+            return
+        if self._tone_needs_settle or self.tone_preview_timer.isActive():
+            self._tone_preview_generation = self.token
+            self._tone_settle_generation = self.token
+            self._tone_settle_full = self._tone_needs_settle
+            self.tone_preview_timer.stop()
+            if immediate:
+                visible = self.tone_visible_context
+                if (self._is_final_tone_context(visible)
+                        and self.canvas.displayed_image() is self.canvas.interactive_image):
+                    self._present_released_fit(visible)
+                    self._refine_after_tone_drag()
+                elif (self._tone_frame_in_flight(self.token)
+                      and self._is_final_tone_context(self.preview_contexts.get(self.token))):
+                    self._wait_for_released_tone_frame()
+                elif (self.step == 2 and self._can_show_tone_frame()
+                      and self.project.repair_context() is None):
+                    # If the pointer left before the last coalesced edit was
+                    # submitted, preview that value before its exact meter.
+                    self.request_preview(tone_edit=True, interactive_edge=self._tone_drag_edge(slider))
+                    self._tone_preview_generation = self._tone_settle_generation = self.token
+                    self._tone_settle_full = True
+                    self._wait_for_released_tone_frame()
+                else:
+                    self._refine_after_tone_drag()
+            else:
+                QTimer.singleShot(0, self.dispatch_tone_preview)
+        self._tone_needs_settle = False
+        if self._tone_sync_pending:
+            self._tone_sync_pending = False
+            self.sync_controls()
+
+    def _is_final_tone_context(self, context):
+        photo = self.current_photo()
+        return bool(context and photo
+                    and context.get("tone_stroke") == self._tone_stroke
+                    and context.get("photo") == photo["id"] and context.get("engine") == photo["engine"]
+                    and self._can_show_tone_frame()
+                    and context.get("recipe") == self.project.recipe())
+
+    def _present_released_fit(self, context):
+        self.tone_visible_context = {**context, "released_fit": True}
+        self.canvas.repaint_interactive_image()
+        self.image_presented.emit()
+
+    def _wait_for_released_tone_frame(self):
+        token = self._tone_release_token = self.token
+        timeout = 220 if self.step == 2 else 130
+        QTimer.singleShot(timeout, lambda: self._finish_pending_tone_release(token))
+
+    def _finish_pending_tone_release(self, token):
+        if self._tone_release_token != token:
+            return
+        self._tone_release_token = None
+        if token == self.token:
+            self._refine_after_tone_drag()
+
+    def _refine_after_tone_drag(self):
+        if self.step == 2 or not self.canvas.fit_mode:
+            # Full metering or an original-pixel tile can be costly. Leave a
+            # short idle window so another stroke can keep using small frames.
+            self.tone_settle_timer.start()
+        else:
+            self.dispatch_tone_preview()
+
+    def _tone_frame_in_flight(self, token):
+        return any(packet and packet["token"] == token for packet in (
+            self.live.active, self._tone_display_work,
+            self._tone_display_pending[0] if self._tone_display_pending else None,
+        ))
+
+    def sync_tone_controls(self):
+        if self._tone_drag is None:
+            self.sync_controls()
+        else:
+            self._tone_sync_pending = True
+
+    def schedule_tone_preview(self):
+        if self.step not in (2, 3) or self.geometry_role is not None:
+            self.schedule_preview()
+            return
+        self.preview_scopes.cancel()
         self.preview_timer.stop()
+        self._tone_preview_generation = self.token
+        # Continuous slider movement must not push back the first frame.
+        if not self.tone_preview_timer.isActive():
+            if self._tone_drag is not None and (self._tone_releasing or not self._tone_needs_settle):
+                # A click should request the normal fit frame once. Give the
+                # press/release pair one display interval to complete first.
+                self.tone_preview_timer.start()
+            else:
+                self.dispatch_tone_preview()
+
+    def dispatch_tone_preview(self):
+        if self.closing or self._tone_preview_generation != self.token:
+            return
+        if self._tone_settle_generation == self.token:
+            self._tone_settle_generation = None
+            if self._tone_settle_full:
+                self.request_preview(tone_edit=True, settled_drag=True)
+            else:
+                self.request_preview(tone_edit=True)
+            return
+        context = self.preview_contexts.get(self.token, {})
+        useful_in_flight = (context.get("tone_edit") and (
+            self._tone_drag is None or context.get("tone_stroke") == self._tone_stroke
+        ) and (
+            any(request and request["token"] == self.token
+                for request in (self.live.active, self.live.pending))
+            or (self.base_display_pending and self.base_display_pending[1] == self.token)
+        ))
+        activity = self.preview_activity
+        grace = 2.0 if self.live.cache_report.get("retained_source_bytes") else 8.0
+        if (useful_in_flight and activity.token == self.token
+                and activity.clock() - activity.started < grace):
+            # Let a same-photo frame reach the canvas before submitting the
+            # newest recipe. A stalled frame still reaches normal preemption.
+            self.tone_preview_timer.start()
+            return
+        if self._tone_drag is not None:
+            self.request_preview(tone_edit=True, interactive_edge=self._tone_drag_edge(self._tone_drag))
+        else:
+            self.request_preview(tone_edit=True)
+
+    def _tone_drag_edge(self, slider):
+        engine = self.project.photo()["engine"]
+        if engine == "native":
+            if (self.step == 2 or not self.canvas.fit_mode or slider in (
+                self.print_exposure.slider, self.headroom_strength.slider, self.highlight_strength.slider,
+            )):
+                return 704
+            return self.native_fit_edge or 704
+        if engine == "nikon" and slider is self.fixed_strength.slider:
+            return 512
+        return 1400
+
+    def stop_preview(self):
+        self.end_tone_drag()
+        self._discard_pending_tone_frame()
+        self.canvas.set_interactive_image(None)
+        self.tone_visible_context = None
+        self.preview_timer.stop()
+        self.tone_preview_timer.stop()
+        self.tone_settle_timer.stop()
         if self.preview_activity.active:
             self.preview_activity.finish(self.preview_activity.token, state="cancelled", message="已停止预览更新")
         self.set_preview_updating(False)
@@ -440,15 +728,40 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self._make_live()
 
     def install_glass(self):
-        self.glass_report = attach_glass(self)
+        if self.closing:
+            return
+        if self.appearance == "obsidian":
+            detach_glass(self)
+            chrome = apply_solid_window_chrome(self)
+            self.glass_report = dict(mode="obsidian", attached=False, chrome=chrome)
+        elif not self.glass_report["attached"]:
+            self.glass_report = attach_glass(self)
         self._apply_glass_palette()
         if self.glass_report["attached"]:
             self.glass_report["controls"] = attach_materials(self)
 
     def _apply_glass_palette(self, *_):
-        self.setStyleSheet(stylesheet(self.glass_report["attached"]))
+        obsidian = self.appearance == "obsidian"
+        self.setStyleSheet(stylesheet(self.glass_report["attached"], obsidian=obsidian))
+        self.header_beam.set_visible_for_theme(obsidian)
+
+    def change_appearance(self, appearance):
+        if appearance == self.appearance:
+            return
+        try:
+            write_json(self.appearance_path, appearance)
+        except OSError as error:
+            self.appearance_actions[self.appearance].setChecked(True)
+            self.status_message(f"无法保存外观设置：{error}")
+            return
+        self.appearance = appearance
+        self.appearance_actions[appearance].setChecked(True)
+        set_obsidian_enabled(appearance == "obsidian")
+        self.install_glass()
 
     def display_target_changed(self, target):
+        self.canvas.set_interactive_image(None)
+        self.tone_visible_context = None
         self.canvas.clear_detail()
         self.display_target = target
         self.display_icc = target.icc
@@ -507,6 +820,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
 
     def performance_changed(self, settings):
         self.performance = save_performance_settings(self.performance_path, settings)
+        self.native_fit_edge = native_fit_preview_edge(self.performance)
         self.tasks.performance = self.performance
         self.live.performance = self.performance
         set_debug_logging(self.performance["debug_logging"])
@@ -515,7 +829,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         policy = resolve_performance(self.performance, include_backend=False)
         if hasattr(self, "display_cache"):
             self.display_cache.set_budget(min(512 * 1024**2, policy["preview_cache_budget_bytes"] // 4))
-            self.display_cache.set_workers(policy["display_threads"])
+            self.display_cache.set_workers(self.preview_display_workers(policy))
         self.session_events.append(dict(event="settings_changed", status="complete", mode=self.performance["mode"]))
         was_updating = bool(self.live.active or self.live.pending or self.pool.activeThreadCount())
         self.stop_preview()
@@ -529,6 +843,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.error("未知软打样色域")
             return
         self.proof_space = space
+        self.canvas.set_interactive_image(None)
+        self.tone_visible_context = None
         self.canvas.clear_detail()
         write_json(self.display_preferences, dict(proof=space))
         self.display_revision += 1
@@ -594,6 +910,12 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             write_diagnostic_report(path, self.performance, events=self.session_events[-100:])
             self.status_message("诊断报告已保存。")
 
+    def preview_display_workers(self, policy):
+        workers = policy["display_threads"]
+        if self.native_fit_edge and not self.performance["cpu_threads"]:
+            return max(workers, min(6, policy["cpu_count"] - 2))
+        return workers
+
     def setup_background_previews(self):
         from .workflow_display_cache import DisplayImageCache
         from .workflow_idle import IdlePreviewScheduler, PrewarmGate
@@ -601,7 +923,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         policy = resolve_performance(self.performance, include_backend=False)
         self.display_cache = DisplayImageCache(
             budget_bytes=min(512 * 1024**2, policy["preview_cache_budget_bytes"] // 4),
-            workers=policy["display_threads"],
+            workers=self.preview_display_workers(policy),
         )
         self.idle_pool = QThreadPool(self)
         self.idle_pool.setMaxThreadCount(1)
@@ -662,6 +984,15 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         queue = []
         for _, photo in ordered:
             if photo["id"] == current:
+                # Older projects may not yet have a decoded cache for this
+                # photo. Prepare it while the user inspects the saved image.
+                if getattr(self, "step", None) == 3 and (
+                    self.live.cached_source_context is None or self.live.cached_source_context
+                    != self.live._source_context({"draft_recipe": self.project.recipe(photo)})
+                ):
+                    job = self.project.source_job(photo)
+                    if job:
+                        queue.append((job["id"], None))
                 continue
             job = (self.project.saved_job(photo) if saved_jobs is None
                    else saved_jobs.get(photo["id"]))
@@ -685,17 +1016,18 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         def read():
             if generation in self.idle_cancelled or self.closing:
                 return None
-            sample = self.project.workspace.sample(self.project.workspace.job(item[0]))
-            for mode in dict.fromkeys((RESULT_MODES[item[1]], "native")):
-                if generation in self.idle_cancelled or self.closing:
-                    break
-                if f"baseline__{mode}" not in sample.results:
-                    continue
-                record = sample.record(mode, "baseline")
-                self.display_cache.get_image(
-                    record, target, proof=proof,
-                    source_step=saved_display_source_step(record) or 1,
-                )
+            if item[1] is not None:
+                sample = self.project.workspace.sample(self.project.workspace.job(item[0]))
+                for mode in dict.fromkeys((RESULT_MODES[item[1]], "native")):
+                    if generation in self.idle_cancelled or self.closing:
+                        break
+                    if f"baseline__{mode}" not in sample.results:
+                        continue
+                    record = sample.record(mode, "baseline")
+                    self.display_cache.get_image(
+                        record, target, proof=proof,
+                        source_step=saved_display_source_step(record) or 1,
+                    )
             if hasattr(self.project.workspace, "root"):
                 from .decode_prewarm import prewarm
 
@@ -724,6 +1056,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         busy = bool(
             self.tasks.busy or self.live.active or self.live.pending
             or self.pool.activeThreadCount() or self.idle_pool.activeThreadCount()
+                or self._tone_drag is not None or self._tone_display_work is not None
         )
         idle = time.monotonic() - self.last_activity
         if not busy and self.live.process and idle >= 8:
@@ -731,6 +1064,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             if should_release_preview(
                 self.performance, idle_seconds=idle, busy=False, rss_bytes=rss,
                 retained_source_bytes=self.live.cache_report.get("retained_source_bytes", 0),
+                memory_pressure=system_memory_pressure(),
             ):
                 self.stop_preview()
 
@@ -765,6 +1099,18 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         from .workflow_application import ApplicationMenuTitles
 
         self.application_menu_titles = ApplicationMenuTitles(self)
+        appearance_menu = self.menuBar().addMenu("外观")
+        appearance_menu.menuAction().setVisible(len(APPEARANCES) > 1)
+        appearance_group = QActionGroup(appearance_menu)
+        self.appearance_actions = {}
+        for mode, label in APPEARANCES.items():
+            action = QAction(label, appearance_group)
+            action.setCheckable(True)
+            action.setChecked(mode == self.appearance)
+            action.triggered.connect(lambda _checked, mode=mode: self.change_appearance(mode))
+            appearance_group.addAction(action)
+            appearance_menu.addAction(action)
+            self.appearance_actions[mode] = action
         self.library_menu = self.menuBar().addMenu("图片库")
         self.library_action = QAction("打开图片库…", self)
         self.library_action.setShortcut(QKeySequence("Ctrl+Shift+L"))
@@ -826,6 +1172,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             index: self.stage_buttons[index] for index in VISIBLE_STAGE_INDICES})
         self.stage_highlight = self.stage_navigation.indicator
         head.addWidget(stage_bar, 1, Qt.AlignmentFlag.AlignVCenter)
+        self.header_beam = WorkflowBorderBeam(header)
         split = QSplitter(Qt.Orientation.Horizontal)
         split.setHandleWidth(WORKSPACE_GAP)
         outer.addWidget(split, 1)
@@ -1021,9 +1368,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         photos.setMinimumWidth(240)
         photos.setMaximumWidth(300)
         right = QVBoxLayout(photos)
-        from .workflow_scopes import ScopePanel
+        from .workflow_scopes import PreviewScopeRefresh, ScopePanel
 
         self.scope_panel = ScopePanel()
+        self.preview_scopes = PreviewScopeRefresh(self)
         right.addWidget(self.scope_panel)
         self.photo_heading = text("照片")
         right.addWidget(self.photo_heading)
@@ -1232,6 +1580,12 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         body.addWidget(
             button("绘制密度测量区", lambda: self.begin_selection("include"))
         )
+        self.frame_meter_button = button(
+            "框选有效画幅并测量中心 80%", lambda: self.begin_selection("frame_meter")
+        )
+        body.addWidget(self.frame_meter_button)
+        self.frame_meter_note = text("", True)
+        body.addWidget(self.frame_meter_note)
         self.exclude_meter_button = button("减去不良区域", lambda: self.begin_selection("exclude"))
         body.addWidget(self.exclude_meter_button)
         self.advanced_button(body, 2, "密度测量高级参数…")
@@ -1275,13 +1629,19 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         return control
 
     def build_stage_3(self, layout):
+        from negpy.features.exposure.logic import TEMP_MAX_KELVIN, TEMP_MIN_KELVIN, TEMP_REF_KELVIN
         from .film_ui import NativeFilmSelector
         from .motion_sliders import JellySliderControl
         from .workflow_parameter_reset import add_parameter_reset
 
+        self.print_kelvin = self.spin(
+            layout, "印相色温（K）", TEMP_MIN_KELVIN, TEMP_MAX_KELVIN, 50, TEMP_REF_KELVIN,
+            self.print_kelvin_changed,
+        )
+        self.print_kelvin.setToolTip("NegPy 原生负片印相滤色，沿原生色温轴调节品红与黄色")
         spec = TEMPERATURE_SPEC
         self.temperature = self.spin(
-            layout, "色温（K）", spec.low, spec.high, spec.step, spec.default,
+            layout, "正像色温（K）", spec.low, spec.high, spec.step, spec.default,
             lambda value: self.color_slider_changed(TEMPERATURE_SPEC, value),
         )
         self.temperature.setToolTip("NegPy 正像色温；5500 K 为中性")
@@ -1297,9 +1657,29 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         layout.addWidget(self.native_film)
         self.film_note = text("", True)
         layout.addWidget(self.film_note)
-        self.exposure = self.spin(
-            layout, "曝光（EV）", -4, 4, 0.1, 0, self.tone_changed
+        print_ev = PRINT_EXPOSURE_SPEC
+        self.print_exposure = self.spin(
+            layout, print_ev.title, print_ev.low, print_ev.high, print_ev.step, print_ev.default,
+            self.print_exposure_changed,
         )
+        print_exposure_help = (
+            "根据三张 RAW 的印相前密度计算亮度，输出编码前等比例调整 RGB，保留原有色彩。"
+            "负值压暗正像并展开 RAW 仍有数据的亮部，正值提亮。"
+        )
+        self.print_exposure.setToolTip(print_exposure_help)
+        self.print_exposure.label.setToolTip(print_exposure_help)
+        self.print_exposure.slider.setToolTip(print_exposure_help)
+        self.print_exposure.slider.setAccessibleDescription(print_exposure_help)
+        self.exposure = self.spin(
+            layout, "正像曝光（EV）", -4, 4, 0.1, 0, self.tone_changed
+        )
+        exposure_help = (
+            "调整转换后正像的整体亮度。NegPy 的相纸曲线前曝光请用「印相曝光（EV）」。"
+        )
+        self.exposure.setToolTip(exposure_help)
+        self.exposure.label.setToolTip(exposure_help)
+        self.exposure.slider.setToolTip(exposure_help)
+        self.exposure.slider.setAccessibleDescription(exposure_help)
         self.contrast = ScrubberControl("反差", 50, 180, 1, 115)
         self.contrast_label = self.contrast.label
         self.contrast.valueChanged.connect(self.tone_changed)
@@ -1310,6 +1690,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.paper_label = text("印相相纸")
         layout.addWidget(self.paper_label)
         self.paper_reset = add_parameter_reset(layout, self.paper, "neutral", "印相相纸")
+        self.headroom_strength = self.spin(
+            layout, "高光找回强度（%）", 0, 100, 1, 0, self.headroom_strength_changed,
+        )
+        self.headroom_strength.reset_button.clicked.connect(self.reset_legacy_highlight)
         self.color_box = QWidget()
         color_outer = QVBoxLayout(self.color_box)
         color_outer.setContentsMargins(0, 0, 0, 0)
@@ -1419,7 +1803,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.export_old_highlight_button = button(
             "导出当前照片的已保存旧版", self.export_previous_highlight
         )
-        self.export_old_highlight_button.setToolTip("导出旧算法保存的成片及其已确认除尘。")
+        self.export_old_highlight_button.setToolTip("导出升级前保存的成片及其已确认除尘。")
         self.export_old_highlight_button.hide()
         layout.addWidget(self.export_old_highlight_button)
         layout.addWidget(text("参数自动保存；导出时自动生成当前配方的完整 TIFF，同名文件不会覆盖。", True))
@@ -1444,7 +1828,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         return self.advanced_panels.get(getattr(self, "step", 3))
 
     def advanced_button(self, layout, stage, title):
-        panel = AdvancedPanel(default_expanded=stage == 2)
+        panel = AdvancedPanel(default_expanded=stage == 2, live_tone=stage in (2, 3))
         panel.expand_all_button.setAccessibleName(title)
         self.advanced_buttons[stage] = panel.expand_all_button
         panel.recipe_changed.connect(
@@ -1496,6 +1880,11 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         try:
             if recipe == self.project.recipe():
                 return
+            if stage in (2, 3):
+                self.project.set_recipe(recipe)
+                self.sync_tone_controls()
+                self.schedule_tone_preview()
+                return
             self.preview_timer.stop()
             self.token += 1
             self.live.invalidate(self.token)
@@ -1516,13 +1905,15 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
     def set_preview_updating(self, updating):
         if not hasattr(self, "preview_overlay"):
             return
+        if not updating:
+            self.preview_overlay.hide()
+            return
         self.preview_overlay.fit_to_width(max(150, self.canvas_stack.width() - 32))
         self.preview_overlay.move(
             max(0, (self.canvas_stack.width() - self.preview_overlay.width()) // 2), 12
         )
-        self.preview_overlay.setVisible(updating)
-        if updating:
-            self.preview_overlay.raise_()
+        self.preview_overlay.show()
+        self.preview_overlay.raise_()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1543,7 +1934,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self._measurement_hint_text = ""
         if getattr(self, "step", None) == 2 and not self.selection.points:
             if self.geometry_role == "import_roi":
-                message = "未能自动识别有效画面\n请拖出矩形密度检测区域。松开后自动测量，完成测量后才能进入下一步。"
+                message = "未能自动识别有效画面\n请框选有效画幅，松开后测量中心约 80%。完成测量后才能进入下一步。"
+            elif self.geometry_role == "frame_meter":
+                message = "请框选有效画幅\n松开后测量画幅中心约 80%。"
             elif self.geometry_role == "include":
                 message = "请绘制密度检测区域\n从画面内按住鼠标拖动，松开后开始测量。"
             elif (self.geometry_role is None and self.current_photo()
@@ -1638,13 +2031,20 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             return
         for panel in self.advanced_panels.values():
             panel.cancel_pending()
-        had_stage = hasattr(self, "step")
-        route_changed = self.project.enter_stage(index)
+        previous_stage = getattr(self, "step", None)
+        had_stage = previous_stage is not None
+        if had_stage and previous_stage != index:
+            self.canvas.set_interactive_image(None)
+            self.tone_visible_context = None
+        try:
+            route_changed = self.project.enter_stage(index)
+        except OSError as error:
+            if had_stage:
+                self.stage_buttons[previous_stage].setChecked(True)
+            self.error(error)
+            return
         if route_changed:
-            self.preview_timer.stop()
-            self.token += 1
-            self.live.invalidate(self.token)
-            self.mark_preview_pending()
+            self.invalidate_engine_preview()
         from .workflow_materials import stable_material_layout
 
         with stable_material_layout(self):
@@ -1660,17 +2060,25 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             if route_changed:
                 self.refresh_photos()
             self.stage_navigation.select(index, animate=had_stage)
+        if had_stage and previous_stage != index:
+            self.header_beam.pulse()
         if start_crop:
             self.begin_selection("crop")
         elif route_changed and had_stage and self.current_photo()["initial_job"]:
+            self.preview_timer.stop()
             job = self.project.saved_job()
             if job and not self.project.dirty():
                 sample = self.project.workspace.sample(job)
                 self.load_records(*self.saved_images(sample))
             elif not self.tasks.busy:
-                self.request_preview()
+                if index == 3:
+                    self.request_engine_preview()
+                else:
+                    self.request_preview()
         if index == 0:
             self.schedule_import_preview()
+        elif index == 3 and previous_stage != index:
+            self.queue_idle_previews()
 
     def refresh_metering_status(self):
         photo = self.current_photo()
@@ -1733,12 +2141,31 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             locating_import = self.geometry_role == "import_roi"
             self.retry_button.setEnabled(
                 not busy and not locating_import and not self.preview_activity.active
-                and (failed.get("action") in ("render", "probe", "geometry_prepare", "flatfield_import")
+                and (_retryable_task(failed)
                      or getattr(self, "_failed_preview", False))
             )
             self.import_button.setEnabled(bool(photo) and not busy and not locating_import)
             ready = bool(photo and photo["initial_job"])
             grid_available = ready and not busy and photo["engine"] == "native"
+            self.frame_meter_button.setEnabled(grid_available)
+            uncertain = False
+            if ready:
+                if "frame_detection_uncertain" not in photo:
+                    try:
+                        manifest_file = (self.project.workspace.root / "runs" /
+                                         photo["initial_job"] / "manifest.json")
+                        region = json.loads(manifest_file.read_text()).get("picture_region") or {}
+                        photo["frame_detection_uncertain"] = bool(region.get("measurement_only_fallback"))
+                    except (OSError, ValueError, TypeError):
+                        pass
+                roi = photo["measurement"].get("roi")
+                uncertain = bool(photo.get("frame_detection_uncertain")) and (
+                    roi is None or list(roi) == list(photo["analysis_roi"] or ())
+                )
+            self.frame_meter_note.setText(
+                "未能识别有效画幅，当前使用整张源图的临时测量区。请框选有效画幅。"
+                if uncertain else ""
+            )
             self.meter_grid_button.setEnabled(grid_available)
             self.meter_grid_reset.setEnabled(grid_available)
             self.import_button.set_attention(False)
@@ -1775,6 +2202,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 control.setEnabled(ready and not busy)
             self.sync_photo_selection()
             if not photo:
+                self.print_exposure.hide()
+                self.headroom_strength.hide()
                 self.equipment_note.setText("选择 RAW 后读取器材与内嵌矫正参数。")
                 self.lens_correction_button.setChecked(False)
                 self.chromatic_button.setChecked(False)
@@ -1908,10 +2337,21 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.avoidance.setCurrentIndex(self.avoidance.findData(action))
             self.refresh_metering_status()
             color_values = recipe.get("post_controls", {}).get(RESULT_MODES[engine], {}).get("values", {})
+            self.print_kelvin.setVisible(native and not bw)
+            self.print_kelvin.setEnabled(ready and not busy and native and not bw)
+            if native and not bw:
+                from negpy.features.exposure.logic import wb_to_kelvin
+
+                self.print_kelvin.setValue(wb_to_kelvin(*self._print_kelvin_pair(recipe)))
             for control, spec in ((self.temperature, TEMPERATURE_SPEC), (self.hue, HUE_SPEC)):
                 control.setVisible(not bw)
                 control.setEnabled(ready and not busy)
                 control.setValue(color_values.get(spec.key, spec.default))
+            print_ev = PRINT_EXPOSURE_SPEC
+            self.print_exposure.setVisible(native and not bw)
+            if native and not bw:
+                values = recipe.get("native_controls", {}).get("values", {})
+                self.print_exposure.setValue(values.get(print_ev.key, print_ev.default))
             self.exposure.setValue(recipe["exposure_ev"])
             self.contrast_label.setText(
                 "ISO-R 反差（低值更硬）" if native else "正像反差（18% 锚点）"
@@ -1940,6 +2380,25 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.paper.setVisible(native)
             self.paper_reset.setVisible(native)
             self.paper_label.setVisible(native)
+            headroom_route = native and not bw and recipe.get("measurement_method") == "negpy"
+            headroom_supported = headroom_route and native_headroom_supported(recipe)
+            legacy_highlight = headroom_supported and bool(recipe.get("highlight_controls")) and not headroom_selected(recipe)
+            self.headroom_strength.setVisible(headroom_route)
+            self.headroom_strength.setEnabled(ready and not busy and headroom_supported)
+            self.headroom_strength.setValue(native_headroom_strength(recipe) * 100)
+            if legacy_highlight:
+                self.headroom_strength.reset_button.setEnabled(True)
+            headroom_help = (
+                "在相纸曲线压缩之前利用负片密度保留亮部层次。0% 为常规印相，100% 为完整映射。"
+                if headroom_supported else
+                "分区、扩散或反差遮罩启用时暂不可用。"
+            )
+            if legacy_highlight:
+                headroom_help += "此照片沿用旧版高光处理。拖动滑杆切换到新映射，点击复位关闭旧处理。"
+            self.headroom_strength.setToolTip(headroom_help)
+            self.headroom_strength.label.setToolTip(headroom_help)
+            self.headroom_strength.slider.setToolTip(headroom_help)
+            self.headroom_strength.slider.setAccessibleDescription(headroom_help)
             self.color_box.setVisible(not bw)
             for key, control in self.balance.items():
                 control.setValue(output.get(key, 0))
@@ -1948,7 +2407,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.fixed.setChecked(fixed > 0)
             self.fixed_strength.setValue((fixed or photo["fixed_last_strength"]) * 100)
             self.fixed_strength.setEnabled(fixed > 0)
-            self.high_box.setVisible(native)
+            self.high_box.setVisible(native and not headroom_route)
+            self.high_box.setEnabled(native and not headroom_route)
             high = recipe.get("highlight_controls")
             self.highlight.setChecked(bool(high))
             self.highlight_strength.setValue(
@@ -1985,12 +2445,14 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 else "中性曲线 · 使用公开算法演算，胶片原曲线面板需要本机资源配方。"
             )
             self.engine_note.setText(flex_note if engine == "flex" else "")
-            highlight_refresh = ready and self.project.highlight_reprocess_required(photo)
+            updates = self.project.native_render_updates(photo) if ready else ()
+            update_label = "、".join(_NATIVE_RENDER_UPDATE_LABELS[key] for key in updates)
+            dirty = self.project.dirty(photo)
             self.canvas_title.setText(
                 Path(raw[0]).stem
                 + (" · 等待自动处理" if not ready else
-                   " · 高光算法已更新，需重新生成完整版本" if highlight_refresh else
-                   " · 调整已自动保存" if self.project.dirty() else " · 完整版本已就绪")
+                   f" · {update_label}算法已更新，需重新生成完整版本" if updates else
+                   " · 调整已自动保存" if dirty else " · 完整版本已就绪")
             )
             self.canvas_title.setToolTip(self.canvas_title.text())
             self.repair_button.setEnabled(ready and not busy)
@@ -2000,14 +2462,14 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.canvas_title.setText(self.canvas_title.text() + " · 除尘需重新审核")
                 self.canvas_title.setToolTip(repair_status["message"])
             self.repair_button.setText(
-                "保存并打开 PURE Neg…" if self.project.dirty() else "PURE Neg 除尘与审核…")
+                "保存并打开 PURE Neg…" if dirty else "PURE Neg 除尘与审核…")
             self.repair_button.setToolTip(
-                "高光算法已更新。生成新版时保留同来源、同画幅的已确认除尘选区；原版本与审核保留。"
-                if highlight_refresh else
-                "保存当前完整分辨率版本后自动打开除尘审核。" if self.project.dirty()
+                f"{update_label}算法已更新。生成新版时保留同来源、同画幅的已确认除尘选区；原版本与审核保留。"
+                if updates else
+                "保存当前完整分辨率版本后自动打开除尘审核。" if dirty
                 else "使用当前保存版本进入 PURE Neg 检测、画笔修整及审核。")
-            self.export_old_highlight_button.setVisible(bool(highlight_refresh))
-            self.export_old_highlight_button.setEnabled(bool(highlight_refresh) and not busy)
+            self.export_old_highlight_button.setVisible(bool(updates))
+            self.export_old_highlight_button.setEnabled(bool(updates) and not busy)
         finally:
             self.loading = False
             self.sync_history_actions()
@@ -2034,7 +2496,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             job = self.project.saved_job(photo)
             if job:
                 saved_jobs[photo["id"]] = job
-            state = ("高光需重新生成" if job and self.project.highlight_reprocess_required(photo, saved=job)
+            updates = self.project.native_render_updates(photo, saved=job) if job else ()
+            update_label = "、".join(_NATIVE_RENDER_UPDATE_LABELS[key] for key in updates)
+            state = (f"{update_label}需重新生成" if updates
                      else "完整版本" if job and not self.project.dirty(photo, saved=job)
                      else "调整已保存" if photo["initial_job"] else self.auto_import.state(photo))
             item = existing.get(photo["id"])
@@ -2352,15 +2816,19 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.refresh_photos()
             return
         self.preview_timer.stop()
+        self.tone_preview_timer.stop()
         self.import_preview_timer.stop()
         self.import_lens_context = None
         self.preview_reusable = False
-        self.preview_timer.setInterval(450)
+        self.preview_timer.setInterval(220)
+        self.preview_scopes.cancel()
         self.preview_activity.reset()
         self.token += 1
         self.live.invalidate(self.token)
         self.snapshot_store.clear()
         self.shown_context = None
+        self.tone_visible_context = None
+        self.canvas.set_interactive_image(None)
         self.__dict__.pop("last_display_records", None)
         self.show_preview_notice()
         self.project.data["current"] = identifier
@@ -2369,6 +2837,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.set_stage(0)
         self.project.enter_stage(self.step)
         self.finish_selection()
+        self.preview_timer.stop()
         self.current_record = None
         self.pending_actual = False
         self.canvas.current = self.canvas.reference = None
@@ -2867,12 +3336,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 from .nikon_research_workflow import checked_nikon_resources
 
                 checked_nikon_resources()
-            self.preview_timer.stop()
-            self.preview_reusable = False
-            self.token += 1
-            self.live.invalidate(self.token)
             self.project.select_engine(desired)
-            self.mark_preview_pending()
+            self.invalidate_engine_preview()
             self.sync_controls()
             self.refresh_photos()
             if self.current_photo()["initial_job"]:
@@ -2881,7 +3346,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                     sample = self.project.workspace.sample(job)
                     self.load_records(*self.saved_images(sample))
                 else:
-                    self.request_preview()
+                    self.request_engine_preview()
         except Exception as error:
             self.error(error)
             self.sync_controls()
@@ -2926,8 +3391,79 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         else:
             current["values"][spec.key] = value
         self.project.set_recipe(recipe, label="调整" + spec.title.split("（")[0])
-        self.sync_controls()
-        self.schedule_preview()
+        self.sync_tone_controls()
+        self.schedule_tone_preview()
+
+    @staticmethod
+    def _print_kelvin_pair(recipe):
+        values = recipe.get("native_controls", {}).get("values", {})
+        return values.get("exposure.wb_magenta", 0), values.get("exposure.wb_yellow", 0)
+
+    def print_kelvin_changed(self, value):
+        photo = self.current_photo()
+        if (self.loading or self.tasks.busy or not photo or not photo["initial_job"]
+                or photo["engine"] != "native" or photo["source_mode"] == "bw"):
+            return
+        if not self.flush_advanced():
+            self.sync_controls()
+            return
+        from negpy.features.exposure.logic import kelvin_to_wb
+
+        recipe = self.project.recipe()
+        anchor = self._print_kelvin_anchor or self._print_kelvin_pair(recipe)
+        magenta, yellow = kelvin_to_wb(value, *anchor)
+        values = recipe.setdefault("native_controls", dict(version=1, values={}))[
+            "values"
+        ]
+        values.update({"exposure.wb_magenta": magenta, "exposure.wb_yellow": yellow})
+        self.project.set_recipe(recipe, label="调整印相色温")
+        self.sync_tone_controls()
+        self.schedule_tone_preview()
+
+    def print_exposure_changed(self, value):
+        photo = self.current_photo()
+        if (self.loading or self.tasks.busy or not photo or not photo["initial_job"]
+                or photo["engine"] != "native" or photo["source_mode"] != "rgb"):
+            return
+        if not self.flush_advanced():
+            self.sync_controls()
+            return
+        recipe = self.project.recipe()
+        fields = recipe.setdefault("native_controls", dict(version=1, values={}))["values"]
+        fields[PRINT_EXPOSURE_SPEC.key] = value
+        self.project.set_recipe(recipe, label="调整印相曝光")
+        self.sync_tone_controls()
+        self.schedule_tone_preview()
+
+    def headroom_strength_changed(self, value):
+        photo = self.current_photo()
+        if (self.loading or self.tasks.busy or not photo or not photo["initial_job"]
+                or photo["engine"] != "native" or photo["source_mode"] != "rgb"):
+            return
+        if not self.flush_advanced():
+            self.sync_controls()
+            return
+        recipe = self.project.recipe()
+        if not native_headroom_supported(recipe):
+            self.sync_controls()
+            return
+        values = recipe.setdefault("native_controls", dict(version=1, values={}))["values"]
+        values.pop(HEADROOM_CONTROL, None)
+        values[HEADROOM_STRENGTH] = value / 100
+        try:
+            self.project.set_recipe(recipe, label="调整高光找回强度")
+        except (ValueError, OSError) as error:
+            self.error(error)
+            self.sync_controls()
+            return
+        self.sync_tone_controls()
+        self.schedule_tone_preview()
+
+    def reset_legacy_highlight(self):
+        if self.current_photo() and self.headroom_strength.value() == 0:
+            recipe = self.project.recipe()
+            if recipe.get("highlight_controls") and not headroom_selected(recipe):
+                self.headroom_strength_changed(0)
 
     def tone_changed(self, *args):
         if self.loading or not self.current_photo() or self.tasks.busy:
@@ -2967,14 +3503,18 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 )["values"]
                 if desired["contrast"] != 115 or "exposure.grade" in values:
                     values["exposure.grade"] = desired["contrast"]
-                if desired["highlight"]:
+                edit_highlight = not native_headroom_active(recipe)
+                if edit_highlight and desired["highlight"]:
                     roi = recipe.get("roi") or photo["analysis_roi"]
                     if roi is None:
                         raise ValueError("请先完成源准备，再启用高光找回")
                     high = recipe.get("highlight_controls")
+                    enabling = high is None
+                    created = False
                     if high is None:
                         high = photo.pop("suspended_highlight_controls", None)
                         if high is None:
+                            created = True
                             high = dict(version=1, reference_roi=list(roi), controls={})
                             photo["highlight_reference_origin"] = "automatic"
                             photo.pop("highlight_reference_drawn_roi", None)
@@ -2987,8 +3527,13 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                         # A zero-strength recipe canonicalizes to disabled; keep
                         # the last active settings and source-coordinate masks.
                         photo["suspended_highlight_controls"] = deepcopy(high)
-                    high["controls"]["strength"] = desired["highlight_strength"] / 100
-                else:
+                    strength = desired["highlight_strength"] / 100
+                    if (not bw and recipe.get("measurement_method") == "negpy"
+                            and (created or (not enabling and strength > 0
+                                              and strength != high["controls"].get("strength")))):
+                        high.setdefault("reference_density_offset", 0.45)
+                    high["controls"]["strength"] = strength
+                elif edit_highlight:
                     high = recipe.pop("highlight_controls", None)
                     if high is not None:
                         photo["suspended_highlight_controls"] = deepcopy(high)
@@ -3009,16 +3554,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 recipe["nikon_research_controls"] = nikon_controls(
                     strength if desired["fixed"] else 0
                 )
-            self.token += 1
-            self.live.invalidate(self.token)
-            self.set_preview_updating(False)
             self.project.set_recipe(recipe)
             committed = True
-            if engine == "native":
-                self.project.prepare_highlight_reference()
-            self.sync_controls()
-            self.mark_preview_pending()
-            self.preview_timer.start()
+            self.sync_tone_controls()
+            self.schedule_tone_preview()
         except Exception as error:
             if not committed:
                 for key in highlight_keys:
@@ -3040,8 +3579,8 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 return
             effect_area["feather_pixels"] = value
             self.project.set_recipe(recipe, label="调整高光作用区羽化")
-            self.sync_controls()
-            self.schedule_preview()
+            self.sync_tone_controls()
+            self.schedule_tone_preview()
         except Exception as error:
             self.error(error)
             self.sync_controls()
@@ -3332,7 +3871,6 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.selection.temporary = None
             self.selection.temporary_shape = None
             self.refresh_selection_preview()
-            self.schedule_preview()
 
     def selection_overlays(self):
         photo, recipe, role = self.project.photo(), self.project.recipe(), self.geometry_role
@@ -3446,6 +3984,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             return
         try:
             photo = self.project.photo()
+            if (role in ("highlight", "highlight_effect", "highlight_protect")
+                    and native_headroom_active(self.project.recipe())):
+                self.status_message("当前 NegPy 高光找回根据整张负片的密度映射。")
+                return
             if role == "meter_grid" and self.project.recipe().get("measurement_method") != "zonal":
                 role = "inspect"
             if not photo["initial_job"] or self.tasks.busy:
@@ -3606,11 +4148,21 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
     def leave_selection(self):
         was_crop = self.geometry_role == "crop"
         was_import = self.geometry_role == "import_roi"
+        fast_crop = None
+        if was_crop:
+            from .workflow_crop_preview import confirmed_crop_preview
+
+            fast_crop = confirmed_crop_preview(self)
         if self.geometry_role == "meter_grid":
             self.meter_grid_hidden = True
         self.finish_selection()
-        if was_crop:
+        if was_crop and self.preview_timer.isActive():
             self.preview_timer.stop()
+            if fast_crop is not None:
+                self.preview_scopes.cancel()
+                self.scope_panel.set_scope_data(None)
+                self.scope_panel.caption.setText("裁切后的 RGB · 正在取样")
+                self.canvas.set_interactive_image(fast_crop, "裁切 · 快速预览")
             self.request_preview()
         elif was_import:
             self.set_stage(0)
@@ -3620,7 +4172,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         was_crop = self.geometry_role == "crop"
         was_full_highlight = (self.geometry_role in ("highlight", "highlight_effect", "highlight_protect")
                               and getattr(self, "highlight_full_source", False))
-        if was_full_highlight:
+        if was_crop or was_full_highlight:
             self.cancel_highlight_locator()
         self.highlight_full_source = False
         self.__dict__.pop("_import_roi_context", None)
@@ -3642,12 +4194,18 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.selection.selected_zone = None
         if was_crop or was_full_highlight:
             self.crop_locator_pending = None
+            if was_crop:
+                from .workflow_crop_preview import restore_crop_scopes
+
+                restore_crop_scopes(self)
             photo = self.current_photo()
             shown, desired = self.shown_context or {}, self.preview_context() or {}
             if (not self.closing and photo and photo.get("initial_job")
                     and any(shown.get(key) != desired.get(key)
                             for key in ("photo", "engine", "recipe_sha256", "repair_plan_sha256"))):
                 self.preview_timer.start()
+            elif was_crop:
+                self.show_preview_notice()
 
     def shape_selected(self, shape):
         if self.tasks.busy or not self.geometry_role or self.geometry_role == "inspect":
@@ -3656,7 +4214,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.status_message("请先修正左侧高级参数组合。")
             return
         photo = None
-        previous_highlight_state = None
+        photo_fields, previous_state = (), {}
         committed = False
         try:
             role = self.geometry_role
@@ -3667,22 +4225,29 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 accept_import_roi(self, bounds)
                 return
             photo = self.project.photo()
+            photo_fields = {
+                "include": ("frame_detection_uncertain",),
+                "frame_meter": ("frame_detection_uncertain",),
+                "protect": ("protected_rois",),
+            }.get(role, ())
             if role in ("highlight", "highlight_effect", "highlight_protect"):
-                previous_highlight_state = {
-                    key: deepcopy(photo[key]) for key in (
-                        "suspended_highlight_controls", "highlight_reference_origin",
-                        "highlight_reference_drawn_roi", "highlight_reference_aligned",
-                    ) if key in photo
-                }
-            if role in ("include", "exclude", "protect"):
+                photo_fields = ("suspended_highlight_controls", "highlight_reference_origin",
+                                "highlight_reference_drawn_roi", "highlight_reference_aligned")
+            previous_state = {key: deepcopy(photo[key]) for key in photo_fields if key in photo}
+            if role in ("include", "exclude", "protect", "frame_meter"):
+                if role == "frame_meter":
+                    from .picture import metering_region_from_frame
+
+                    bounds = metering_region_from_frame(bounds, photo["source_shape"])
+                    shape = dict(type="rectangle", bounds=bounds)
                 recipe = self.meter_recipe()
                 if recipe.get("measurement_method") == "negpy":
-                    if role != "include" or shape["type"] != "rectangle":
+                    if role not in ("include", "frame_meter") or shape["type"] != "rectangle":
                         raise ValueError("NegPy 原生测量支持矩形区域；非矩形与排除工具请选实验分区模式。")
                     recipe["roi"] = bounds
                 else:
                     meter = recipe["native_spatial_controls"]["metering"]
-                    if role == "include":
+                    if role in ("include", "frame_meter"):
                         recipe["roi"] = bounds
                         meter["include"] = [shape]
                     elif role == "exclude":
@@ -3733,10 +4298,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                             high["protection"] = dict(include=[], feather_pixels=0)
                         high["protection"]["include"].append(shape)
             self.project.set_recipe(recipe, label={
-                "crop": "调整裁切范围", "include": "调整密度选区", "exclude": "添加测量避让",
+                "crop": "调整裁切范围", "include": "调整密度选区", "frame_meter": "根据有效画幅调整密度选区", "exclude": "添加测量避让",
                 "protect": "添加保护区", "highlight": "调整高光参考区",
                 "highlight_effect": "添加高光作用区", "highlight_protect": "添加高光保护区",
-            }[role])
+            }[role], confirmed_frame=role in ("include", "frame_meter"))
             committed = True
             self.sync_controls()
             if (
@@ -3753,7 +4318,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.selection.scene().removeItem(self.selection.temporary)
                 self.selection.temporary = None
             self.selection.temporary_shape = None
-            if role == "include":
+            if role in ("include", "frame_meter"):
                 self.meter_grid_hidden = False
                 self.finish_selection()
                 if recipe.get("measurement_method") == "zonal":
@@ -3764,18 +4329,16 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.schedule_preview()
             self.region_done.remind()
             self.status_message(
+                "裁切范围已记录，可继续拖动调整。" if role == "crop" else
                 "高光参考已按分析网格收边，正在更新预览。"
                 if role == "highlight" and aligned != bounds else
                 "选区已生效，正在更新正像；可继续绘制，无需确认。"
             )
         except Exception as error:
-            if previous_highlight_state is not None and not committed:
-                for key in (
-                    "suspended_highlight_controls", "highlight_reference_origin",
-                    "highlight_reference_drawn_roi", "highlight_reference_aligned",
-                ):
+            if photo_fields and not committed:
+                for key in photo_fields:
                     photo.pop(key, None)
-                photo.update(previous_highlight_state)
+                photo.update(previous_state)
                 self.selection.cancel_drawing()
             self.error(error)
 
@@ -3976,11 +4539,20 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.job_saved.emit(request["id"])
             elif action == "export_batch":
                 report = result["report"]
-                self.status_message(
-                    f"导出完成：{len(report['saved'])} 张；失败 {len(report['errors'])} 张。"
-                )
+                message = f"导出完成：{len(report['saved'])} 张；失败 {len(report['errors'])} 张。"
                 if report["errors"]:
+                    from .workflow_exports import remaining_export_items
+
+                    remaining = remaining_export_items(request, report)
+                    if remaining:
+                        self.failed_request = {**request, "items": remaining, "retry_partial_export": True}
+                        self._failed_preview = False
+                        message += "可重试失败项。"
                     self.last_error = str(report["errors"])
+                elif getattr(self, "failed_request", {}).get("action") == "export_batch":
+                    self.failed_request = {}
+                    self.last_error = None
+                self.status_message(message)
             elif action == "repair_prepare":
                 receipt = Path(request["directory"]) / "receipt.json"
                 self.project.workspace.data.setdefault("repairs", []).append(
@@ -4071,9 +4643,13 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.error(error)
 
     def cancel_task(self):
-        self.pending_probe = []
-        self.auto_import.cancel()
         if self.tasks.busy:
+            request = self.tasks.request
+            if request.get("action") == "probe":
+                self.pending_probe = []
+                self.auto_import.cancel()
+            elif request.get("auto_import"):
+                self.auto_import.cancel()
             self.tasks.cancel()
         elif self.preview_activity.active:
             token = self.preview_activity.token
@@ -4126,6 +4702,17 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.last_error = None
             self.tasks.start(retry)
             self.sync_controls()
+        elif request["action"] == "export_batch" and request.get("retry_partial_export") is True:
+            from .workflow_exports import retry_export_request
+
+            try:
+                retry = retry_export_request(request)
+                self.stop_preview()
+                self.tasks.start(retry)
+                self.last_error = None
+                self.sync_controls()
+            except Exception as error:
+                self.error(error)
 
     def request_actual(self):
         self.pending_actual = True
@@ -4134,6 +4721,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
     def _detail_context_matches(self, context, token):
         if self.closing or token != self.token or context["display_revision"] != self.display_revision:
             return False
+        return WorkflowWindow._preview_recipe_matches(self, context)
+
+    def _preview_recipe_matches(self, context):
         current = self.preview_context()
         return bool(current and current["photo"] == context["photo"]
                     and current["engine"] == context["engine"]
@@ -4142,6 +4732,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
 
     def request_detail_preview(self, view):
         request_id = view["request_id"]
+        if self._tone_drag is not None:
+            self.canvas.detail_failed(request_id)
+            return
         current, shown = self.preview_context(), self.shown_context
         base_in_flight = any(
             request and not request.get("viewport") and request.get("token") == self.token
@@ -4287,7 +4880,21 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             lambda message: failed(token, message),
         )
 
-    def request_preview(self, full=False):
+    def request_engine_preview(self):
+        from .workflow_engine_preview import restore_visible_engine_preview
+
+        if restore_visible_engine_preview(self):
+            return
+        if self.canvas.fit_mode and not self.compare.isChecked() and self._can_show_tone_frame():
+            self.request_preview(tone_edit=True, interactive_edge=704, engine_proxy=True)
+        else:
+            self.request_preview()
+
+    def request_preview(self, full=False, *, tone_edit=False, interactive_edge=None, settled_drag=False,
+                        engine_proxy=False):
+        self.preview_timer.stop()
+        self.tone_preview_timer.stop()
+        self.tone_settle_timer.stop()
         if (self.geometry_role == "crop"
                 or (self.geometry_role in ("highlight", "highlight_effect", "highlight_protect")
                     and getattr(self, "highlight_full_source", False))):
@@ -4298,9 +4905,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             except Exception as error:
                 self.preview_failed(self.token, str(error))
             return
-        self.set_preview_updating(False)
-        if not full:
-            self.canvas.clear_detail()
+        if interactive_edge is None:
+            self.set_preview_updating(False)
+            if not full:
+                self.canvas.clear_detail()
         if (
             self.tasks.busy
             or not self.current_photo()
@@ -4310,33 +4918,60 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         try:
             recipe = self.project.prepare_highlight_reference()
             manifest = self.project.preview_base()
+            repair = self.project.repair_context(recipe=recipe)
+            if repair is not None:
+                interactive_edge = None
+                engine_proxy = False
+            photo = self.project.photo()
+            fit_edge = (self.native_fit_edge if tone_edit and not engine_proxy and not full and repair is None
+                        and photo["engine"] == "native" and self.canvas.fit_mode else None)
             self.last_error = None
             self._failed_preview = False
             self.token += 1
-            self.begin_preview_activity(self.token)
+            warm_tone = (tone_edit and self.canvas.current is not None
+                         and (self.preview_reusable or interactive_edge is not None or settled_drag))
+            self.begin_preview_activity(self.token, quiet_for=0.18 if warm_tone else 0)
             controls = {
                 key: value
                 for key, value in recipe.items()
                 if key in (*EDITING_DOCUMENT_KEYS, "exposure_ev", "cool_tone")
             }
-            self.preview_overlay.setText("正在更新预览…")
-            self.set_preview_updating(True)
-            self.mark_preview_pending(clear_detail=not full)
-            self.preview_contexts[self.token] = self.preview_context()
+            if not warm_tone:
+                self.mark_preview_pending(clear_detail=not full)
+            self.preview_contexts[self.token] = self.preview_context(recipe=recipe, repair_plan=repair)
+            if engine_proxy:
+                self.preview_contexts[self.token]["engine_proxy"] = True
+            elif tone_edit:
+                self.preview_contexts[self.token]["tone_edit"] = True
+            if settled_drag:
+                self.preview_contexts[self.token]["settled_drag"] = True
+            if interactive_edge is not None and not engine_proxy:
+                self._tone_needs_settle = True
+                self.preview_contexts[self.token]["tone_stroke"] = self._tone_stroke
+                normal_edge = fit_edge if photo["engine"] == "native" else 1400
+                self.preview_contexts[self.token]["matched_fit_grid"] = interactive_edge == normal_edge
             self.preview_contexts = {key: value for key, value in self.preview_contexts.items() if key >= self.token - 16}
             self.live.submit(
                 dict(
                     token=self.token,
                     manifest=str(manifest),
                     manifest_sha256=sha256(manifest),
-                    mode=RESULT_MODES[self.project.photo()["engine"]],
+                    mode=RESULT_MODES[photo["engine"]],
                     controls=controls,
                     draft_recipe=recipe,
                     full_resolution=bool(full),
-                    repair_plan=self.project.repair_context(recipe=recipe),
+                    **({"tone_edit": True} if tone_edit else {}),
+                    **({"engine_proxy": True} if engine_proxy else {}),
+                    **({"release_priority": True} if settled_drag else {}),
+                    **({"interactive_edge": interactive_edge} if interactive_edge is not None else {}),
+                    **({"defer_reference": True} if not full and interactive_edge is None
+                       and repair is None and not self.compare.isChecked() else {}),
+                    **({"metering_edit": True} if interactive_edge is not None and not engine_proxy and self.step == 2
+                       and photo["engine"] == "native" else {}),
+                    **({"fit_edge": fit_edge} if fit_edge is not None else {}),
+                    repair_plan=repair,
                 )
             )
-            self.status_message("正在更新真实处理预览…")
         except Exception as error:
             self.set_preview_updating(False)
             self.preview_activity.finish(self.token, state="failed", message="预览失败：" + str(error))
@@ -4347,6 +4982,24 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.load_detail_records(event)
             return
         context = deepcopy(self.preview_contexts.get(event.get("token")))
+        if event.get("interactive_frame") is True:
+            if context and context.get("engine_proxy"):
+                from .workflow_engine_preview import receive_engine_preview
+
+                receive_engine_preview(self, event, context)
+                return
+            if context:
+                context["preview_quality"] = event.get("preview_quality") or {}
+            if self.tone_preview_timer.isActive():
+                self.dispatch_tone_preview()
+            self.receive_tone_frame(event, context)
+            return
+        if context and event.get("token") in (self._tone_release_token, self._tone_settle_generation):
+            # The renderer declined the transient route and already returned
+            # the ordinary fit result for the final slider value.
+            self._tone_release_token = self._tone_settle_generation = None
+            self.tone_settle_timer.stop()
+            context["settled_drag"] = True
         if context is not None and context.get("crop_locator"):
             from .workflow_crop_preview import receive_crop_frame
 
@@ -4354,9 +5007,12 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             return
         if context is not None:
             context["output_size"] = event.get("output_size")
+            if event.get("visible_engine_binding") is not None:
+                context["visible_engine_binding"] = event["visible_engine_binding"]
         seconds = event.get("seconds")
         self.preview_reusable = bool(event.get("preview_reusable")) and (
-            isinstance(seconds, (int, float)) and seconds <= 1.5
+            ((event.get("preview_quality") or {}).get("mode") in {"nikon-screen", "flex-screen"})
+            or (isinstance(seconds, (int, float)) and seconds <= 1.5)
         )
         if context is not None and event.get("reference_label"):
             context["reference_label"] = event["reference_label"]
@@ -4379,6 +5035,71 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             temporary=event,
             context=context,
         )
+
+    def _accept_tone_frame(self, event, context):
+        photo = self.current_photo()
+        release = self._tone_release_token == event.get("token") == self.token
+        return (not self.closing and (self._tone_drag is not None or release) and context and photo
+                and photo["id"] == context["photo"] and photo["engine"] == context.get("engine")
+                and context.get("tone_stroke") == self._tone_stroke and self._can_show_tone_frame()
+                and (not release or self._is_final_tone_context(context)))
+
+    def receive_tone_frame(self, event, context):
+        if not self._accept_tone_frame(event, context):
+            self.live.discard(event)
+            self._finish_pending_tone_release(event.get("token"))
+            return
+        self._discard_pending_tone_frame()
+        self._tone_display_pending = (event, context, self.display_revision, self.live.discard)
+        self._start_tone_display_work()
+
+    def _discard_pending_tone_frame(self):
+        if self._tone_display_pending is not None:
+            event, _, _, discard = self._tone_display_pending
+            self._tone_display_pending = None
+            discard(event)
+
+    def _start_tone_display_work(self):
+        if self._tone_display_work is not None or self._tone_display_pending is None:
+            return
+        event, context, revision, discard = self._tone_display_pending
+        self._tone_display_pending = None
+        token = event["token"]
+        if revision != self.display_revision or not self._accept_tone_frame(event, context):
+            discard(event)
+            self._finish_pending_tone_release(token)
+            return
+        self._tone_display_work = event
+        target, proof = self.display_target, self.proof_space
+
+        def read():
+            try:
+                return self.display_cache.get_interactive_image(
+                    event["records"][0], target, proof=proof,
+                    reuse_for_settle=context.get("matched_fit_grid", False),
+                )
+            finally:
+                discard(event)
+
+        def complete(_, image):
+            self._tone_display_work = None
+            if revision == self.display_revision and self._accept_tone_frame(event, context):
+                released = self._tone_release_token == token
+                if image is not None:
+                    self.tone_visible_context = {**context, "released_fit": True} if released else context
+                    self.canvas.set_interactive_image(image)
+                    self.image_presented.emit()
+                elif not released:
+                    # The normal fit route retries the conversion and reports errors.
+                    self.end_tone_drag()
+                if released:
+                    self._finish_pending_tone_release(token)
+            self._start_tone_display_work()
+
+        work = Work(token, read)
+        work.signals.done.connect(complete)
+        work.signals.failed.connect(lambda token, _: complete(token, None))
+        self.tone_display_pool.start(work)
 
     def saved_images(self, sample):
         source = sample.record(RESULT_MODES[self.project.photo()["engine"]], "baseline")
@@ -4405,6 +5126,9 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         self.base_display_pending = (display_serial, token)
         activity = getattr(self, "preview_activity", None)
         context = deepcopy(context or self.preview_context())
+        if context is not None and temporary and temporary.get("reference_deferred") is True:
+            context["reference_deferred"] = True
+        reference_deferred = (context or {}).get("reference_deferred") is True
         output_size = (context or {}).get("output_size")
         if not temporary and not display_only and current.get("shape"):
             output_size = [current["shape"][1], current["shape"][0]]
@@ -4477,7 +5201,15 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
         icc = self.display_icc
         target, proof = self.display_target, self.proof_space
         want_scopes = hasattr(self, "scope_panel")
-        if target is None and (source_step > 1 or want_scopes):
+        defer_scopes = bool(temporary and ((context or {}).get("tone_edit") or reference_deferred) and want_scopes)
+        worker_directory = getattr(self.live, "directory", None) if temporary else None
+        from .preview_fit_transport import FIT_TRANSPORT
+
+        settle_now = bool(temporary and (context or {}).get("settled_drag") and not display_only
+                          and self.canvas.fit_mode and not self.canvas.split
+                          and all(record.get("transport") == FIT_TRANSPORT
+                                  for record in (current, reference)))
+        if target is None and (source_step > 1 or want_scopes or current.get("transport")):
             # Explicit sRGB test mode and initial ICC discovery must also avoid
             # full-frame float64 conversion of a 96MP saved image.
             from .workflow_display import DisplayTarget, named_reference_profile, profile_description
@@ -4508,15 +5240,15 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 if prepared is None:
                     prepared = self.snapshot_store.prepare(
                         current, reference, context, sample_step,
-                        own_files=bool(temporary),
+                        own_files=bool(temporary), worker_directory=worker_directory,
                     )
-                current_result = displayed(prepared.current, include_scopes=want_scopes)
-                image, scopes = current_result if want_scopes else (current_result, None)
-                other = (
-                    image
-                    if prepared.current["sha256"] == prepared.reference["sha256"]
-                    else displayed(prepared.reference)
-                )
+                eager_scopes = want_scopes and not defer_scopes
+                current_result = displayed(prepared.current, include_scopes=eager_scopes)
+                image, scopes = current_result if eager_scopes else (current_result, None)
+                other = None
+                if not reference_deferred:
+                    other = (image if prepared.current["sha256"] == prepared.reference["sha256"]
+                             else displayed(prepared.reference))
                 return image, other, prepared, scopes, metering
             except BaseException:
                 if prepared is not None:
@@ -4534,6 +5266,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             prepared = images[2] if len(images) > 2 else None
             photo = self.current_photo()
             if (self.closing or not photo or context.get("photo") != photo["id"]
+                    or context.get("engine") != photo["engine"]
                     or (not display_only and result_token != self.token)):
                 if prepared:
                     prepared.release()
@@ -4583,9 +5316,34 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 if not temporary:
                     self.last_display_records = (current, reference, sample_step)
             self.shown_context = context
+            self.shown_display = (display_revision, proof)
+            self.shown_scopes = images[3] if len(images) > 3 else None
+            self.tone_visible_context = None
+            if hasattr(self, "compare"):
+                self._sync_comparison()
+            if settle_now:
+                self.canvas.repaint()
             if want_scopes:
-                self.scope_panel.set_scope_data(images[3] if len(images) > 3 else None)
-                self.scope_panel.caption.setText("输出 RGB · 预览取样")
+                if defer_scopes and published:
+                    scope_lease = self.snapshot_store.acquire()
+                    if scope_lease is not None:
+                        self.scope_panel.caption.setText("输出 RGB · 预览取样更新中")
+
+                        def present_scopes(scopes):
+                            if display_serial == self.display_serial and not self.closing:
+                                self.shown_scopes = scopes
+                                self.scope_panel.set_scope_data(scopes)
+                                self.scope_panel.caption.setText("输出 RGB · 预览取样")
+
+                        self.preview_scopes.submit(
+                            lambda: displayed(scope_lease.current, include_scopes=True)[1],
+                            present_scopes,
+                            scope_lease.release,
+                        )
+                else:
+                    self.preview_scopes.cancel()
+                    self.scope_panel.set_scope_data(images[3] if len(images) > 3 else None)
+                    self.scope_panel.caption.setText("输出 RGB · 预览取样")
             if hasattr(self, "refresh_selection_preview"):
                 self.refresh_selection_preview()
             if prepared:
@@ -4612,6 +5370,10 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.set_preview_updating(False)
             self.image_presented.emit()
             self.queue_idle_previews()
+            if reference_deferred and hasattr(self, "compare") and self.compare.isChecked():
+                # A/B may have been enabled during a current-only render. Keep
+                # the new frame and request its comparison after it is shown.
+                QTimer.singleShot(0, self._request_comparison)
 
         work.signals.done.connect(shown)
         def failed(result_token, message):
@@ -4640,9 +5402,14 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                         ))
                         and (display_only or token == self.token))
 
-        WorkflowWindow._start_display_work(
-            self, work, current_display, abandon, lambda message: failed(token, message),
-        )
+        if settle_now:
+            # The bounded FIT packet is already available. Complete the final
+            # display in its delivery event so release avoids another Qt wakeup.
+            work.run()
+        else:
+            WorkflowWindow._start_display_work(
+                self, work, current_display, abandon, lambda message: failed(token, message),
+            )
 
     def base_display_failed(self, token, message):
         if token == self.token:
@@ -4662,6 +5429,13 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
                 self.retry_button.setEnabled(True)
 
     def preview_failed(self, token, message):
+        if (token == self.token and not self.closing
+                and self.preview_contexts.get(token, {}).get("engine_proxy")):
+            self.request_preview()
+            return
+        if self._tone_release_token == token == self.token:
+            self._finish_pending_tone_release(token)
+            return
         detail = self.detail_contexts.pop(token, None)
         if detail is not None:
             if self._detail_context_matches(detail, token):
@@ -4671,9 +5445,30 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             return
         self.base_display_failed(token, message)
 
+    def _comparison_frame_matches(self):
+        shown = self.shown_context
+        return bool(shown and getattr(self, "shown_display", None) == (self.display_revision, self.proof_space)
+                    and WorkflowWindow._preview_recipe_matches(self, shown))
+
+    def _sync_comparison(self):
+        self.canvas.split = bool(self.compare.isChecked() and self.canvas.reference is not None
+                                 and self._comparison_frame_matches())
+
+    def _request_comparison(self):
+        if (self.closing or self.tasks.busy or self.geometry_role is not None or not self.compare.isChecked()
+                or self.canvas.reference is not None or not self._comparison_frame_matches()
+                or not self.shown_context.get("reference_deferred")
+                or self.preview_timer.isActive() or self.base_display_pending
+                or any(packet and packet.get("token") == self.token and "viewport" not in packet
+                       for packet in (self.live.active, self.live.pending))):
+            return
+        self.request_preview(tone_edit=self.shown_context.get("tone_edit") is True)
+        self.status_message("正在载入 A/B 对比…")
+
     def toggle_compare(self):
-        self.canvas.split = self.compare.isChecked()
+        self._sync_comparison()
         self.canvas.update()
+        self._request_comparison()
 
     def choose_export_directory(self):
         path = QFileDialog.getExistingDirectory(
@@ -4861,7 +5656,7 @@ class WorkflowWindow(FlatfieldUI, EditHistoryUI, QMainWindow):
             self.error(error)
 
     def closeEvent(self, event):
-        if not self.closing and not self.flush_advanced():
+        if not self.closing and (not self.flush_advanced() or not self.flush_recipe_autosave()):
             event.ignore()
             return
         self.application_menu_titles.dispose()
@@ -4890,6 +5685,7 @@ def main():
 
     app.setFont(body_font())
     app.setWindowIcon(application_icon())
+    set_obsidian_enabled(_saved_appearance(ROOT / APPEARANCE_PATH) == "obsidian")
     # Frost every dialog, alert, menu and combo popup with native vibrancy.
     install_glass_surfaces(app)
     from .workflow_startup import choose_workspace

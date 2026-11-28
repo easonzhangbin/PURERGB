@@ -49,6 +49,7 @@ from .positive_float import (
 
 
 SCHEMA = "pure-rgb-native-highlight-workflow"
+MAX_REFERENCE_DENSITY_OFFSET = 2.0
 
 
 def _neutral_document():
@@ -113,6 +114,14 @@ def _protection(document):
     return {"include": normalized, "feather_pixels": feather}
 
 
+def _checked_reference_density_offset(value):
+    _require(
+        type(value) in (int, float) and 0 <= value <= MAX_REFERENCE_DENSITY_OFFSET,
+        "Highlight reference density offset must be finite in [0,2]",
+    )
+    return float(value)
+
+
 def checked_highlight_workflow(document=None):
     """Canonical version1 wrapper around guarded-v2 controls and source regions.
 
@@ -123,7 +132,10 @@ def checked_highlight_workflow(document=None):
         return _neutral_document()
     _require(
         isinstance(document, dict)
-        and not set(document) - {"version", "reference_roi", "controls", "protection", "effect_area", "automatic_reference"},
+        and not set(document) - {
+            "version", "reference_roi", "controls", "protection", "effect_area",
+            "automatic_reference", "reference_density_offset",
+        },
         "Unexpected highlight workflow fields",
     )
     version = document.get("version", 1)
@@ -136,6 +148,7 @@ def checked_highlight_workflow(document=None):
         region = _roi(region)
     protection = _protection(document.get("protection"))
     effect_area = _protection(document.get("effect_area"))
+    offset = _checked_reference_density_offset(document.get("reference_density_offset", 0.0))
     automatic = document.get("automatic_reference", False)
     _require(type(automatic) is bool, "automatic_reference must be boolean")
     if (
@@ -155,6 +168,7 @@ def checked_highlight_workflow(document=None):
         "controls": controls,
         "protection": protection,
         **({"effect_area": effect_area} if effect_area is not None else {}),
+        **({"reference_density_offset": offset} if offset else {}),
     }
 
 
@@ -265,7 +279,35 @@ def select_highlight_reference(recipe, allowed):
     return align_highlight_reference(recipe, best)
 
 
-def _configuration(config, export, bounds_override):
+_POINT_TRIM_FIELDS = (
+    "white_point_offset", "black_point_offset",
+    "white_point_trim_red", "white_point_trim_green", "white_point_trim_blue",
+    "black_point_trim_red", "black_point_trim_green", "black_point_trim_blue",
+)
+
+
+def _reference_meter_process(config, film):
+    process = config.process
+    allow_unmix = process.crosstalk_strength != 0
+    if allow_unmix or film is not None:
+        from negpy.features.process.models import ProcessMode
+        from .film_profiles import film_config, film_signature
+
+        selected = film_config(config, film).process if film is not None else None
+        selected_active = selected is not None and selected.crosstalk_strength != 0
+        if allow_unmix or selected_active:
+            _require(
+                selected_active and process.process_mode == ProcessMode.C41
+                and not process.positive_source and film_signature(process) == film_signature(selected),
+                "高光参考与当前胶片密度矩阵不一致，请重新选择胶片配置",
+            )
+    trims = {key: getattr(process, key) for key in _POINT_TRIM_FIELDS if getattr(process, key) != 0}
+    meter = replace(process, meter_rect=None, **dict.fromkeys(trims, 0.0))
+    check_density_domain(meter, allow_unmix=allow_unmix)
+    return meter, trims, allow_unmix
+
+
+def _configuration(config, export, bounds_override, *, film=None):
     from negpy.domain.models import (
         AspectRatio,
         ColorSpace,
@@ -312,11 +354,7 @@ def _configuration(config, export, bounds_override):
         not transformed,
         "Highlight source-coordinate regions require identity SDK geometry",
     )
-    _require(
-        config.process.crosstalk_strength == 0,
-        "Highlight local metering does not assume a dye-unmixed source; crosstalk must be zero",
-    )
-    check_density_domain(config.process)
+    _reference_meter_process(config, film)
 
 
 def _unchanged(image, layout, sha, label):
@@ -353,23 +391,31 @@ def _bounded_render_buffer(buffer, source_shape, block_rows):
         )
 
 
-def highlight_reference_config(source, config, region):
+def highlight_reference_config(source, config, region, *, reference_density_offset=0.0, film=None):
     """Measure the exact reference ROI and bind its window to the full source."""
+    offset = _checked_reference_density_offset(reference_density_offset)
     region = _roi(region, source.shape)
     x0, y0, x1, y1 = region
     # Crop by integer edges before metering to avoid normalized-edge round trips.
     # metering_process fixes the normalized auxiliary-meter pixel edges.
     selected = np.ascontiguousarray(source[y0:y1, x0:x1])
-    meter_config = replace(config, process=replace(config.process, meter_rect=None))
-    window = negpy_window(selected, meter_config, (0, 0, x1 - x0, y1 - y0))
+    meter, trims, allow_unmix = _reference_meter_process(config, film)
+    window = negpy_window(
+        selected, replace(config, process=meter), (0, 0, x1 - x0, y1 - y0),
+        allow_unmix=allow_unmix,
+    )
     window = replace(window, analysis=replace(window.analysis, roi=tuple(region)))
     selection = select_metering_roi(
         source.shape, region, min_side=2, min_area_fraction=1.0
     )
-    process = replace(
-        metering_process(config.process, window, selection), meter_rect=None
-    )
-    return replace(config, process=process), window
+    # Freeze the untrimmed bounds. The SDK applies the original point trims
+    # to these bounds when normalizing the original, still-mixed RAW source.
+    process = replace(metering_process(meter, window, selection), **trims)
+    if trims:
+        window.metadata["native_point_trims"] = trims
+    exposure = (replace(config.exposure, density=config.exposure.density + offset)
+                if offset else config.exposure)
+    return replace(config, process=process, exposure=exposure), window
 
 
 def _merge_highlight(current, incoming):
@@ -428,6 +474,7 @@ def render_highlight_workflow(
     block_rows=DEFAULT_BLOCK_ROWS,
     metrics=None,
     bounds_override=None,
+    film=None,
 ):
     """Return ``None`` when disabled, else ``(SDK TIFF bytes, bound receipt)``.
 
@@ -440,11 +487,12 @@ def render_highlight_workflow(
     if recipe["controls"]["strength"] == 0:
         return None
     from negpy.infrastructure.display.color_spaces import WORKING_COLOR_SPACE
+    from negpy.features.process.models import ProcessMode
     from negpy.kernel.image.logic import working_oetf_encode
 
     from .diagnostics import span
 
-    _configuration(config, export, bounds_override)
+    _configuration(config, export, bounds_override, film=film)
     point = checked_native_float(native_float_controls)
     _header(source, block_rows)
     _require(
@@ -490,13 +538,21 @@ def render_highlight_workflow(
         else None
     )
     effect_layout = _layout(effect_area.mask) if effect_area else None
+    # Frozen black-and-white reference configurations retain their recorded
+    # print settings. The darker alternate is currently for ordinary C41.
+    offset = (recipe.get("reference_density_offset", 0.0)
+              if config.process.process_mode == ProcessMode.C41 else 0.0)
     with span("highlight_reference_meter", roi=region):
-        reference_config, window = highlight_reference_config(source, config, region)
+        reference_config, window = highlight_reference_config(
+            source, config, region, reference_density_offset=offset, film=film,
+        )
     reference_config_sha = _digest(reference_config.to_dict())
     _require(
-        asdict(config.exposure) == asdict(reference_config.exposure)
+        reference_config.exposure == replace(
+            config.exposure, density=config.exposure.density + offset,
+        )
         and asdict(config.lab) == asdict(reference_config.lab),
-        "Highlight paper/creative controls must match both renders",
+        "Highlight paper/creative controls must match apart from the reference density offset",
     )
     source_labels = []
     source_labels.append(
@@ -578,6 +634,7 @@ def render_highlight_workflow(
                 domain=linear_domain,
                 protection_mask=mask,
                 effect_mask=effect_area.mask[start : start + len(base_part)] if effect_area else None,
+                recover_clipped=bool(offset),
             )
             high_receipt = _merge_highlight(high_receipt, observation)
             base_linear_sha.update(memoryview(base_linear).cast("B"))
@@ -667,7 +724,9 @@ def render_highlight_workflow(
         "reference_density_exact_ROI_crop_then_restored_source_coordinates": True,
         "reference_auxiliary_pixel_edges_roundtrip_exact": True,
         "reference_meter_rect_cleared": True,
-        "paper_and_creative_controls_matched": True,
+        "paper_and_creative_controls_matched": not bool(offset),
+        **({"reference_density_offset": offset,
+            "reference_tone_policy": "preclip-density-offset"} if offset else {}),
         "SDK_working_OETF_domain": encoded_domain,
         "linear_domain": linear_domain,
         "working_ICC_sha256": ICC_SHA256,

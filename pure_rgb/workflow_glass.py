@@ -1,9 +1,10 @@
 """macOS NSVisualEffectView behind Qt's content, with an opaque fallback."""
 
+from functools import partial
 import sys
 import weakref
 
-from PyQt6.QtCore import QEvent, QObject, Qt, QTimer
+from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QFontMetrics
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -20,6 +21,56 @@ WORKSPACE_INSET = 16
 WORKSPACE_GAP = 12
 MENU_RADIUS = 12
 WORKFLOW_ACCENT = "#d93722"
+
+_OBSIDIAN_PROPERTY = "pureRgbObsidian"
+
+
+class _AppearanceSignals(QObject):
+    changed = pyqtSignal()
+
+
+class _AppearanceObserver(QObject):
+    def __init__(self, widget, callback):
+        super().__init__(widget)
+        self.callback = callback
+
+    @pyqtSlot()
+    def notify(self):
+        self.callback()
+
+
+def obsidian_enabled():
+    app = QApplication.instance()
+    return bool(app and app.property(_OBSIDIAN_PROPERTY))
+
+
+def _appearance_signals(app):
+    if not hasattr(app, "_pure_rgb_appearance_signals"):
+        app._pure_rgb_appearance_signals = _AppearanceSignals(app)
+    return app._pure_rgb_appearance_signals
+
+
+def observe_appearance(widget, callback):
+    """Reapply theme-specific presentation when the app's preset changes."""
+    observer = _AppearanceObserver(widget, callback)
+    widget._pure_rgb_appearance_observer = observer
+    _appearance_signals(QApplication.instance()).changed.connect(observer.notify)
+
+
+def set_obsidian_enabled(enabled):
+    app = QApplication.instance()
+    if enabled == obsidian_enabled():
+        return
+    app.setProperty(_OBSIDIAN_PROPERTY, enabled)
+    if enabled:
+        app._pure_rgb_system_stylesheet = app.styleSheet()
+        app.styleHints().setColorScheme(Qt.ColorScheme.Dark)
+        app.setStyleSheet(stylesheet(obsidian=True))
+    else:
+        app.styleHints().setColorScheme(Qt.ColorScheme.Unknown)
+        app.setStyleSheet(app._pure_rgb_system_stylesheet)
+        del app._pure_rgb_system_stylesheet
+    _appearance_signals(app).changed.emit()
 
 # Attribute-guarded transparency appended to every tracked surface so the
 # frosted native material shows through regardless of the active stylesheet.
@@ -143,6 +194,7 @@ def attach_glass(window, *, base="under", veil=None):
         from .workflow_window_chrome import attach_chrome
 
         chrome = attach_chrome(ns_window, view, container, effect)
+        window.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         window._native_glass = effect
         window._native_glass_veil = brand_veil
         return dict(
@@ -304,6 +356,28 @@ def detach_glass(window):
         window._native_glass_veil = None
 
 
+def apply_solid_window_chrome(window):
+    """Paint the Qt background and replace the detached native title bar."""
+    # Keep window translucency available for reattaching glass. Its
+    # NoSystemBackground flag would suppress the solid Qt style paint.
+    window.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
+    if sys.platform != "darwin" or QApplication.platformName() != "cocoa":
+        return dict(applied=False, reason="non-cocoa")
+    try:
+        import objc
+        from AppKit import NSColor
+
+        native = objc.objc_object(c_void_p=int(window.winId())).window()
+        if native is None:
+            return dict(applied=False, reason="native-view-not-attached")
+        native.setTitlebarAppearsTransparent_(False)
+        native.setBackgroundColor_(NSColor.colorWithWhite_alpha_(0.043, 1.0))
+        native.setOpaque_(True)
+        return dict(applied=True)
+    except Exception as error:
+        return dict(applied=False, reason=str(error))
+
+
 def _set_native_material(widget, active):
     if widget.property("nativeMaterial") != active:
         widget.setProperty("nativeMaterial", active)
@@ -326,6 +400,15 @@ class GlassSurfaces(QObject):
         self.app = app
         self.surfaces = {}
         app.installEventFilter(self)
+        _appearance_signals(app).changed.connect(self._appearance_changed)
+
+    def _appearance_changed(self):
+        for surface in tuple(self.surfaces):
+            if sip_deleted(surface):
+                self._forget(surface)
+                continue
+            self._hidden(surface)
+            self._shown(surface)
 
     @staticmethod
     def _classify(surface):
@@ -378,19 +461,19 @@ class GlassSurfaces(QObject):
         if surface in self.surfaces:
             return
         self.surfaces[surface] = dict(role=role, attached=False)
-        surface.destroyed.connect(self._forget)
+        surface.destroyed.connect(partial(self._forget, surface))
         prepare_glass(surface)
         if role == "popup" and not surface.testAttribute(Qt.WidgetAttribute.WA_WState_Created):
             surface.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         surface.setStyleSheet((surface.styleSheet() or "") + _GLASS_SURFACE_QSS)
 
-    def _forget(self, surface=None):
-        """destroyed() delivers the dying QObject wrapper; drop its entry."""
-        if surface is not None:
-            self.surfaces.pop(surface, None)
+    def _forget(self, surface, *_):
+        # Qt may emit a transient QObject wrapper rather than the QWidget
+        # originally used as the dictionary key.
+        self.surfaces.pop(surface, None)
 
     def _shown(self, surface):
-        if surface is None:
+        if surface is None or sip_deleted(surface):
             return
         state = self.surfaces.get(surface)
         if (
@@ -399,6 +482,10 @@ class GlassSurfaces(QObject):
             or not surface.isWindow()
             or not surface.isVisible()
         ):
+            return
+        if obsidian_enabled():
+            if state["role"] == "dialog":
+                apply_solid_window_chrome(surface)
             return
         if state["role"] == "popup":
             report = attach_popup_glass(surface)
@@ -567,7 +654,11 @@ def system_reduce_motion():
     return False
 
 
-def stylesheet(glass=False, dark=None):
+def stylesheet(glass=False, dark=None, *, obsidian=None):
+    if obsidian is None:
+        obsidian = obsidian_enabled()
+    if obsidian:
+        dark, glass = True, False
     if dark is None:
         dark = system_dark()
     text, muted = ("#f2ede4", "#c4c4c4") if dark else ("#1d1d1f", "#60646c")
@@ -589,7 +680,16 @@ def stylesheet(glass=False, dark=None):
     popup = "#302f2e" if dark else "#f7f8fa"
     slider_edge = "rgba(255,255,255,74)" if dark else "rgba(32,38,48,72)"
     slider_hover = "rgba(255,255,255,30)" if dark else "rgba(255,255,255,235)"
-    return f"""
+    if obsidian:
+        text, muted = "#f0f0ef", "#b1b4bb"
+        background, panel, field, popup = "#0b0b0c", "#141517", "#1e2024", "#1a1c20"
+        edge, selected = "#34363c", "#48251f"
+        accent, slider_edge, slider_hover = "#ff946f", "#666a75", "#292c31"
+        primary = (
+            "qlineargradient(x1:0,y1:0,x2:1,y2:1,"
+            "stop:0 #b92d21,stop:0.55 #a72820,stop:1 #86241e)"
+        )
+    style = f"""
 QWidget {{ color:{text}; font-size:13px; }}
 QMainWindow, QWidget#workflowRoot {{ background:{background}; }}
 QFrame#glassPanel {{ background:{panel}; border:1px solid {edge}; border-radius:16px; }}
@@ -670,3 +770,12 @@ QComboBox QAbstractItemView[nativeMaterial="true"] {{ background:transparent; bo
 QComboBox QAbstractItemView[nativeMaterial="true"] QWidget {{ background:transparent; }}
 QToolTip {{ background:{field}; color:{text}; border:1px solid {edge}; }}
 """ + NATIVE_SLIDER_QSS
+    if obsidian:
+        style += f"""
+QDialog, QMessageBox {{ background:{background}; }}
+QTextEdit, QPlainTextEdit, QTextBrowser, QListWidget#libraryFolders, QListWidget#libraryPhotos {{
+    background:{panel}; color:{text}; border:1px solid {edge}; border-radius:10px;
+    selection-background-color:{selected};
+}}
+"""
+    return style

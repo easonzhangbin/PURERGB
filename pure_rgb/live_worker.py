@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 from collections.abc import Mapping
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 import shutil
@@ -19,13 +20,16 @@ from .editing_render import experimental_positive
 from .endpoint_study import EndpointFit
 from .engines import Analysis, density_auto, flexcolor_research, check_reference_sources
 from .native import check_baseline, encode_experiment, native_export, sha256
+from .native_headroom import native_headroom_active, native_headroom_strength, native_local_highlight
 from .preview_data import verified_pixels
+from .preview_fit_transport import MAX_FIT_EDGE, FitReferenceCache, can_transport_fit, write_fit_records
 from .preview_grid import post_requires_full_grid
-from .professional_controls import native_config
+from .professional_controls import native_config, native_print_ev
 from .rgb_curve_study import SharedCurveFit
 from .tone_study import GAMMA, ICC_SHA256
 from .workflow_render import (
     _native_float_export,
+    _native_headroom_export,
     _native_highlight_export,
     _cool_headroom_export,
     _flex_research_export,
@@ -149,6 +153,38 @@ def _checked_preview_request(request):
     full_resolution = request.get("full_resolution", False)
     if type(full_resolution) is not bool:
         raise ValueError("预览分辨率参数必须为布尔值")
+    if type(request.get("tone_edit", False)) is not bool:
+        raise ValueError("交互预览参数必须为布尔值")
+    if "metering_edit" in request and (
+        request["metering_edit"] is not True or mode != "native" or "interactive_edge" not in request
+    ):
+        raise ValueError("交互测量只适用于原生拖动预览")
+    if "engine_proxy" in request and (
+        request["engine_proxy"] is not True or "interactive_edge" not in request
+        or "metering_edit" in request or "fit_edge" in request
+        or request.get("release_priority")
+    ):
+        raise ValueError("引擎快速预览仅支持独立的小尺寸适应窗口请求")
+    if "defer_reference" in request and (
+        request["defer_reference"] is not True or "draft_recipe" not in request
+        or full_resolution or "viewport" in request or request.get("crop_locator")
+        or request.get("repair_plan") is not None or "interactive_edge" in request
+    ):
+        raise ValueError("延后对比参考仅支持无修补的普通适应窗口预览")
+    for field, minimum, label in (
+        ("fit_edge", 1400, "适应窗口预览"),
+        ("interactive_edge", 256, "拖动预览"),
+    ):
+        if field not in request:
+            continue
+        edge = request[field]
+        if type(edge) is not int or not minimum <= edge <= MAX_FIT_EDGE:
+            raise ValueError(f"{label}长边必须为 {minimum} 到 {MAX_FIT_EDGE} 像素的整数")
+        if ((field == "fit_edge" and mode != "native")
+                or not request.get("tone_edit") or "draft_recipe" not in request
+                or full_resolution or "viewport" in request or request.get("crop_locator")
+                or request.get("repair_plan") is not None):
+            raise ValueError(f"{label}尺寸只适用于无修补的适应窗口调色")
     return controls, mode, full_resolution
 
 
@@ -541,7 +577,9 @@ class Session:
             document = recipe.get("native_controls", {"version": 1, "values": {}})
             film = recipe.get("native_film")
             float_controls = recipe.get("native_float_controls")
-            highlight_controls = recipe.get("highlight_controls")
+            headroom = native_headroom_active(recipe)
+            print_ev = native_print_ev(recipe)
+            highlight_controls = native_local_highlight(recipe)
             spatial_controls = recipe.get("native_spatial_controls")
             spatial_config = spatial_source_key = None
             cache_documents = [document, film, recipe.get("measurement_method")]
@@ -633,7 +671,15 @@ class Session:
                             highlight=highlight_controls,
                             point=float_controls,
                             film=film,
+                            print_ev=print_ev,
                         )
+                    elif headroom or (print_ev and not highlight_controls):
+                        payload, _, _ = _native_headroom_export(
+                            self.processor, config, self.manifest["inputs"], self.export, float_controls,
+                            strength=native_headroom_strength(recipe) if headroom else 0,
+                            print_ev=print_ev,
+                        )
+                        self.native_print_cache = {key: deepcopy(self.processor.pure_native_print)}
                     elif highlight_controls:
                         payload, _ = _native_highlight_export(
                             self.processor,
@@ -643,6 +689,8 @@ class Session:
                             self.export,
                             highlight_controls,
                             float_controls,
+                            film=film,
+                            print_ev=print_ev,
                         )
                     elif float_controls:
                         payload, _ = _native_float_export(
@@ -846,6 +894,7 @@ class Session:
             pixels,
             recipe.get("post_controls", {}).get(mode),
             sample_step=1 if full_grid_preview else self.sample_step,
+            collect_ranges=False,
         )
         if self.full_resolution:
             remember_completed(self, recipe, mode, pixels, icc)
@@ -913,8 +962,10 @@ def main():
         os.setsid()
     session = None
     retained_density = None
+    fit_reference = FitReferenceCache()
     incoming = _REQUEST_STATE = IncomingRequests(sys.stdin)
     for line in incoming:
+        worker_received_ns = time.monotonic_ns()
         request = None
         records = []
         metering_path = None
@@ -922,6 +973,7 @@ def main():
         try:
             request = json.loads(line)
             if isinstance(request, dict) and request.get("action") == "clear_derived":
+                fit_reference.clear()
                 cache = getattr(session, "density_preview", None)
                 if cache is not None:
                     cache.clear_derived()
@@ -950,6 +1002,8 @@ def main():
             )
             if not reused:
                 # Release the old RAW and native caches before decoding another photo.
+                fit_reference.clear()
+                verified_inputs = getattr(session, "authenticated_inputs", None)
                 if getattr(session, "density_preview", None) is not None:
                     retained_density = session.density_preview
                     session.density_preview = None
@@ -960,6 +1014,7 @@ def main():
                     request["manifest"],
                     request["manifest_sha256"],
                     request["directory"],
+                    **({"authenticated_inputs": verified_inputs} if "draft_recipe" in request and verified_inputs else {}),
                 )
                 if retained_density is not None:
                     if hasattr(session, "density_preview") and retained_density.rebind(session):
@@ -967,8 +1022,12 @@ def main():
                     else:
                         retained_density.close()
                     retained_density = None
+            # A slider gesture can dispatch many tiny frames per second. Skip
+            # starting and joining a resource polling thread on each frame.
+            measure_resources = "interactive_edge" not in request or os.environ.get("PURE_RGB_DEBUG") == "1"
+            sampler = MemorySampler() if measure_resources else nullcontext()
             with (
-                MemorySampler() as resources,
+                sampler as resources,
                 span("preview_render", token=request["token"], mode=request["mode"]),
             ):
                 pixels, reference, icc = session.render(request)
@@ -987,12 +1046,32 @@ def main():
                 token=request["token"],
                 seconds=time.monotonic() - started,
                 shape=list(pixels.shape),
-                resources=resources.report(),
-            )
-            records = _write_preview_records(
-                request["directory"], request["token"], pixels, reference, icc
+                **({"resources": resources.report()} if resources is not None else {}),
             )
             quality = getattr(session, "preview_quality", None)
+            interactive = "interactive_edge" in request and (quality or {}).get("interactive_frame") is True
+            reference_deferred = request.get("defer_reference") is True and getattr(session, "reference_deferred", False)
+            current_only = interactive or reference_deferred
+            if current_only:
+                reference = pixels
+            if interactive and max(pixels.shape[:2]) > request["interactive_edge"]:
+                raise ValueError("拖动预览超出请求的采样尺寸")
+            if can_transport_fit(request, pixels, reference, icc):
+                try:
+                    records = write_fit_records(
+                        request["directory"], request["token"], pixels, reference, icc,
+                        current_only=current_only, reference_cache=fit_reference,
+                    )
+                except OSError as error:
+                    if interactive:
+                        raise
+                    event("preview_fit_transport_fallback", token=request["token"], reason=str(error))
+            if not records:
+                if interactive:
+                    raise ValueError("拖动预览未生成可交接的 RGB16 像素")
+                records = _write_preview_records(
+                    request["directory"], request["token"], pixels, reference, icc
+                )
             if repair_provenance is not None:
                 records[0].update(outside_mask_changed_pixels=0, repair_replay=repair_provenance)
                 quality = {
@@ -1005,9 +1084,11 @@ def main():
             metering = getattr(session, "metering_receipt", None)
             desktop = request.get("metering_transport") == "sidecar"
             metering_fields = {"metering_receipt": metering}
-            if desktop:
+            if interactive:
                 metering_fields = {}
-                if metering and not request.get("viewport") and not request.get("crop_locator"):
+            elif desktop:
+                metering_fields = {}
+                if metering and not request.get("viewport"):
                     metering_path = preview_metering_path(records[0])
                     metering_path.write_text(
                         json.dumps(metering, ensure_ascii=False, separators=(",", ":")),
@@ -1017,10 +1098,17 @@ def main():
                     event("preview_metering_sidecar", token=request["token"],
                           bytes=metering_path.stat().st_size, zones=len(metering.get("zones", ())))
             incoming.check()
+            visible_binding = None
+            if (desktop and not interactive and not (quality or {}).get("approximate")
+                    and hasattr(session, "visible_engine_binding")):
+                visible_binding = session.visible_engine_binding(request)
             emit(
                 type="result",
                 token=request["token"],
                 records=records,
+                **({"interactive_frame": True} if interactive else {}),
+                **({"reference_deferred": True} if reference_deferred else {}),
+                **({"visible_engine_binding": visible_binding} if visible_binding else {}),
                 seconds=time.monotonic() - started,
                 preview_long_edge=max(pixels.shape[:2]),
                 sample_step=session.sample_step,
@@ -1041,6 +1129,7 @@ def main():
                     or getattr(session, "native_cache", None)
                     or (quality or {}).get("mode") in {
                         "native-original-screen", "nikon-original-screen", "flex-original-screen",
+                        "nikon-screen", "flex-screen",
                     }
                 ),
                 preview_performance=(
@@ -1049,6 +1138,8 @@ def main():
                 ),
                 preview_cache=(session.density_preview.cache_report
                     if getattr(session, "density_preview", None) is not None else None),
+                worker_received_ns=worker_received_ns,
+                worker_finished_ns=time.monotonic_ns(),
             )
             delivered = True
         except PreviewSuperseded as error:
@@ -1078,6 +1169,7 @@ def main():
         session.close()
     if retained_density is not None:
         retained_density.close()
+    fit_reference.clear()
     _REQUEST_STATE = None
 
 

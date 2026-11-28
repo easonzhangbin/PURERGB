@@ -9,6 +9,9 @@ photosites and is measured separately in the retained area and full frame.
 """
 
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
+import hashlib
+import json
 import math
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -27,6 +30,10 @@ MAX_SPATIAL_RANGE = 0.15
 BRIGHT_TAIL_WARNING = 0.15
 DEFAULT_REGION = (0.4, 0.4, 0.6, 0.6)
 FULL_REGION = (0.0, 0.0, 1.0, 1.0)
+MEASUREMENT_SCHEMA = "pure-rgb-film-base-balance"
+MEASUREMENT_SCHEMA_VERSION = 1
+MEASUREMENT_BEGIN = "[PURE RGB BALANCE MEASUREMENT BEGIN]"
+MEASUREMENT_END = "[PURE RGB BALANCE MEASUREMENT END]"
 _SHUTTER_STEPS = (
     *(1 / denominator for denominator in (
         8000, 6400, 5000, 4000, 3200, 2500, 2000, 1600, 1250, 1000, 800, 640, 500, 400, 320, 250,
@@ -34,6 +41,45 @@ _SHUTTER_STEPS = (
     )),
     .3, .4, .5, .6, .8, 1., 1.3, 1.6, 2., 2.5, 3.2, 4., 5., 6., 8., 10., 13., 15., 20., 25., 30.,
 )
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _canonical_json(value):
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"))
+
+
+def _content_digest(value):
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _source_identity(path):
+    """Hash the original file while the enclosing capture verifies its stat identity."""
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+            size += len(chunk)
+    return dict(name=path.name, sha256=digest.hexdigest(), size_bytes=size)
+
+
+def _file_stat_identity(stat):
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def _checked_source(value):
+    if not isinstance(value, Mapping) or set(value) != {"name", "sha256", "size_bytes"}:
+        raise ValueError("缺少测量时的 RAW 内容身份，请重新分析三张 RAW 后导出联动报告。")
+    name, digest, size = value["name"], value["sha256"], value["size_bytes"]
+    if (not isinstance(name, str) or not name or "/" in name or "\\" in name
+            or not isinstance(digest, str) or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or type(size) is not int or size <= 0):
+        raise ValueError("RAW 内容身份无效，请重新分析三张 RAW 后导出联动报告。")
+    return dict(name=name, sha256=digest, size_bytes=size)
 
 
 def checked_region(region):
@@ -154,6 +200,7 @@ class ChannelReading:
     capture: RawExposure | None = None
     full_capture: RawExposure | None = None
     raw_median: float | None = None
+    source: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -168,6 +215,7 @@ class BalanceAnalysis:
     reference_confirmed: bool = False
     deviations_percent: tuple[float, ...] | None = None
     capture_confirmed: bool = True
+    generated_at: str = field(default_factory=_utc_now)
 
     @property
     def usable(self):
@@ -393,6 +441,85 @@ class BalanceAnalysis:
             "physical_light_power_calibrated": False,
         }
 
+    def measurement_report(self, *, capture_reference=None):
+        """Export frozen measurements for a companion app, without inventing source identity.
+
+        Confirmation changes can update validity, but neither the source set nor
+        measurement identity becomes a new camera capture. Re-exporting the same
+        analysis also preserves its original analysis time.
+        """
+        from .release import APP_VERSION
+
+        payload = self.to_dict()
+        if len(payload["readings"]) != len(CHANNELS):
+            raise ValueError("联动报告需要完整的 R、G、B 三路测量。")
+        for channel, row in zip(CHANNELS, payload["readings"]):
+            if row["channel"] != channel:
+                raise ValueError("联动报告需要按 R、G、B 顺序的测量。")
+            row["source"] = _checked_source(row.get("source"))
+        try:
+            measured_at = datetime.fromisoformat(self.generated_at.replace("Z", "+00:00"))
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("分析时间无效，请重新分析 RAW 后导出。") from None
+        if measured_at.utcoffset() is None or measured_at.utcoffset().total_seconds() != 0:
+            raise ValueError("分析时间必须使用 UTC，请重新分析 RAW 后导出。")
+        medians = [row["median"] for row in payload["readings"]]
+        target = (float(np.median(medians)) if all(value is not None and math.isfinite(value)
+                                                  and value > 0 for value in medians) else None)
+        sources = [dict(channel=row["channel"], sha256=row["source"]["sha256"],
+                        size_bytes=row["source"]["size_bytes"]) for row in payload["readings"]]
+        capture_set_id = _content_digest(sources)
+        # Adjustment hints depend on confirmation and are not a new measurement.
+        identity_readings = [{key: value for key, value in row.items()
+                              if key not in ("adjustment_issue", "path")}
+                             for row in payload["readings"]]
+        identity = dict(capture_set_id=capture_set_id, generated_at=self.generated_at,
+                        region_xyxy_fraction=payload["region_xyxy_fraction"],
+                        capture_region_xyxy_fraction=payload["capture_region_xyxy_fraction"],
+                        flatfield=payload["flatfield"], readings=identity_readings)
+        payload.update(schema=MEASUREMENT_SCHEMA, schema_version=MEASUREMENT_SCHEMA_VERSION,
+                       producer="PURE RGB", producer_version=APP_VERSION,
+                       generated_at=self.generated_at, analysis_id=_content_digest(identity),
+                       capture_set_id=capture_set_id,
+                       target=dict(method="median", signal=target, pass_deviation_percent=5,
+                                   retest_limit_percent=10))
+        if capture_reference is not None:
+            from .rgb_balance_reference import BalanceReference
+
+            payload["capture_reference"] = BalanceReference.from_dict(capture_reference).to_dict()
+        # Validate all exported values before either JSON or the TXT block is written.
+        _canonical_json(payload)
+        return payload
+
+    def verify_sources_current(self):
+        """Require the files being confirmed/exported to match the measured contents.
+
+        The report always retains its measurement-time hashes. This additional
+        export check rejects an overwritten path instead of attaching a fresh
+        user confirmation to statistics from the previous contents.
+        """
+        for reading in self.readings:
+            expected = _checked_source(reading.source)
+            try:
+                path = Path(reading.path)
+                before = path.stat()
+                actual = _source_identity(path)
+                after = path.stat()
+            except OSError:
+                raise ValueError(f"{reading.channel} 路 RAW 已改变或不可用，请重新分析并确认后导出。") from None
+            if (_file_stat_identity(before) != _file_stat_identity(after)
+                    or actual["sha256"] != expected["sha256"]
+                    or actual["size_bytes"] != expected["size_bytes"]):
+                raise ValueError(f"{reading.channel} 路 RAW 已改变，请重新分析并确认后导出。")
+
+    def measurement_json(self, *, capture_reference=None):
+        return json.dumps(self.measurement_report(capture_reference=capture_reference),
+                          ensure_ascii=False, allow_nan=False, indent=2) + "\n"
+
+    def measurement_text_block(self, *, capture_reference=None):
+        block = _canonical_json(self.measurement_report(capture_reference=capture_reference))
+        return f"{MEASUREMENT_BEGIN}\n{block}\n{MEASUREMENT_END}\n"
+
     def report_text(self):
         lines = ["PURE RGB · RGB 拍摄灯光配平", "建议使用同卷已冲洗、无画面的片基。三张使用相同 ISO、快门和光圈。"]
         lines.append(f"片基量区：{_region_label(self.region)} · {'已确认' if self.reference_confirmed else '待确认'}")
@@ -581,6 +708,12 @@ def _measure_raw_exposure(mosaic, colors, black, white, region):
     return _summarize_raw(limits)
 
 
+def _joined_samples(planes):
+    if len(planes) == 1:
+        return planes[0]
+    return np.concatenate(planes) if planes else np.empty(0, np.float32)
+
+
 def measure_cfa(mosaic, colors, black, white, positions, region=FULL_REGION, *, gain=None):
     """Measure actual photosites, including both green sites, without interpolation."""
     patch, pattern = _sample_patches(mosaic, colors, region)
@@ -597,18 +730,22 @@ def measure_cfa(mosaic, colors, black, white, positions, region=FULL_REGION, *, 
     raw_limits = []
     normalized = np.full(patch.shape, np.nan, dtype=np.float32)
     for index, mask, values in _linear_cfa_planes(patch, pattern, black, white):
-        raw_limits.append(_cfa_limit(index, values, overwrite=index not in selected))
-        if index not in selected:
-            continue
-        raw_parts.append(values)
-        if gain is not None:
-            with np.errstate(over="ignore", invalid="ignore"):
-                values = values * gain[mask]
-            parts.append(values)
-        normalized[mask] = values
-    raw_samples = np.concatenate(raw_parts) if raw_parts else np.empty(0, np.float32)
-    samples = np.concatenate(parts) if parts else raw_samples
-    raw_median, raw_signal = np.percentile(raw_samples, (50, 99.9)) if raw_samples.size else (None, None)
+        if index in selected:
+            raw_parts.append(values)
+            if gain is not None:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    corrected = values * gain[mask]
+                parts.append(corrected)
+                normalized[mask] = corrected
+            else:
+                normalized[mask] = values
+        # The spatial sample is already copied, so the percentile can
+        # partition this photosite array in place without changing its geometry.
+        raw_limits.append(_cfa_limit(index, values, overwrite=True))
+    raw_samples = _joined_samples(raw_parts)
+    samples = _joined_samples(parts) if parts else raw_samples
+    raw_median, raw_signal = (np.percentile(raw_samples, (50, 99.9), overwrite_input=True)
+                              if raw_samples.size else (None, None))
     raw_metadata = dict(raw_median=float(raw_median) if raw_median is not None else None,
                         raw_signal=float(raw_signal) if raw_signal is not None else None,
                         raw_limit_signal=max((item["p999"] for item in raw_limits), default=None),
@@ -620,8 +757,9 @@ def measure_cfa(mosaic, colors, black, white, positions, region=FULL_REGION, *, 
                     uniformity_range=None, issues=("片基样本过少，请稍微放大片基框。",), **raw_metadata)
     if gain is not None and not np.isfinite(samples).all():
         raise ValueError("RAW 片基样本含有无效数值。")
-    median, signal = map(float, np.percentile(samples, (50, 99.9)) if gain is not None else (raw_median, raw_signal))
-    saturation = float(np.mean(raw_samples >= RAW_NEAR_LIMIT))
+    median, signal = map(float, np.percentile(samples, (50, 99.9), overwrite_input=True)
+                         if gain is not None else (raw_median, raw_signal))
+    saturation = sum(item["near_count"] for item in raw_limits if item["position"] in selected) / raw_samples.size
     if min(median, raw_median) < MIN_SIGNAL:
         issues.append(WEAK_REFERENCE_ISSUE)
     if any(item["risk"] and item["position"] in selected for item in raw_limits):
@@ -735,6 +873,47 @@ def _sensor_gain_patch(prepared, path, channel, plan, region):
     return result
 
 
+def _capture_preview(raw, channel, visible_roi):
+    """Fixed, unrotated locator rendering shared by both reference tools."""
+    import rawpy
+    from negpy.infrastructure.capture.raw_demosaic import _user_sat
+    from negpy.infrastructure.loaders.helpers import is_xtrans
+    from PIL import Image
+
+    half = not is_xtrans(raw)
+    rgb = raw.postprocess(gamma=(1, 1), no_auto_bright=True, adjust_maximum_thr=0.0,
+                          user_sat=_user_sat(raw), use_camera_wb=False, user_wb=[1, 1, 1, 1],
+                          output_bps=16, output_color=rawpy.ColorSpace.raw,
+                          half_size=half, user_flip=0, highlight_mode=0)
+    factor = 2 if half else 1
+    x0, y0, x1, y1 = visible_roi
+    band = rgb[y0 // factor:y1 // factor, x0 // factor:x1 // factor, CHANNELS.index(channel)]
+    display = np.rint(np.clip(band.astype(np.float32) / 65535, 0, 1) ** (1 / 2.2) * 255).astype(np.uint8)
+    image = Image.fromarray(display)
+    image.thumbnail((760, 760), Image.Resampling.BILINEAR)
+    preview = np.array(image, dtype=np.uint8, copy=True)
+    preview.flags.writeable = False
+    return preview
+
+
+def read_triplet_previews(paths, *, progress=None):
+    """Decode the three locator images without measuring a provisional region."""
+    import rawpy
+    from .raw_validity import plan_standard_crop
+
+    previews = []
+    for index, (channel, path) in enumerate(zip(CHANNELS, ordered_paths(paths))):
+        if progress is not None:
+            progress(f"正在读取 {channel} 参考预览（{index + 1}/3）…")
+        with rawpy.imread(path) as raw:
+            shape = raw.raw_image_visible.shape
+            if len(shape) != 2:
+                raise ValueError("当前参考分析支持带 CFA 阵列的相机 RAW。")
+            plan = plan_standard_crop(raw.sizes._asdict(), (*shape, 3), user_flip=0, half_size=False)
+            previews.append(_capture_preview(raw, channel, plan.visible_roi))
+    return tuple(previews)
+
+
 def read_capture(path, channel, region, *, with_preview=True, flatfield=None, capture_region=FULL_REGION):
     """Call on a worker. The rawpy handle and full arrays never leave it."""
     import rawpy
@@ -746,6 +925,7 @@ def read_capture(path, channel, region, *, with_preview=True, flatfield=None, ca
     prepared = (flatfield if isinstance(flatfield, _PreparedFlatfield)
                 else _prepare_flatfield(flatfield, [str(source.expanduser().resolve())]))
     before = source.stat()
+    source_identity = _source_identity(source)
     with rawpy.imread(str(source)) as raw:
         mosaic = raw.raw_image_visible
         colors = raw.raw_colors_visible
@@ -782,32 +962,14 @@ def read_capture(path, channel, region, *, with_preview=True, flatfield=None, ca
             (text(exif.get(271)), text(exif.get(272))), _positive(info.iso_speed),
             _positive(info.shutter_speed), _positive(info.aperture), (y1 - y0, x1 - x0),
         )
-        preview = None
-        if with_preview:
-            # A fixed display transform for locating the film base only. Neither
-            # this demosaic nor its display gamma enters the numerical meter.
-            from negpy.infrastructure.capture.raw_demosaic import _user_sat
-            from negpy.infrastructure.loaders.helpers import is_xtrans
-            from PIL import Image
-
-            half = not is_xtrans(raw)
-            rgb = raw.postprocess(gamma=(1, 1), no_auto_bright=True, adjust_maximum_thr=0.0,
-                                  user_sat=_user_sat(raw), use_camera_wb=False, user_wb=[1, 1, 1, 1],
-                                  output_bps=16, output_color=rawpy.ColorSpace.raw,
-                                  half_size=half, user_flip=0, highlight_mode=0)
-            factor = 2 if half else 1
-            band = rgb[y0 // factor:y1 // factor, x0 // factor:x1 // factor, CHANNELS.index(channel)]
-            # Fixed 16-bit to display transform, shared by all three channels.
-            image = Image.fromarray(np.rint(np.clip(band.astype(np.float32) / 65535, 0, 1) ** (1 / 2.2) * 255).astype(np.uint8))
-            image.thumbnail((760, 760), Image.Resampling.BILINEAR)
-            preview = np.array(image, dtype=np.uint8, copy=True)
-            preview.flags.writeable = False
+        preview = _capture_preview(raw, channel, plan.visible_roi) if with_preview else None
     after = source.stat()
-    if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
+    if (_file_stat_identity(before) != _file_stat_identity(after)
+            or source_identity["size_bytes"] != before.st_size):
         raise ValueError("参考 RAW 在读取时发生变化，请重新选择。")
     return ChannelReading(channel, str(source), settings, preview=preview,
                           flatfield=prepared.report if prepared is not None else None,
-                          capture=capture_exposure, full_capture=full_exposure, **result)
+                          capture=capture_exposure, full_capture=full_exposure, source=source_identity, **result)
 
 
 def combine_readings(readings, region=FULL_REGION, *, capture_region=FULL_REGION, reference_confirmed=False,
@@ -844,10 +1006,12 @@ def combine_readings(readings, region=FULL_REGION, *, capture_region=FULL_REGION
         if capture_confirmed and reference_confirmed and imbalance > 10:
             if retained_risk:
                 issue = "保留画幅已有 RAW 削顶风险。请先降低拍摄曝光，再复测配平。"
-            elif ratio > 1 and (item.capture is None or item.capture.limit_signal is None):
-                issue = "缺少保留画幅的 RAW 上限数据，暂不估算增加量。"
-            elif ratio > 1 and item.capture.limit_signal * ratio >= RAW_NEAR_LIMIT:
-                issue = "增加到共同参考会使保留画幅原始 RAW 接近或达到削顶。请先降低整体曝光再复测。"
+            elif ratio > 1 and (not _has_retained_exposure(item.capture) or not _has_capture_peak(item.capture)):
+                issue = "缺少保留画幅的可靠 RAW 峰值与上限数据，暂不估算增加量。"
+            elif ratio > 1 and (item.capture.near_count or item.capture.clipped_count):
+                issue = "保留画幅已有零星近上限或削顶点，暂不估算增加量。请先降低拍摄曝光再复测。"
+            elif ratio > 1 and item.capture.peak_signal * ratio >= RAW_NEAR_LIMIT:
+                issue = "增加到共同参考会使保留画幅原始 RAW 峰值接近或达到削顶。请先降低整体曝光再复测。"
             else:
                 adjustment = float(100 * (ratio - 1))
         adjustments.append(adjustment)

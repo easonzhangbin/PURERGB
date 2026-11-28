@@ -8,6 +8,8 @@ import shutil
 import threading
 import uuid
 
+from .preview_fit_transport import FIT_TRANSPORT, read_fit_record
+
 
 @dataclass
 class _Entry:
@@ -41,6 +43,31 @@ class SnapshotLease:
     def sample_step(self):
         return self.entry.sample_step
 
+    def current_tiff_path(self):
+        """Materialize a small preview only for consumers that require TIFF."""
+        with self.store.lock:
+            if self.released:
+                raise ValueError("预览快照已释放")
+            record = self.entry.current
+            path = Path(record["path"])
+            if record.get("transport") != FIT_TRANSPORT:
+                return path
+            destination = self.entry.directory / "light-table.tiff"
+            if not destination.is_file():
+                import tifffile
+
+                pixels, icc = read_fit_record(record)
+                temporary = destination.with_suffix(".tmp")
+                try:
+                    tifffile.imwrite(
+                        temporary, pixels, photometric="rgb", metadata=None,
+                        extratags=[(34675, 7, len(icc), icc, False)],
+                    )
+                    temporary.replace(destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            return destination
+
     def release(self):
         self.store.release(self)
 
@@ -63,7 +90,21 @@ class PreviewSnapshotStore:
             raise ValueError("预览源在交接期间改变，不能保留为显示快照")
         return {**deepcopy(record), "path": str(destination)}
 
-    def prepare(self, current, reference, context, sample_step=1, *, own_files=True):
+    def _adopt(self, record, directory, role, worker_directory):
+        if record.get("transport") != FIT_TRANSPORT:
+            return self._copy(record, directory / f"{role}.tiff")
+        source = Path(record["path"])
+        destination = directory / f"{role}.rgb16"
+        if (source.parent.resolve() != worker_directory or source.is_symlink()
+                or source.suffix != ".rgb16" or not source.is_file()):
+            raise ValueError("预览帧不在当前工作进程目录")
+        try:
+            source.replace(destination)
+        except OSError:
+            return self._copy(record, destination)
+        return {**deepcopy(record), "path": str(destination)}
+
+    def prepare(self, current, reference, context, sample_step=1, *, own_files=True, worker_directory=None):
         with self.lock:
             if self.closed:
                 raise ValueError("预览快照已关闭")
@@ -72,10 +113,11 @@ class PreviewSnapshotStore:
         directory.mkdir()
         try:
             if own_files:
-                first = self._copy(current, directory / "current.tiff")
+                source_directory = self.root.parent if worker_directory is None else Path(worker_directory).resolve()
+                first = self._adopt(current, directory, "current", source_directory)
                 second = (
                     first if current["sha256"] == reference["sha256"]
-                    else self._copy(reference, directory / "reference.tiff")
+                    else self._adopt(reference, directory, "reference", source_directory)
                 )
             else:
                 # Saved versions are immutable and not owned by this store.

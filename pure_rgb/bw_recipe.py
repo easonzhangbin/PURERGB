@@ -9,7 +9,8 @@ import json
 import math
 from pathlib import Path
 
-from .professional_controls import NATIVE_SPECS, checked_controls
+from .native_headroom import HEADROOM_CONTROL, HEADROOM_STRENGTH
+from .professional_controls import NATIVE_SPECS, PRINT_EXPOSURE_EV, checked_controls
 from .output_orientation import checked_document as checked_output_orientation
 
 
@@ -135,6 +136,10 @@ def checked_bw_recipe(recipe, *, verify_resources=True):
             result["output_orientation"] = value
     if "native_controls" in result:
         controls = checked_controls(result["native_controls"], NATIVE_SPECS)
+        _require(not {HEADROOM_CONTROL, HEADROOM_STRENGTH}.intersection(controls["values"]),
+                 "负片动态范围映射目前适用于彩色 NegPy 原生转换")
+        _require(PRINT_EXPOSURE_EV not in controls["values"],
+                 "RAW 印相曝光目前适用于彩色 NegPy 原生转换")
         paper_override = controls["values"].get(
             "exposure.paper_profile", "__reference__"
         )

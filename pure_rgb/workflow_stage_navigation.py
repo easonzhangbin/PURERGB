@@ -11,7 +11,7 @@ from PyQt6.QtCore import QEvent, QObject, QPoint, QRect, QTimer, Qt, pyqtSlot
 from PyQt6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QLayout, QPushButton, QVBoxLayout, QWidget
 
 from .motion_spring import Spring
-from .workflow_glass import system_dark, system_reduce_motion
+from .workflow_glass import obsidian_enabled, observe_appearance, system_dark, system_reduce_motion
 
 
 def _clamp(value, low, high):
@@ -229,17 +229,8 @@ class StageNavigation(QObject):
         self.card.setProperty("glassCornerRadius", 24.0)
         self.card.setAccessibleName("当前步骤导航与状态")
         self.card.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        surface, text, muted = ("rgba(38,38,38,245)", "#f4f1ec", "#b4b1ab") if system_dark() else (
-            "rgba(250,249,247,248)", "#201f1d", "#6e6b65")
-        self.card.setStyleSheet(
-            f"QFrame#rubberDockCard{{background:{surface};border:0;border-radius:24px;}}"
-            'QFrame#rubberDockCard[nativeMaterial="true"]{background:transparent;}'
-            f"QFrame#rubberDockCard QLabel{{background:transparent;color:{text};border:0;}}"
-            f"QLabel#dockStatus{{color:{muted};font-size:12px;}}"
-            "QFrame#rubberDockCard QPushButton{border:0;border-radius:12px;padding:9px 12px;"
-            "background:rgba(127,127,127,28);}"
-            'QFrame#rubberDockCard QPushButton[nativeMaterial="true"]{background:transparent;}'
-        )
+        self._apply_card_palette()
+        observe_appearance(self.card, self._apply_card_palette)
         layout = QVBoxLayout(self.card)
         layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         layout.setContentsMargins(18, 15, 18, 17)
@@ -265,6 +256,21 @@ class StageNavigation(QObject):
         self.card_action_layout.setSpacing(7)
         layout.addLayout(self.card_action_layout)
         self.card.hide()
+
+    def _apply_card_palette(self):
+        surface, text, muted = ("rgba(38,38,38,245)", "#f4f1ec", "#b4b1ab") if system_dark() else (
+            "rgba(250,249,247,248)", "#201f1d", "#6e6b65")
+        if obsidian_enabled():
+            surface, text, muted = "#141517", "#f0f0ef", "#b1b4bb"
+        self.card.setStyleSheet(
+            f"QFrame#rubberDockCard{{background:{surface};border:0;border-radius:24px;}}"
+            'QFrame#rubberDockCard[nativeMaterial="true"]{background:transparent;}'
+            f"QFrame#rubberDockCard QLabel{{background:transparent;color:{text};border:0;}}"
+            f"QLabel#dockStatus{{color:{muted};font-size:12px;}}"
+            "QFrame#rubberDockCard QPushButton{border:0;border-radius:12px;padding:9px 12px;"
+            "background:rgba(127,127,127,28);}"
+            'QFrame#rubberDockCard QPushButton[nativeMaterial="true"]{background:transparent;}'
+        )
 
     def _action_sources(self):
         owner = self.bar.window()

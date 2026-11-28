@@ -1,9 +1,8 @@
 """Runtime resource policy for isolated workers; it never changes image recipes.
 
 Thread environment must be installed before spawning a worker.  Cache budgets
-are soft retention budgets for an idle preview process, not limits on the RAW
-buffers needed to complete a render.  Current verified image routes use CPU;
-window compositing and native glass are independent of this computation policy.
+are soft retention budgets for an idle preview process. Verified metering and
+saved rendering use the CPU. Eligible interactive previews use Metal.
 """
 
 from copy import deepcopy
@@ -140,6 +139,24 @@ def _mac_physical_memory():
     return int(value.value) if size.value == ctypes.sizeof(value) and value.value else None
 
 
+def system_memory_pressure():
+    """Read macOS's userspace pressure level without running a command."""
+    if sys.platform != "darwin":
+        return None
+    functions = _mac_system_functions()
+    if functions is None:
+        return None
+    value = ctypes.c_uint32()
+    size = ctypes.c_size_t(ctypes.sizeof(value))
+    status = functions[0](
+        b"kern.memorystatus_vm_pressure_level", ctypes.byref(value), ctypes.byref(size), None, 0
+    )
+    if status != 0 or size.value != ctypes.sizeof(value):
+        return None
+    # XNU translates its internal level into the userspace event flags.
+    return {1: "normal", 2: "warning", 4: "critical"}.get(value.value)
+
+
 def _mac_process_rss(pid):
     functions = _mac_system_functions()
     if functions is None or pid > 2**31 - 1:
@@ -187,7 +204,7 @@ def backend_status(document=None):
         label="CPU + GPU 预览" if available and settings["backend"] != "cpu" else "CPU",
         device=gpu.get("device", ""),
         gpu_unavailable_reason="" if available else gpu.get("reason", "当前设备无法使用GPU预览"),
-        scope="GPU accelerates supported positive preview adjustments; metering and saved color rendering retain their verified CPU routes.",
+        scope="Metal accelerates eligible NegPy interactive previews and positive adjustments; metering and saved rendering use verified CPU routes.",
     )
 
 
@@ -292,20 +309,31 @@ def process_rss_bytes(pid):
 
 
 def preview_release_decision(
-    document=None, *, idle_seconds, busy, rss_bytes=None, hardware=None, retained_source_bytes=0
+    document=None, *, idle_seconds, busy, rss_bytes=None, hardware=None,
+    retained_source_bytes=0, memory_pressure=None,
 ):
     """Whether the GUI may release an idle preview process and its whole cache.
 
     The GUI owns shutdown.  No signals or resource limits are applied here;
     active previews, queued replacements and saved-output jobs must pass busy.
     """
+    hardware = hardware_info() if hardware is None else hardware
     policy = resolve_performance(document, hardware=hardware, include_backend=False)
     if type(retained_source_bytes) is not int or retained_source_bytes < 0:
         raise ValueError("保留源缓存字节数必须为非负整数")
     effective_budget = policy["preview_cache_budget_bytes"] + retained_source_bytes
+    if memory_pressure == "normal" and retained_source_bytes and not policy["settings"]["cache_mb"]:
+        # A qualified RAW session also retains SDK and GPU state outside the
+        # source array. On the measured 96 MP workload it occupies 6.22 GiB,
+        # while the decoded source accounts for 1.07 GiB. Keep it warm through
+        # short idle gaps within a bounded share of known physical memory.
+        memory = hardware.get("total_memory_bytes") or 0
+        effective_budget = max(effective_budget, min(memory // 8, 8 * GIB))
     release, reason = False, "retained"
     if busy:
         reason = "active-work"
+    elif memory_pressure == "critical":
+        release, reason = True, "system-memory-pressure"
     elif idle_seconds >= policy["preview_idle_release_seconds"]:
         release, reason = True, "idle-timeout"
     elif (
@@ -320,6 +348,7 @@ def preview_release_decision(
         budget_bytes=policy["preview_cache_budget_bytes"],
         retained_source_bytes=retained_source_bytes,
         effective_budget_bytes=effective_budget,
+        memory_pressure=memory_pressure,
         idle_limit_seconds=policy["preview_idle_release_seconds"],
     )
 

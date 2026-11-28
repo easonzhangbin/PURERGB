@@ -119,9 +119,10 @@ class AdvancedPanel(QWidget):
 
     recipe_changed = pyqtSignal(object)
 
-    def __init__(self, parent=None, *, default_expanded=False):
+    def __init__(self, parent=None, *, default_expanded=False, live_tone=False):
         super().__init__(parent)
         self.default_expanded = default_expanded
+        self.live_tone = live_tone
         self.original = None
         self.groups = ()
         self.pages = {}
@@ -156,7 +157,7 @@ class AdvancedPanel(QWidget):
         column.addWidget(self.error)
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
-        self.timer.setInterval(300)
+        self.timer.setInterval(35 if self.live_tone else 300)
         self.timer.timeout.connect(self.apply_changes)
 
     def cancel_pending(self):
@@ -224,8 +225,12 @@ class AdvancedPanel(QWidget):
         self.updateGeometry()
 
     def schedule_changes(self):
-        if not self.loading:
-            self.timer.start()
+        if not self.loading and (not self.live_tone or not self.timer.isActive()):
+            slider = getattr(self.window(), "_tone_drag", None)
+            if self.live_tone and slider is not None and self.isAncestorOf(slider):
+                self.timer.start(8)
+            else:
+                self.timer.start(35 if self.live_tone else 300)
 
     def rebase(self, recipe):
         """Refresh a committed recipe while retaining accordion state and widgets."""

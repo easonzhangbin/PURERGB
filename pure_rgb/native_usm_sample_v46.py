@@ -34,7 +34,7 @@ class _USMBandEngine(_SpatialEngine):
         return super()._run_stage(image, config, cache_field, processor_fn, context, pipeline_changed)
 
 
-def render_original_usm_band(runner, source, render_config, band_start):
+def render_original_usm_band(runner, source, render_config, band_start, *, print_ev=0.0):
     from .density_preview_v44 import native_usm_supported
     from .live_worker import preview_checkpoint
 
@@ -60,7 +60,8 @@ def render_original_usm_band(runner, source, render_config, band_start):
         process_mode=render_config.process.process_mode, wants_uv_grid=False,
         readback_metrics=False, cache_stages=False)
     engine = _USMBandEngine(runner._metrics, runner._sha256, log_domain=film_domain_for(source))
-    image = engine.process(dense, render_config, f"{runner._sha256}:usm:{band_start}", context)
+    image = engine.process(dense, render_config, f"{runner._sha256}:usm:{band_start}", context,
+                           print_ev=print_ev)
     if image.shape != dense.shape or not np.isfinite(image).all():
         raise ValueError("Native USM band produced invalid or changed-geometry output")
     _check_source(source, runner._identity)

@@ -8,6 +8,7 @@ import uuid
 from PyQt6.QtCore import QProcess, Qt
 from PyQt6.QtWidgets import QFileDialog
 
+from .workflow_glass import obsidian_enabled
 from .workflow_ui_model import RESULT_MODES
 
 
@@ -82,7 +83,7 @@ class ProjectLightTable:
             # may also have a lease while the next draft is still rendering.
             if (all(snapshot.get(k) == context.get(k) for k in identity)
                     and path.is_relative_to(window.snapshot_store.root) and path.is_file()):
-                return path, "当前调色预览"
+                return self.lease.current_tiff_path(), "当前调色预览"
         if not job:
             raise ValueError("请先生成当前引擎的预览或完整版本")
         baseline = project.workspace.sample(job).record(RESULT_MODES[photo["engine"]], "baseline")
@@ -116,7 +117,8 @@ class ProjectLightTable:
         self.directory = TemporaryDirectory(prefix="purergb-light-table-")
         manifest = Path(self.directory.name) / "session.json"
         manifest.write_text(json.dumps(dict(mode=mode, current=current, items=items,
-                                            canExport=can_export, displayID=window_display_id(self.window)),
+                                            canExport=can_export, displayID=window_display_id(self.window),
+                                            obsidian=obsidian_enabled()),
                                        ensure_ascii=False))
         command = launch_command(manifest)
         process = QProcess(self.window)

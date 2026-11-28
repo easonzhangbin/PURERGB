@@ -18,6 +18,8 @@ SCHEMA = "pure-rgb-highlight-reference-guarded"
 VERSION = 2
 BLOCK_PIXELS = 262144
 LUMINANCE_EPSILON = 1e-12
+REFERENCE_HEADROOM_FLOOR = 0.03
+RECOVERY_POLICY = "reference-headroom-continuous-shoulder-v2"
 DEFAULTS = {
     "version": VERSION,
     "strength": 0.0,
@@ -126,9 +128,14 @@ def _budget(y, start, tau, minimum_slope):
     return (1 - minimum_slope) * h
 
 
+def _smooth_weight(values, low, high):
+    t = np.clip((values - low) / (high - low), 0, 1)
+    return t * t * (3 - 2 * t)
+
+
 def apply_highlight_reference_guarded(
     base_linear, reference_linear, document=None, *, domain, protection_mask=None,
-    effect_mask=None,
+    effect_mask=None, recover_clipped=False,
 ):
     """Return (working-linear RGB, receipt), with RGB-common burn/protection.
 
@@ -160,6 +167,9 @@ def apply_highlight_reference_guarded(
             raise ValueError("Effect area must be HW with the base shape and dtype")
     local_start = max(controls["range_start"], 0.35) if effect_mask is not None else controls["range_start"]
     local_reference = max(controls["budget_reference"], 0.75) if effect_mask is not None else controls["budget_reference"]
+    if recover_clipped:
+        local_start = max(local_start, 0.50)
+        local_reference = max(local_reference, 0.80)
     tau = _tau(local_start, local_reference)
     count = base_linear.shape[0] * base_linear.shape[1]
     receipt = {
@@ -200,6 +210,17 @@ def apply_highlight_reference_guarded(
         receipt["ordering_guarantee"] += "; the effect mask must also be constant"
     if effect_mask is not None or protection_mask is not None:
         receipt["local_selection_policy"] = "highlight-luminance-soft-v2"
+    if recover_clipped:
+        receipt.update(
+            reference_recovery_policy=RECOVERY_POLICY,
+            recovery_highlight_start=local_start,
+            recovery_highlight_reference=local_reference,
+            recovery_reference_luminance_floor=REFERENCE_HEADROOM_FLOOR,
+            colour_policy="Blend bounded reference chroma near the base white limit at constant output luminance",
+            ordering_guarantee="Luminance is nondecreasing in each source luminance for fixed masks, before dtype rounding",
+        )
+        receipt["formula"] = receipt["formula"].replace("max(Yref,eps)", "max(Yref,recovery_reference_luminance_floor)")
+        receipt["formula"] += "; recovery uses its recorded shoulder; smooth near-white eligibility gates only chroma"
     if (
         controls["strength"] == 0
         or controls["max_burn_ev"] == 0
@@ -228,14 +249,21 @@ def apply_highlight_reference_guarded(
         y_base = np.einsum("...c,c->...", base, LUMA)
         y_reference = np.einsum("...c,c->...", reference, LUMA)
         budget = _budget(y_base, local_start, tau, controls["min_log_slope"])
+        reference_floor = REFERENCE_HEADROOM_FLOOR if recover_clipped else LUMINANCE_EPSILON
         desired = controls["strength"] * np.clip(
             np.log2(
                 np.maximum(y_base, LUMINANCE_EPSILON)
-                / np.maximum(y_reference, LUMINANCE_EPSILON)
+                / np.maximum(y_reference, reference_floor)
             ),
             0,
             controls["max_burn_ev"],
         )
+        if recover_clipped:
+            peak = np.maximum(_smooth_weight(y_base, .82, .98),
+                              _smooth_weight(base.max(axis=-1), .94, 1.0))
+            headroom = 1 - _smooth_weight(reference.max(axis=-1), .90, .99)
+            chroma_weight = (controls["strength"] * peak * headroom
+                             * _smooth_weight(y_reference, reference_floor, .06))
         burn = np.zeros_like(budget)
         positive = budget > 0
         # D/b may overflow only toward +infinity for a vanishing positive
@@ -250,11 +278,27 @@ def apply_highlight_reference_guarded(
             )
             protected = controls["protection_strength"] * mask
             burn *= 1 - protected
+            if recover_clipped:
+                chroma_weight *= 1 - protected
             fully_protected += int(np.count_nonzero(protected == 1))
         if effect_mask is not None:
             burn *= effect_mask[start : start + block.shape[0]]
+            if recover_clipped:
+                chroma_weight *= effect_mask[start : start + block.shape[0]]
         gain = np.exp2(-burn)
-        result = (base * gain[..., None]).astype(base_linear.dtype)
+        result = base * gain[..., None]
+        if recover_clipped:
+            selected = (chroma_weight > 0) & (burn > 0)
+            if selected.any():
+                original = result[selected]
+                ratio = y_base[selected] * gain[selected] / y_reference[selected]
+                delta = reference[selected] * ratio[:, None] - original
+                # Scale the chroma change to fit, retaining its zero-luma direction.
+                limits = np.ones_like(delta)
+                np.divide(1 - original, delta, out=limits, where=delta > 0)
+                weight = np.minimum(chroma_weight[selected], limits.min(axis=-1))
+                result[selected] = np.clip(original + delta * weight[:, None], 0, 1)
+        result = result.astype(base_linear.dtype)
         output[start : start + block.shape[0]] = result
         affected += int(np.count_nonzero(np.any(result != block, axis=-1)))
         burn_sum += float(burn.sum(dtype=np.float64))

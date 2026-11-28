@@ -269,18 +269,31 @@ def read_gain(path):
 
 
 def prepare_calibration(calibration, directory, targets=()):
+    from .raw_import import file_identity
+
     path = Path(calibration["path"]).resolve(strict=True)
-    if sha256(path) != calibration["sha256"]:
+    identity = file_identity(path)
+    selected_identity = calibration.get("file_identity")
+    expected_sha = calibration.get("sha256")
+    if selected_identity is None and not expected_sha:
+        raise ValueError("平场缺少选定源文件的身份")
+    if selected_identity is not None and tuple(selected_identity) != identity:
+        raise ValueError("平场源文件自选择/入队后发生变化")
+    source_digest = sha256(path)
+    if (expected_sha is not None and source_digest != expected_sha) or file_identity(path) != identity:
         raise ValueError("平场源文件自选择/入队后发生变化")
     directory = Path(directory)
+    gain_identity = identity
+    compatibility_report = None
     if path.suffix.lower() == ".npz":
-        gain_path, digest = path, calibration["sha256"]
+        gain_path, digest = path, source_digest
     elif path.suffix.lower() in RAW_EXTENSIONS:
         if calibration.get("gain_path"):
             gain_path, digest = (
                 Path(calibration["gain_path"]),
                 calibration["gain_sha256"],
             )
+            gain_identity = file_identity(gain_path)
             if sha256(gain_path) != digest:
                 raise ValueError("已冻结的平场增益文件发生变化")
         else:
@@ -299,15 +312,15 @@ def prepare_calibration(calibration, directory, targets=()):
             provenance = {
                 "version": 1,
                 "algorithm": "NegPy-0.68-compute_gain-sensor-v1",
-                "source": {"path": str(path), "sha256": calibration["sha256"]},
+                "source": {"path": str(path), "sha256": source_digest},
                 "capture": capture,
                 "orientation": int(metadata.get("orientation", 1)),
                 "quality": quality,
                 "decode": "Full sensor RGB; linear gamma=1; neutral WB; fixed white level; user_flip=0; highlight reconstruction=0",
                 "scope": "Single broadband reference; existing post-triplet-merge gain path, not per-LED calibration",
             }
-            compatibility(provenance, targets)
-            if sha256(path) != calibration["sha256"]:
+            compatibility_report = compatibility(provenance, targets)
+            if file_identity(path) != identity:
                 raise ValueError("平场 RAW 解码期间发生变化")
             directory.mkdir(parents=True, exist_ok=True)
             gain_path = directory / "flatfield-gain.npz"
@@ -321,18 +334,21 @@ def prepare_calibration(calibration, directory, targets=()):
                         provenance, ensure_ascii=False, allow_nan=False
                     ),
                 )
+            gain_identity = file_identity(gain_path)
             digest = sha256(gain_path)
     else:
         raise ValueError("请选择单张相机 RAW 或平场增益 NPZ")
     gain, provenance = read_gain(gain_path)
+    if file_identity(gain_path) != gain_identity or file_identity(path) != identity:
+        raise ValueError("平场 RAW 或增益文件在处理期间发生变化")
     result = {
         "path": str(path),
-        "sha256": calibration["sha256"],
+        "sha256": source_digest,
         "gain_path": str(gain_path),
         "gain_sha256": digest,
         "kind": "single-raw-flatfield" if provenance else "existing-native-gain",
         "provenance": provenance,
-        "compatibility": compatibility(provenance, targets),
+        "compatibility": compatibility_report if compatibility_report is not None else compatibility(provenance, targets),
     }
     return gain, result
 

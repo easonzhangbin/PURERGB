@@ -26,12 +26,14 @@ _PANEL_NAMES = {"glassPanel", "workflowHeader", "workflowFooter", "workflowStage
                 "reviewToolbar", "reviewSidebar", "panel", "toolbar"}
 _HEADER_NAMES = {"workflowHeader", "workflowFooter", "workflowStages", "previewToolbar",
                  "reviewToolbar", "toolbar"}
+# LayoutRequest alone says a layout was invalidated. Actual geometry and
+# visibility changes below already notify each watched widget, while native
+# HUD text is refreshed when that widget paints.
 _EVENTS = {
     QEvent.Type.Resize,
     QEvent.Type.Move,
     QEvent.Type.Show,
     QEvent.Type.Hide,
-    QEvent.Type.LayoutRequest,
     QEvent.Type.ParentChange,
     QEvent.Type.EnabledChange,
     QEvent.Type.DynamicPropertyChange,
@@ -129,6 +131,7 @@ class MaterialBinder(QObject):
         self._layout_depth = 0
         self._settling_layout = False
         self._frame_depth = 0
+        self._frame_needs_native_display = False
         self.clip_class = _native_types(AppKit)
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
@@ -201,6 +204,7 @@ class MaterialBinder(QObject):
         keys, self._appearance_dirty = self._appearance_dirty, set()
         if not keys or not self.report.get("attached"):
             return
+        self._frame_needs_native_display = True
         from Quartz import CATransaction
 
         self._syncing = True
@@ -227,19 +231,26 @@ class MaterialBinder(QObject):
         from Quartz import CATransaction
 
         self._frame_depth += 1
+        self._frame_needs_native_display = self._dirty or bool(self._appearance_dirty)
         CATransaction.begin()
         CATransaction.setDisableActions_(True)
         try:
             yield
-            if not self.disposed and self.view is not None:
+            if self._frame_needs_native_display and not self.disposed and self.view is not None:
                 self.view.displayIfNeeded()
                 native_window = self.view.window()
                 if native_window is not None:
                     native_window.displayIfNeeded()
         finally:
-            CATransaction.commit()
-            CATransaction.flush()
-            self._frame_depth -= 1
+            try:
+                CATransaction.commit()
+                # Canvas-only frames need the Qt backing store, but no extra
+                # synchronous native material flush. AppKit commits normally.
+                if self._frame_needs_native_display:
+                    CATransaction.flush()
+            finally:
+                self._frame_needs_native_display = False
+                self._frame_depth -= 1
 
     def eventFilter(self, watched, event):
         if self.disposed:
@@ -251,8 +262,9 @@ class MaterialBinder(QObject):
             if self._dirty:
                 self.sync()
             else:
-                if watched.property("nativeHUD") or isinstance(watched, QSlider):
-                    self._appearance_dirty.add(id(watched))
+                key = id(watched)
+                if key in self.entries and (watched.property("nativeHUD") or isinstance(watched, QSlider)):
+                    self._appearance_dirty.add(key)
                 self._sync_appearance()
         elif (kind == QEvent.Type.DynamicPropertyChange
               and bytes(event.propertyName()) in {
@@ -673,6 +685,7 @@ class MaterialBinder(QObject):
             self.schedule()
             return
         self._syncing, self._dirty = True, False
+        self._frame_needs_native_display = True
         self._appearance_dirty.clear()
         transaction = animation = None
         try:

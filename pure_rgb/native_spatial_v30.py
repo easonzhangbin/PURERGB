@@ -42,6 +42,8 @@ from .native_masked_meters import native_masked_metrics_payload
 
 SCHEMA = "pure-rgb-native-spatial-v30"
 SCOPE = "frozen-meter-identity-full-source-spatial-cpu-v1"
+_PRE_PRINT_EV_ENGINE = "f153b14009e3bc767eaecc42985a7dff15df8620cd16083eac561b471e0b77b1"
+_FIRST_PRINT_EV_ENGINE = "51056158c88dbd3c36096e54ad269f1fd513628ee487d750682381b920f0c802"
 MAX_JSON_BYTES = 4 * 1024 * 1024
 LAB_RANGES = {
     "clahe_strength": (0, 1),
@@ -225,6 +227,31 @@ def _render_configuration(meter, render):
 
 
 class _SpatialEngine(_FrozenEngine):
+    _print_exposure = None
+
+    def process(self, img, settings, source_hash, context=None, *, print_ev=0.0):
+        if print_ev == 0:
+            return super().process(img, settings, source_hash, context)
+        from .native_headroom import NativePrintExposure
+
+        self._print_exposure = NativePrintExposure(settings, print_ev)
+        try:
+            return super().process(img, settings, source_hash, context)
+        finally:
+            self._print_exposure = None
+
+    def _run_stage(self, img, config, cache_field, processor_fn, context, pipeline_changed):
+        exposure = self._print_exposure
+        if cache_field == "exposure" and exposure is not None:
+            config = (config, exposure.ev)
+            original_print = processor_fn
+
+            def render_print(pixels, ctx):
+                return exposure.render(pixels, ctx, original_print)
+
+            processor_fn = render_print
+        return super()._run_stage(img, config, cache_field, processor_fn, context, pipeline_changed)
+
     def _normalize(self, image, context):
         normalized = super()._normalize(image, context)
         # This is an existing masked auxiliary value, not a full-source
@@ -478,19 +505,24 @@ class NativeSpatialCPU:
             ),
             "Spatial snapshot checksum changed",
         )
+        from .film_density_domain_v45 import _FIRST_PRINT_EV_ADAPTER, _PRE_PRINT_EV_ADAPTER
+
         current_runtime = _runtime()
-        old_runtime = deepcopy(current_runtime)
-        old_runtime["files"]["pure_rgb/native_spatial_v30.py"] = (
-            "de762007206390f2dcbd9723431f1f94df1cf9a1c7891ffd6ebd1c0d8f5615f4"
+        compatible_engines = (
+            ("de762007206390f2dcbd9723431f1f94df1cf9a1c7891ffd6ebd1c0d8f5615f4", _PRE_PRINT_EV_ADAPTER),
+            ("0dddc5b5a00b0c39fd8c160afb4e17e1a54a8990d703b92140b9fff1eb9b7362", _PRE_PRINT_EV_ADAPTER),
+            (_PRE_PRINT_EV_ENGINE, _PRE_PRINT_EV_ADAPTER),
+            (_FIRST_PRINT_EV_ENGINE, _FIRST_PRINT_EV_ADAPTER),
         )
-        prior_runtime = deepcopy(current_runtime)
-        prior_runtime["files"]["pure_rgb/native_spatial_v30.py"] = (
-            "0dddc5b5a00b0c39fd8c160afb4e17e1a54a8990d703b92140b9fff1eb9b7362"
-        )
+        previous_runtimes = [
+            {**current_runtime, "files": {**current_runtime["files"],
+                "pure_rgb/native_spatial_v30.py": engine, "pure_rgb/film_density_domain_v45.py": adapter}}
+            for engine, adapter in compatible_engines
+        ]
         _require(
             parsed["meter_config"] == _config_document(meter_config)
             and parsed["render_config"] == _config_document(render_config)
-            and parsed["runtime"] in (current_runtime, old_runtime, prior_runtime),
+            and parsed["runtime"] in [current_runtime, *previous_runtimes],
             "Spatial snapshot configuration/runtime changed",
         )
         _check_source(source, parsed["source_identity"])
@@ -529,6 +561,7 @@ class NativeSpatialCPU:
         *,
         prefer_gpu=False,
         cache_stages=True,
+        print_ev=0.0,
     ):
         _require(prefer_gpu is False, "Spatial replay supports CPU only")
         _require(type(cache_stages) is bool, "cache_stages must be boolean")
@@ -550,7 +583,7 @@ class NativeSpatialCPU:
         )
         before = self.base_normalization_runs
         try:
-            image = self._engine.process(source, self._effective, self._sha256, context)
+            image = self._engine.process(source, self._effective, self._sha256, context, print_ev=print_ev)
         finally:
             _check_source(source, self._identity)
             self._validate()
@@ -584,4 +617,8 @@ class NativeSpatialCPU:
             defect_repair_claim=False,
             output_domain="working-OETF-encoded RGB; no ICC conversion",
         )
+        if print_ev:
+            from .native_headroom import print_exposure_receipt
+
+            receipt["native_print_exposure"] = print_exposure_receipt(print_ev)
         return FrozenNativeCPUResult(image, deepcopy(context.metrics), receipt)

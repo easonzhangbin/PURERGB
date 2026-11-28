@@ -150,7 +150,8 @@ def compose_native_sample(encoded, *, icc, reference_encoded=None, highlight=Non
         reference = decode_working_oetf_pixels(reference_encoded, icc_bytes=icc)
         output, high_receipt = apply_highlight_reference_guarded(
             linear, reference, highlight["controls"], domain=linear_domain,
-            protection_mask=protection_mask, effect_mask=effect_mask)
+            protection_mask=protection_mask, effect_mask=effect_mask,
+            recover_clipped=bool(highlight.get("reference_density_offset")))
     if point["values"]:
         output = apply_positive_float(output, point, domain=linear_domain, icc_bytes=icc).image
     result = working_oetf_encode(np.clip(output, 0, 1))

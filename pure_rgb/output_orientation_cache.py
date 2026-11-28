@@ -193,6 +193,8 @@ def cached_preview(owner, recipe, mode, full_resolution):
     profile, exposure, source selection or density to reuse an old frame. Only
     documents not read by the selected existing engine branch are ignored.
     """
+    from .draft_preview import _saved_color_valid
+
     _trim(owner)
     if not (
         recipe.get("output_orientation")
@@ -200,7 +202,8 @@ def cached_preview(owner, recipe, mode, full_resolution):
         or getattr(owner, "_orientation_used", False)
     ):
         return None
-    same_saved = _color_recipe(recipe, mode) == _color_recipe(owner.recipe, mode)
+    same_saved = (_color_recipe(recipe, mode) == _color_recipe(owner.recipe, mode)
+                  and _saved_color_valid(owner.manifest, mode))
     completed = getattr(owner, "_orientation_completed", None)
     same_completed = bool(
         completed is not None

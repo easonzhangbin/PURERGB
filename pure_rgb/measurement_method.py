@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import replace
+from .metering_regions import normalized_metering_edges
 from .native_metering_controls import process_controls_active
 
 NATIVE = "negpy"
@@ -36,10 +37,8 @@ def native_recipe(recipe):
 
 def original_config(config, roi, shape):
     """Select the exact requested rectangle and let NegPy measure its own bounds."""
-    h, w = shape[:2]
-    a, b, c, d = roi
     return replace(config, process=replace(config.process,
-        analysis_rect=(a / w, b / h, c / w, d / h), analysis_buffer=0.,
+        analysis_rect=normalized_metering_edges(roi, shape), analysis_buffer=0.,
         local_floors=(0., 0., 0.), local_ceils=(0., 0., 0.),
     ))
 

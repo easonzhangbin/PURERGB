@@ -1,10 +1,14 @@
 """Quick positives for checking sources and channel order before import."""
 
 from io import BytesIO
+from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageOps
 from PyQt6.QtGui import QColorSpace, QImage
+
+from .raw_import import file_identity
 
 
 def _small_rgb(path):
@@ -36,8 +40,9 @@ def _positive_plane(transmission):
     return np.rint(255 * np.clip((high - transmission.astype(np.float32)) / (high - low), 0, 1)).astype(np.uint8)
 
 
-def import_preview(paths, display_icc=None):
-    images = [_small_rgb(path) for path in paths]
+@lru_cache(maxsize=6)
+def _source_preview(inputs):
+    images = [_small_rgb(str(path)) for path, _ in inputs]
     if len(images) == 1:
         plane = _positive_plane(np.asarray(images[0].convert("L")))
         pixels = np.repeat(plane[..., None], 3, axis=2)
@@ -50,6 +55,17 @@ def import_preview(paths, display_icc=None):
     height, width = pixels.shape[:2]
     result = QImage(pixels.tobytes(), width, height, width * 3, QImage.Format.Format_RGB888).copy()
     result.setColorSpace(QColorSpace(QColorSpace.NamedColorSpace.SRgb))
+    if any(file_identity(path) != expected for path, expected in inputs):
+        raise ValueError("RAW 来源在生成导入预览时改变")
+    return result
+
+
+def import_preview(paths, display_icc=None):
+    # The incoming strip, library thumbnail and preview canvas begin with
+    # the same sRGB rendering. Monitor conversion uses a detached QImage.
+    expanded = (Path(name).expanduser() for name in paths)
+    inputs = tuple((path, file_identity(path)) for path in expanded)
+    result = QImage(_source_preview(inputs))
     if display_icc:
         target = QColorSpace.fromIccProfile(display_icc)
         if target.isValid():

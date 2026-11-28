@@ -33,6 +33,7 @@ class PhotoThumbnailLoader(QObject):
         self.directory.mkdir(exist_ok=True)
         self.pending = {}
         self.current = {}
+        self.rows = {}
         self.ready = set()
         self.cache = {}
         self.active = None
@@ -41,15 +42,20 @@ class PhotoThumbnailLoader(QObject):
     def set_icon(self, identifier, icon):
         if self.closed or self.window.closing:
             return
-        for index in range(self.window.photo_list.count()):
-            item = self.window.photo_list.item(index)
-            if item.data(Qt.ItemDataRole.UserRole) == identifier:
+        row = self.rows.get(identifier)
+        if row is None:
+            return
+        item = self.window.photo_list.item(row)
+        if item is not None and item.data(Qt.ItemDataRole.UserRole) == identifier:
+            if item.icon().cacheKey() != icon.cacheKey():
                 item.setIcon(icon)
-                return
 
     def sync(self, ready_photo_ids):
         if self.closed or self.window.closing:
             return
+        photo_list = self.window.photo_list
+        self.rows = {photo_list.item(row).data(Qt.ItemDataRole.UserRole): row
+                     for row in range(photo_list.count())}
         self.ready = set(ready_photo_ids)
         current, pending = {}, {}
         for photo in self.window.project.photos:
@@ -74,6 +80,7 @@ class PhotoThumbnailLoader(QObject):
             if key != self.active:
                 pending[key] = tuple(photo["base"]["raw"])
         self.current, self.pending = current, pending
+        self.cache = {key: icon for key, icon in self.cache.items() if current.get(key[0]) == key}
         if self.active is None:
             self.timer.start(0)
 

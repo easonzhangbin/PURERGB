@@ -67,18 +67,24 @@ def render_interactive_post(owner, request, recipe, mode):
     neutral.pop("output_orientation", None)
     neutral = checked_recipe(neutral)
     neutral_request = {**request, "draft_recipe": neutral, "controls": _controls(neutral, mode)}
+    neutral_request.pop("interactive_edge", None)
     # Unsupported Native film/spatial combinations keep the original full-grid
     # fallback. Their settings are never removed to manufacture eligibility.
     baseline = owner.density_preview.try_render(neutral_request, neutral, mode)
+    if baseline is None and neutral.get("measurement_method") == "negpy":
+        from .native_original_preview import try_original_density_screen
+
+        baseline = try_original_density_screen(owner, neutral_request, neutral, mode)
     if baseline is None:
         return None
     checkpoint()
     step = owner.sample_step
     owner.density_preview._progress("interactive_post", 0.96, "正在更新交互预览；完整源密度测量保持不变…")
     current, reference, icc = baseline
-    current, current_receipt = post_codes(current, document, sample_step=step)
+    current, current_receipt = post_codes(current, document, sample_step=step, collect_ranges=False)
     checkpoint()
-    reference, _ = post_codes(reference, _geometry_document(recipe, mode), sample_step=step)
+    reference, _ = post_codes(reference, _geometry_document(recipe, mode),
+                              sample_step=step, collect_ranges=False)
     checkpoint()
     direction = recipe.get("output_orientation")
     current, reference = orient_codes(current, direction), orient_codes(reference, direction)

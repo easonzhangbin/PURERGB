@@ -51,7 +51,8 @@ def native_usm_supported(config):
 
 
 def render_frozen_sample(runner, source, *, rectangle=None, sample_step=1, certificate=None,
-                         render_config=None, float_output=False, sampling_policy="point"):
+                         render_config=None, float_output=False, sampling_policy="point",
+                         print_ev=0.0):
     """Return exact RGB16 final-grid samples, or None for non-point finishing."""
     from negpy.domain.interfaces import PipelineContext
     from negpy.kernel.system.config import render_scale_factor
@@ -104,7 +105,7 @@ def render_frozen_sample(runner, source, *, rectangle=None, sample_step=1, certi
     # A fresh point engine cannot borrow a previous tile's stage arrays.
     engine = _SpatialEngine(runner._metrics, runner._sha256, log_domain=domain)
     key = json.dumps([runner._sha256, roi, sample_step, effective.to_dict()], sort_keys=True)
-    image = engine.process(sample, effective, key, context)
+    image = engine.process(sample, effective, key, context, print_ev=print_ev)
     if not np.isfinite(image).all() or image.shape != sample.shape:
         raise ValueError("Frozen point renderer returned invalid pixels")
     pixels = (np.ascontiguousarray(image, dtype=np.float32) if float_output else
@@ -141,6 +142,14 @@ class DensityPreviewCache:
         self.session = self.certificate = None
         self.entries = OrderedDict()
         self.samples = OrderedDict()
+        self.engine_proxy_samples = OrderedDict()
+        self.original_base_samples = OrderedDict()
+        self.original_meter_values = OrderedDict()
+        self.original_companion = None
+        self.original_screen_base = None
+        self.native_meter_proxy = None
+        self.native_metal_tone = None
+        self.interactive_metal_tone = None
         self.source_prepare_calls = self.measurement_calls = 0
         self.last_receipt = None
         self.references = OrderedDict()
@@ -175,11 +184,26 @@ class DensityPreviewCache:
 
         emit(type="progress", stage=stage, fraction=fraction, message=message)
 
+    def remember_original_base(self, key, visible, metrics, roi):
+        """Retain only the immutable display grid and full-grid readouts."""
+        from .output_orientation_cache import cache_budget_bytes
+
+        budget = min(64 * 1024**2, cache_budget_bytes())
+        if visible.nbytes > budget:
+            return np.array(visible, order="C", copy=True)
+        while (len(self.original_base_samples) >= 3
+               or visible.nbytes + sum(sample.nbytes for sample, _, _ in self.original_base_samples.values()) > budget):
+            self.original_base_samples.popitem(last=False)
+        sample = np.frombuffer(visible.tobytes(), dtype=visible.dtype).reshape(visible.shape)
+        self.original_base_samples[key] = (sample, deepcopy(metrics), roi)
+        return sample
+
     def prepare_source(self):
+        decoded_certificate = None
         if self.session is None:
             from types import SimpleNamespace
             from . import workflow_render
-            from .decoded_cache import render_decode_context
+            from .decoded_cache import render_decode_context, source_anchor
             from .flatfield import attach_calibration
             from .raw_import import is_standard_import, validate_frozen_import
 
@@ -211,19 +235,10 @@ class DensityPreviewCache:
                 # The saved run's import receipt anchors the decoded-RAW cache:
                 # a cached source is only restored when it matches that proven
                 # decode, otherwise this re-decodes exactly as before.
-                anchor = {
-                    "source_shape": manifest.get("source_shape"),
-                    "raw_import_receipt": manifest.get("raw_import_receipt"),
-                }
-                if recipe.get("flatfield"):
-                    capture = (manifest.get("calibration") or {}).get("provenance") or {}
-                    anchor["flatfield_reference_shape"] = (
-                        (capture.get("capture") or {}).get("sensor_shape")
-                    )
                 decode_cache = render_decode_context(
                     {"inputs": self.owner.records,
                      "calibration": manifest.get("calibration")},
-                    recipe, anchor,
+                    recipe, source_anchor(manifest), frozen=True,
                 )
                 open_cache = (
                     decode_cache
@@ -289,6 +304,8 @@ class DensityPreviewCache:
                             )
                 if hasattr(processor, "pure_raw_import_token"):
                     validate_frozen_import(processor, self.owner.manifest, source)
+                if decode_cache is not None:
+                    decoded_certificate = decode_cache.take_source_certificate(source)
                 session = SimpleNamespace(processor=processor, config=config, source=source)
                 self.source_prepare_calls += 1
             else:
@@ -306,7 +323,7 @@ class DensityPreviewCache:
                 ("".join(record["sha256"] for record in self.owner.records)
                  + getattr(session.processor, "pure_raw_import_token", "")).encode()
             ).hexdigest()
-            self.certificate = ImmutableSourceCertificate.create(session.source)
+            self.certificate = decoded_certificate or ImmutableSourceCertificate.create(session.source)
             original = session.source
             session.source = self.certificate.source
             # Retain the actual pinned processor's metadata/import cache while
@@ -445,7 +462,7 @@ class DensityPreviewCache:
         found["runner"]._validate()
         return found
 
-    def _exact_usm_float(self, entry, runner, render_config, rectangle, step):
+    def _exact_usm_float(self, entry, runner, render_config, rectangle, step, *, print_ev=0.0):
         from .native_usm_sample_v46 import render_original_usm_band
 
         height, width = entry["source"].shape[:2]
@@ -454,10 +471,12 @@ class DensityPreviewCache:
         output = np.empty((len(ys), len(xs), 3), dtype=np.float32)
         rows = max(1, 1048576 // width)
         for start in sorted(set((ys // rows * rows).tolist())):
-            band_key = _key([runner._sha256, render_config.to_dict(), start])
+            band_key = _key([runner._sha256, render_config.to_dict(), start, print_ev])
             band = self.usm_bands.get(band_key)
             if band is None:
-                image, receipt = render_original_usm_band(runner, entry["source"], render_config, start)
+                image, receipt = render_original_usm_band(
+                    runner, entry["source"], render_config, start, print_ev=print_ev
+                )
                 band = dict(image=np.frombuffer(image.tobytes(), dtype=np.float32).reshape(image.shape), receipt=receipt)
                 self.usm_bands[band_key] = band
                 self.native_sample_pixels += receipt["processed_pixels"]
@@ -476,23 +495,26 @@ class DensityPreviewCache:
 
         return output, working_icc_bytes()
 
-    def _point_float(self, entry, runner, render_config, rectangle, step, key, *, exact=True):
+    def _point_float(self, entry, runner, render_config, rectangle, step, key, *, exact=True,
+                     print_ev=0.0):
         """Private immutable F32 samples, before the high/float one-quantizer join."""
         runner._validate()
         entry["certificate"].validate(entry["source"], runner._identity)
         if entry["domain"] is not None:
             entry["domain"].validate()
         usm = native_usm_supported(render_config)
-        key = _key([key, render_config.to_dict(), rectangle, step, exact if usm else True])
+        key = _key([key, render_config.to_dict(), rectangle, step, exact if usm else True, print_ev])
         found = self.float_samples.get(key)
         if found is None:
             if usm and exact:
-                image, icc = self._exact_usm_float(entry, runner, render_config, rectangle, step)
+                image, icc = self._exact_usm_float(
+                    entry, runner, render_config, rectangle, step, print_ev=print_ev
+                )
             else:
                 image, icc, _ = render_frozen_sample(runner, entry["source"],
                     rectangle=rectangle, sample_step=step, certificate=entry["certificate"],
                     render_config=render_config, float_output=True,
-                    sampling_policy="screen-usm" if usm else "point")
+                    sampling_policy="screen-usm" if usm else "point", print_ev=print_ev)
                 self.native_sample_pixels += int(image.shape[0] * image.shape[1])
                 if runner is entry["runner"]:
                     self.base_sample_render_calls += 1
@@ -523,19 +545,30 @@ class DensityPreviewCache:
         self.protection_samples.move_to_end(key)
         return item
 
-    def _native_join_sample(self, entry, render_config, reference, highlight, point, rectangle, step, *, exact=True):
+    def _native_join_sample(self, entry, render_config, reference, highlight, point, rectangle, step, *,
+                            exact=True, print_ev=0.0):
         from negpy.kernel.image.logic import _to_uint16_jit
         from .highlight_sample_v46 import compose_native_sample
 
-        image, icc = self._point_float(entry, entry["runner"], render_config, rectangle, step, entry["key"], exact=exact)
+        image, icc = self._point_float(
+            entry, entry["runner"], render_config, rectangle, step, entry["key"], exact=exact, print_ev=print_ev
+        )
         ref = None
         if reference is not None:
             ref_config = replace(reference["runner"]._effective, exposure=render_config.exposure,
                                  lab=render_config.lab, toning=render_config.toning)
-            ref, other = self._point_float(entry, reference["runner"], ref_config, rectangle, step, reference["key"], exact=exact)
+            ref, other = self._point_float(
+                entry, reference["runner"], ref_config, rectangle, step, reference["key"],
+                exact=exact, print_ev=print_ev
+            )
             if other != icc:
                 raise ValueError("Frozen highlight reference ICC differs from the Native base")
         mask_args = entry["key"], entry["source"].shape
+        # Experimental spatial metering uses its authenticated reference
+        # packet. The alternate pre-clip density render is for ordinary C41.
+        if highlight and "reference_density_offset" in highlight:
+            highlight = {key: value for key, value in highlight.items()
+                         if key != "reference_density_offset"}
         controls = highlight or {}
         protection = self._highlight_mask(*mask_args, "protection", controls.get("protection"), rectangle, step)
         effect = self._highlight_mask(*mask_args, "effect_area", controls.get("effect_area"), rectangle, step)
@@ -549,13 +582,15 @@ class DensityPreviewCache:
                 receipt["effect_sampling"] = effect.receipt
         return _to_uint16_jit(image), icc, receipt
 
-    def _reference(self, recipe, mode, rectangle, step, direction, fallback, icc):
-        from .draft_preview import _geometry_document
+    def _reference(self, recipe, mode, rectangle, step, direction, fallback, icc, *, share=False):
+        from .draft_preview import _geometry_document, _identity, defer_comparison
         from .output_orientation import orient_reference, orient_codes
         from .preview_data import verified_pixels
         from .workspace import output_rectangle
         from .native_draft_preview_v40 import resolved_saved_recipe
 
+        if defer_comparison(self.owner):
+            return fallback
         record = self.owner.manifest["results"].get(mode)
         if record is None or _geometry_document(self.owner.recipe, mode):
             self.owner.reference_label = "调整前（当前测量）"
@@ -566,15 +601,20 @@ class DensityPreviewCache:
         if not (a <= x0 < x1 <= c and b <= y0 < y1 <= d):
             self.owner.reference_label = "调整前（当前测量）"
             return fallback.copy()
-        from .draft_preview import _identity
-
         identity = _identity(record["path"])
         key = _key([record, rectangle, step, direction])
         cached = self.references.get(key)
         if cached is not None and cached["identity"] == identity:
             self.owner.reference_label = "已保存版本"
-            return cached["pixels"].copy()
-        pixels, other = verified_pixels(record)
+            return cached["pixels"] if share else cached["pixels"].copy()
+        anchor = getattr(self.owner, "anchor", None)
+        if (anchor is not None and anchor.get("owned") is False
+                and anchor["record"] == record and anchor["identity"] == identity
+                and anchor.get("pixels") is not None):
+            # The matching saved anchor already verified this immutable buffer.
+            pixels, other = anchor["pixels"], anchor["icc"]
+        else:
+            pixels, other = verified_pixels(record)
         after = _identity(record["path"])
         if after != identity:
             identity = after
@@ -588,10 +628,12 @@ class DensityPreviewCache:
         while len(self.references) > 2:
             self.references.popitem(last=False)
         self.owner.reference_label = "已保存版本"
-        return reference.copy()
+        return self.references[key]["pixels"] if share else reference.copy()
 
     def try_render(self, request, recipe, mode):
+        from .native_headroom import native_local_highlight, print_exposure_receipt
         from .preview_grid import post_requires_full_grid
+        from .professional_controls import native_print_ev
         from .workspace import output_rectangle
         from .viewport_preview_v43 import output_size_for_recipe, checked_viewport, source_rectangle_for_viewport
         from .flex_draft_preview_v40 import oriented_source_sample_roi
@@ -615,15 +657,23 @@ class DensityPreviewCache:
             rectangle = source_rectangle_for_viewport(rectangle, direction, viewport)
             step = viewport["sample_step"]
         else:
-            step = max(1, (max(size) + 1399) // 1400)
-        phase_roi = oriented_source_sample_roi(rectangle, direction, step)
+            fit_edge = request.get("fit_edge", 1400) if mode == "native" else 1400
+            step = max(1, (max(size) + fit_edge - 1) // fit_edge)
         with span("preview_density_entry", mode=mode, sample_step=step):
             selected = self._entry(recipe, mode)
         if selected is None:
             return None
         entry, render_config = selected
-        highlight = recipe.get("highlight_controls") if mode == "native" else None
+        interactive = bool(viewport is None and request.get("interactive_edge")
+                           and entry["cache_hit"])
+        if interactive:
+            edge = request["interactive_edge"]
+            factor = max(1, (max(size) + edge * step - 1) // (edge * step))
+            step *= factor
+        phase_roi = oriented_source_sample_roi(rectangle, direction, step)
+        highlight = native_local_highlight(recipe) if mode == "native" else None
         point = recipe.get("native_float_controls") if mode == "native" else None
+        print_ev = native_print_ev(recipe) if mode == "native" else 0.0
         if highlight and highlight.get("automatic_reference"):
             from .highlight_workflow import resolve_spatial_highlight_reference
             from .metering_snapshot import restore_zonal_metering
@@ -651,7 +701,7 @@ class DensityPreviewCache:
                      else recipe.get("flex_research_controls") if mode == "flex-endpoint" else None)
         sample_key = _key([entry["key"], mode, color_doc,
                           render_config.to_dict() if mode != "flex-endpoint" else None,
-                          phase_roi, step, direction, highlight, point, exact_neighborhood if usm else True])
+                          phase_roi, step, direction, highlight, point, exact_neighborhood if usm else True, print_ev])
         cached = self.samples.get(sample_key)
         icc = None
         if cached is None:
@@ -670,11 +720,11 @@ class DensityPreviewCache:
             elif mode == "native" and (highlight or point or usm):
                 pixels, icc, joined = self._native_join_sample(
                     entry, render_config, reference_entry, highlight, point, phase_roi, step,
-                    exact=exact_neighborhood)
+                    exact=exact_neighborhood, print_ev=print_ev)
             else:
                 result = render_frozen_sample(entry["runner"], entry["source"],
                     rectangle=phase_roi, sample_step=step, certificate=entry["certificate"],
-                    render_config=render_config)
+                    render_config=render_config, print_ev=print_ev)
                 if result is None:
                     return None
                 pixels, icc, _ = result
@@ -696,8 +746,12 @@ class DensityPreviewCache:
             while len(self.samples) > 3:
                 self.samples.popitem(last=False)
         pixels, icc = cached["pixels"], cached["icc"]
-        reference = self._reference(recipe, mode, phase_roi, step, direction, pixels, icc)
         current = self.owner._finish(pixels, recipe, mode)
+        if interactive:
+            self.owner.reference_label = ""
+            reference = current
+        else:
+            reference = self._reference(recipe, mode, phase_roi, step, direction, pixels, icc)
         self.certificate.validate()
         if entry["domain"] is not None:
             entry["domain"].validate()
@@ -712,6 +766,17 @@ class DensityPreviewCache:
             report=entry["snapshot"]["automatic_result"] or {},
             zones=metering_zone_records(entry["snapshot"]["window"]),
             **({"highlight_reference_roi": highlight["reference_roi"]} if highlight else {})))
+        if interactive:
+            self.owner.preview_quality = {
+                **(self.owner.preview_quality or {}),
+                "mode": "density-screen",
+                "approximate": True,
+                "interactive_frame": True,
+                "label": "拖动预览",
+                "sample_step": step,
+                "full_output_size": size,
+                "full_support_measurement": True,
+            }
         self.last_receipt = dict(route="full-support-frozen-then-point-grid", full_support_measured=True,
             measurement_cache_hit=entry["cache_hit"], source_prepare_calls=self.source_prepare_calls,
             measurement_calls=self.measurement_calls, sample_pixels=int(current.shape[0] * current.shape[1]),
@@ -720,7 +785,7 @@ class DensityPreviewCache:
             native_reference_sample_calls=self.reference_sample_render_calls,
             native_evaluated_pixels=self.native_sample_pixels,
             native_neighborhood="original-width-original-band-USM" if usm and exact_neighborhood else "screen-grid-USM" if usm else None,
-            approximate=bool(usm and not exact_neighborhood),
+            approximate=bool(interactive or (usm and not exact_neighborhood)),
             highlight_reference_roi=deepcopy(highlight["reference_roi"]) if highlight else None,
             highlight_reference_window=(asdict(reference_entry["window"]) if reference_entry else None),
             native_join_processing=deepcopy(cached["native_join_receipt"]),
@@ -732,10 +797,16 @@ class DensityPreviewCache:
             exact_leaf_hits=entry["certificate"].leaf_hits, exact_leaf_misses=entry["certificate"].leaf_misses,
             density_domain="native-c41-sdk-unmixed-log-density-v45" if entry["domain"] else "linear-selected-sensor-bands",
             measurement_window=deepcopy(entry["snapshot"]["window"]))
+        if print_ev:
+            self.last_receipt["native_print_exposure"] = print_exposure_receipt(print_ev)
         self._progress("sampled_encode", 0.94, "预览处理完成，正在准备屏幕显示…")
+        if interactive:
+            return current, current, icc
         return np.array(current, copy=True), np.array(reference, copy=True), icc
 
     def close(self):
+        self._close_native_metal()
+        self.native_meter_proxy = None
         self.entries.clear()
         self.float_samples.clear()
         self.protection_samples.clear()
@@ -744,6 +815,10 @@ class DensityPreviewCache:
             domain.close()
         self.film_domains.clear()
         self.samples.clear()
+        self.engine_proxy_samples.clear()
+        self.original_base_samples.clear()
+        self.original_meter_values.clear()
+        self.original_companion = None
         self.references.clear()
         if self.session is not None and self.session.processor is not None:
             self.session.processor.cleanup()
@@ -753,21 +828,38 @@ class DensityPreviewCache:
             self.certificate.close()
         self.certificate = None
 
+    def _close_native_metal(self):
+        for metal in (self.native_metal_tone, self.interactive_metal_tone):
+            if metal is not None:
+                metal.close()
+        self.native_metal_tone = self.interactive_metal_tone = None
+        self.original_screen_base = None
+
     @property
     def cache_report(self):
+        samples = (*self.samples.values(), *self.engine_proxy_samples.values())
         return dict(retained_source_bytes=int(self.session.source.nbytes) if self.certificate else 0,
-                    derived_bytes=sum(item["pixels"].nbytes for item in self.samples.values()
+                    derived_bytes=sum(item["pixels"].nbytes for item in samples
                                       if "pixels" in item)
-                        + sum(item["encoded"].nbytes for item in self.samples.values()
+                        + sum(item["encoded"].nbytes for item in samples
                               if "encoded" in item)
+                        + sum(item["drag_finish"][1].nbytes for item in samples
+                              if "drag_finish" in item)
+                        + sum(sample.nbytes for sample, _, _ in self.original_base_samples.values())
+                        + (self.original_companion[1]["encoded"].nbytes if self.original_companion else 0)
+                        + sum(value.nbytes for metrics, _ in self.original_meter_values.values()
+                              for value in metrics.values() if isinstance(value, np.ndarray))
+                        + (self.native_meter_proxy[2].nbytes if self.native_meter_proxy is not None else 0)
+                        + sum(metal.retained_cpu_bytes for metal in (self.native_metal_tone, self.interactive_metal_tone)
+                              if metal is not None)
                         + sum(reference["encoded"].nbytes
-                              for item in self.samples.values()
+                              for item in samples
                               if (reference := item.get("highlight_reference")) is not None)
-                        + sum(result["pixels"].nbytes for item in self.samples.values()
+                        + sum(result["pixels"].nbytes for item in samples
                               if (result := item.get("highlight_reference", {}).get("result")) is not None)
-                        + sum(item["nikon_cms"]["pixels"].nbytes for item in self.samples.values()
+                        + sum(item["nikon_cms"]["pixels"].nbytes for item in samples
                               if "nikon_cms" in item)
-                        + sum(item["flex_legacy"]["pixels"].nbytes for item in self.samples.values()
+                        + sum(item["flex_legacy"]["pixels"].nbytes for item in samples
                               if "pixels" in item.get("flex_legacy", {}))
                         + sum(item["pixels"].nbytes for item in self.references.values())
                         + sum(item["image"].nbytes for item in self.float_samples.values())
@@ -777,6 +869,8 @@ class DensityPreviewCache:
                         + (self.certificate.derived_bytes if self.certificate else 0))
 
     def clear_derived(self):
+        self._close_native_metal()
+        self.native_meter_proxy = None
         self.entries.clear()
         self.float_samples.clear()
         self.protection_samples.clear()
@@ -785,6 +879,10 @@ class DensityPreviewCache:
             domain.close()
         self.film_domains.clear()
         self.samples.clear()
+        self.engine_proxy_samples.clear()
+        self.original_base_samples.clear()
+        self.original_meter_values.clear()
+        self.original_companion = None
         self.references.clear()
         if self.certificate is not None:
             self.certificate.grids.clear()

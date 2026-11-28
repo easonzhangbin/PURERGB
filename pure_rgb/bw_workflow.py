@@ -199,7 +199,7 @@ def _cropped(pixels, recipe, roi, *, apply_orientation=True, preview=False):
     if document:
         from .positive_post import post_codes
 
-        result, _ = post_codes(result, document, sample_step=1)
+        result, _ = post_codes(result, document, sample_step=1, collect_ranges=False)
     if apply_orientation and recipe.get("output_orientation"):
         from .output_orientation import orient_codes
 
@@ -243,11 +243,16 @@ def render_bw(request, *, emit_callback=None):
         report["bw_source_receipt"] = deepcopy(processor.pure_bw_source_receipt)
         report["bw_input_config"] = base.to_dict()
         config = _configured(base, recipe)
-        if recipe["roi"] is None and type(request.get("import_stage")) is int:
+        if recipe["roi"] is None and (type(request.get("import_stage")) is int
+                                      or request.get("auto_import") is True):
             from .workflow_geometry_preview import write_geometry_previews
 
             locators = write_geometry_previews(source, out, monochrome=True)
-            region = _study_picture_region(source, None, locators)
+            region = _study_picture_region(
+                source, None, locators,
+                automatic_import=request.get("auto_import") is True,
+                frame_roi=recipe.get("output_roi") if recipe.get("crop") else None,
+            )
             region["coordinate_space"] = "EXIF-oriented single RAW linear source; half-open xyxy"
             report["picture_region"] = region
             roi = list(region["analysis_roi"])
