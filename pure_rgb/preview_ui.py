@@ -266,6 +266,13 @@ class Canvas(QWidget):
         self._detail_roi = None
         self.update()
 
+    def refresh_detail_comparison(self):
+        if self.detail_enabled and (self._detail_pending is not None
+                                    or self._detail_current is not None and self._detail_reference is None):
+            self.clear_detail()
+            if not self.fit_mode or (self.photo_lens and self.photo_lens.active):
+                self._schedule_detail(0)
+
     def detail_failed(self, request_id):
         if self._detail_pending and self._detail_pending["request_id"] == request_id:
             self._detail_pending = None
@@ -397,14 +404,15 @@ class Canvas(QWidget):
         self.update()
 
     def set_interactive_image(self, image, mode_text=None):
-        if self.interactive_image is image and self.interactive_mode_text == mode_text:
+        mode_changed = self.interactive_mode_text != mode_text
+        if self.interactive_image is image and not mode_changed:
             return
         self.interactive_image = image
         self.interactive_mode_text = mode_text if image is not None else None
         if image is not None:
             # This packet arrives on the GUI thread already colour-managed.
             # Present it in this event instead of waiting for a second update.
-            if mode_text:
+            if mode_changed:
                 self.repaint()
             else:
                 self.repaint_interactive_image()

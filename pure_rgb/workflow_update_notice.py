@@ -85,8 +85,8 @@ class UpdateNotice(QWidget):
         self._release_url = f"{release.RELEASES_URL}/tag/v{release.APP_VERSION}"
         self.message.setText(
             f"已更新到 PURE RGB {release.APP_VERSION}\n"
-            "高光找回使用负片密度，印相曝光调整亮度时保留原有色彩比例。\n"
-            "拖动滑杆先更新轻量预览，松手后刷新清晰画面。切换引擎和裁切也更快。"
+            "裁切、拉直和翻转可以沿用已有密度，100% 优先更新可见区域的原像素。\n"
+            "切换 Nikon CMS 或 FlexColor 时，先显示所选引擎的预览，再刷新细节。"
         )
         self.open_button.setText("查看更新说明")
         self.show()

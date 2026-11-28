@@ -165,12 +165,27 @@ def _checked_preview_request(request):
         or request.get("release_priority")
     ):
         raise ValueError("引擎快速预览仅支持独立的小尺寸适应窗口请求")
+    defer_repair = request.get("defer_repair") is True
+    if "defer_repair" in request and (
+        not defer_repair or mode != "native" or not request.get("repair_plan")
+        or "interactive_edge" not in request or "metering_edit" in request
+        or request.get("engine_proxy") or request.get("release_priority")
+    ):
+        raise ValueError("除尘只可延后到原生拖动预览结束时重放")
     if "defer_reference" in request and (
         request["defer_reference"] is not True or "draft_recipe" not in request
-        or full_resolution or "viewport" in request or request.get("crop_locator")
-        or request.get("repair_plan") is not None or "interactive_edge" in request
+        or full_resolution or request.get("crop_locator")
+        or (request.get("repair_plan") is not None and mode != "native"
+            and "viewport" not in request)
+        or "interactive_edge" in request
     ):
-        raise ValueError("延后对比参考仅支持无修补的普通适应窗口预览")
+        raise ValueError("延后对比参考仅支持普通适应窗口与局部高清预览")
+    if "crop_source_grid" in request and (
+        request["crop_source_grid"] is not True or not request.get("crop_locator")
+        or "draft_recipe" not in request
+        or full_resolution or "viewport" in request or "interactive_edge" in request
+    ):
+        raise ValueError("裁切源网格仅适用于裁切定位预览")
     for field, minimum, label in (
         ("fit_edge", 1400, "适应窗口预览"),
         ("interactive_edge", 256, "拖动预览"),
@@ -180,12 +195,43 @@ def _checked_preview_request(request):
         edge = request[field]
         if type(edge) is not int or not minimum <= edge <= MAX_FIT_EDGE:
             raise ValueError(f"{label}长边必须为 {minimum} 到 {MAX_FIT_EDGE} 像素的整数")
+        repaired_engine_proxy = (
+            field == "interactive_edge" and request.get("engine_proxy") is True
+            and mode in ("cool-shared-rgb", "flex-endpoint")
+        )
+        repair_supported = repaired_engine_proxy or (
+            mode == "native" and (field == "fit_edge" or defer_repair)
+        )
         if ((field == "fit_edge" and mode != "native")
                 or not request.get("tone_edit") or "draft_recipe" not in request
                 or full_resolution or "viewport" in request or request.get("crop_locator")
-                or request.get("repair_plan") is not None):
-            raise ValueError(f"{label}尺寸只适用于无修补的适应窗口调色")
+                or (request.get("repair_plan") is not None and not repair_supported)):
+            raise ValueError(f"{label}尺寸不适用于此预览请求")
     return controls, mode, full_resolution
+
+
+def _finish_preview_repair(request, session, pixels, reference, icc):
+    quality = getattr(session, "preview_quality", None)
+    plan = request.get("repair_plan")
+    if plan is None:
+        return pixels, reference, None, quality
+    if (request.get("defer_repair") is True and (quality or {}).get("interactive_frame") is True
+            and max(pixels.shape[:2]) <= request["interactive_edge"]):
+        from .repair_plan import validate_frame
+
+        validate_frame(plan, request["draft_recipe"], session.manifest, request["mode"])
+        return pixels, pixels, None, {**quality, "repair_deferred": True,
+                                       "label": "拖动预览 · 松手后应用除尘"}
+    if request.get("defer_reference") is True and getattr(session, "reference_deferred", False):
+        reference = pixels
+    from .repair_pipeline import preview_repair
+
+    with span("confirmed_repair_preview", token=request["token"]):
+        pixels, reference, provenance = preview_repair(
+            request, session, pixels, reference, icc,
+            on_progress=lambda progress: emit(**progress),
+        )
+    return pixels, reference, provenance, quality
 
 
 def emit(**data):
@@ -907,7 +953,7 @@ class Session:
         return pixels, reference, icc
 
 
-def _write_preview_records(directory, token, pixels, reference, icc):
+def _write_preview_records(directory, token, pixels, reference, icc, *, current_only=False):
     """Write both protocol paths, reusing the encoding for identical images."""
     records = []
     paths = []
@@ -918,8 +964,9 @@ def _write_preview_records(directory, token, pixels, reference, icc):
         and np.array_equal(pixels[::64, ::64], reference[::64, ::64])
         and np.array_equal(pixels, reference)
     )
+    frames = (("current", pixels),) if current_only else (("current", pixels), ("reference", reference))
     try:
-        for suffix, image in (("current", pixels), ("reference", reference)):
+        for suffix, image in frames:
             path = Path(directory) / f"{token}-{suffix}.tiff"
             paths.append(path)
             copied = False
@@ -950,7 +997,7 @@ def _write_preview_records(directory, token, pixels, reference, icc):
         for path in paths:
             path.unlink(missing_ok=True)
         raise
-    return records
+    return [records[0], dict(records[0])] if current_only else records
 
 
 def main():
@@ -968,6 +1015,7 @@ def main():
         worker_received_ns = time.monotonic_ns()
         request = None
         records = []
+        crop_source_record = None
         metering_path = None
         delivered = False
         try:
@@ -985,6 +1033,10 @@ def main():
                 token=request.get("token"),
                 mode=request.get("mode"),
                 full_resolution=request.get("full_resolution", False),
+                viewport="viewport" in request,
+                crop_locator=request.get("crop_locator") is True,
+                engine_proxy=request.get("engine_proxy") is True,
+                defer_reference=request.get("defer_reference") is True,
             )
             started = time.monotonic()
             from .draft_preview import DraftPreview
@@ -1031,15 +1083,10 @@ def main():
                 span("preview_render", token=request["token"], mode=request["mode"]),
             ):
                 pixels, reference, icc = session.render(request)
-                repair_provenance = None
-                if request.get("repair_plan") is not None:
-                    from .repair_pipeline import preview_repair
-
-                    with span("confirmed_repair_preview", token=request["token"]):
-                        pixels, reference, repair_provenance = preview_repair(
-                            request, session, pixels, reference, icc,
-                            on_progress=lambda progress: emit(**progress),
-                        )
+                crop_source = pixels if request.get("crop_source_grid") and request.get("repair_plan") else None
+                pixels, reference, repair_provenance, quality = _finish_preview_repair(
+                    request, session, pixels, reference, icc,
+                )
             incoming.check()
             event(
                 "preview_rendered",
@@ -1048,7 +1095,6 @@ def main():
                 shape=list(pixels.shape),
                 **({"resources": resources.report()} if resources is not None else {}),
             )
-            quality = getattr(session, "preview_quality", None)
             interactive = "interactive_edge" in request and (quality or {}).get("interactive_frame") is True
             reference_deferred = request.get("defer_reference") is True and getattr(session, "reference_deferred", False)
             current_only = interactive or reference_deferred
@@ -1056,7 +1102,8 @@ def main():
                 reference = pixels
             if interactive and max(pixels.shape[:2]) > request["interactive_edge"]:
                 raise ValueError("拖动预览超出请求的采样尺寸")
-            if can_transport_fit(request, pixels, reference, icc):
+            if can_transport_fit(request, pixels, reference, icc,
+                                 repair_ready=repair_provenance is not None or bool((quality or {}).get("repair_deferred"))):
                 try:
                     records = write_fit_records(
                         request["directory"], request["token"], pixels, reference, icc,
@@ -1070,8 +1117,19 @@ def main():
                 if interactive:
                     raise ValueError("拖动预览未生成可交接的 RGB16 像素")
                 records = _write_preview_records(
-                    request["directory"], request["token"], pixels, reference, icc
+                    request["directory"], request["token"], pixels, reference, icc,
+                    current_only=request.get("viewport") is not None and reference_deferred,
                 )
+            if crop_source is not None and can_transport_fit(
+                request, crop_source, crop_source, icc, repair_ready=True,
+            ):
+                try:
+                    crop_source_record = write_fit_records(
+                        request["directory"], f"{request['token']}-crop-source", crop_source, crop_source, icc,
+                        current_only=True,
+                    )[0]
+                except OSError as error:
+                    event("crop_source_grid_unavailable", token=request["token"], reason=str(error))
             if repair_provenance is not None:
                 records[0].update(outside_mask_changed_pixels=0, repair_replay=repair_provenance)
                 quality = {
@@ -1106,6 +1164,7 @@ def main():
                 type="result",
                 token=request["token"],
                 records=records,
+                **({"crop_source": crop_source_record} if crop_source_record is not None else {}),
                 **({"interactive_frame": True} if interactive else {}),
                 **({"reference_deferred": True} if reference_deferred else {}),
                 **({"visible_engine_binding": visible_binding} if visible_binding else {}),
@@ -1161,6 +1220,8 @@ def main():
             if not delivered:
                 for record in records:
                     Path(record["path"]).unlink(missing_ok=True)
+                if crop_source_record is not None:
+                    Path(crop_source_record["path"]).unlink(missing_ok=True)
                 if metering_path is not None:
                     metering_path.unlink(missing_ok=True)
             incoming.finish()

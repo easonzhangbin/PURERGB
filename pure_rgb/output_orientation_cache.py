@@ -62,6 +62,33 @@ def _identity(path):
     return stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
 
+def write_oriented_display_records(directory, token, lease, before, after, *, reference_deferred=False):
+    """Reorient a verified preview grid, preserving working ICC and sample scale."""
+    from .preview_data import verified_pixels
+    from .preview_fit_transport import FIT_TRANSPORT, MAX_FIT_EDGE, read_fit_record, write_fit_records
+
+    def read(record):
+        decode = read_fit_record if record.get("transport") == FIT_TRANSPORT else verified_pixels
+        pixels, icc = decode(record)
+        source_step = record.get("display_source_step", 1)
+        return sample_oriented(pixels, before, after, source_step), icc, source_step
+
+    current, reference = lease.current, lease.reference
+    pixels, icc, source_step = read(current)
+    if max(pixels.shape[:2]) > MAX_FIT_EDGE:
+        raise ValueError("方向预览画面超出适应窗口尺寸")
+    compared = pixels
+    if not reference_deferred and current["sha256"] != reference["sha256"]:
+        compared, other_icc, other_step = read(reference)
+        if compared.shape != pixels.shape or other_icc != icc or other_step != source_step:
+            raise ValueError("方向预览与对照画面的尺寸或ICC不一致")
+    records = write_fit_records(directory, token, pixels, compared, icc)
+    if current.get("outside_mask_changed_pixels") == 0:
+        # The old repaired pixels and its unchanged exterior are permuted alike.
+        records[0]["outside_mask_changed_pixels"] = 0
+    return records, lease.sample_step * source_step
+
+
 _CACHE_NAMES = ("_orientation_saved", "_orientation_completed")
 _DEFAULT_BUDGET_BYTES = 2 * 1024**3
 

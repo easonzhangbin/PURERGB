@@ -27,7 +27,12 @@ def output_size_for_recipe(recipe, source_shape, analysis_roi, mode):
     """Return a proven final size, or None for general geometry finishing."""
     values = recipe.get("post_controls", {}).get(mode, {}).get("values", {})
     if any(key.startswith("geometry.") for key in values):
-        return None
+        from .repair_geometry import frame_descriptor
+
+        try:
+            return frame_descriptor(recipe, {"source_shape": source_shape, "roi": analysis_roi}, mode)["output_size"]
+        except ValueError:
+            return None
     x0, y0, x1, y1 = output_rectangle(recipe, analysis_roi, source_shape)
     width, height = x1 - x0, y1 - y0
     direction = checked_document(recipe.get("output_orientation"))
@@ -158,26 +163,38 @@ def _saved_strip_tile(owner, record, identity, saved_roi, source_roi, direction,
     return sample_oriented(tile, saved_direction, direction, step), icc
 
 
-def _saved_tile(owner, recipe, mode, source_roi, step):
+def _saved_tile(owner, recipe, mode, source_roi, step, *, finished_size=None):
     """An unchanged saved color result can supply an exact viewport directly."""
     from .draft_preview import _saved_color_valid
 
     if mode not in owner.manifest["results"] or not _saved_color_valid(owner.manifest, mode):
         return None
     old, new = _color_recipe(owner.recipe, mode), _color_recipe(recipe, mode)
-    for doc in (old, new):
-        doc.pop("crop", None)
-        doc.pop("output_roi", None)
+    if finished_size is None:
+        for doc in (old, new):
+            doc.pop("crop", None)
+            doc.pop("output_roi", None)
     if old != new:
         return None
-    saved_roi = output_rectangle(owner.recipe, owner.manifest["roi"], owner.manifest["source_shape"])
+    saved_roi = ([0, 0, *finished_size] if finished_size is not None else
+                 output_rectangle(owner.recipe, owner.manifest["roi"], owner.manifest["source_shape"]))
     a, b, c, d = saved_roi
     x0, y0, x1, y1 = source_roi
     if not (a <= x0 < x1 <= c and b <= y0 < y1 <= d):
         return None
-    record = owner.manifest["results"][mode]
+    current, icc = read_saved_tile(
+        owner, owner.manifest["results"][mode], saved_roi, source_roi, recipe.get("output_orientation"), step,
+    )
+    owner.reference_label = "已保存版本"
+    owner.metering_receipt = owner._metering_receipt(owner.manifest, mode)
+    return current, current, icc
+
+
+def read_saved_tile(owner, record, saved_roi, source_roi, direction, step):
+    """Verify the saved raster and read a tile in its undirected output grid."""
+    a, b, c, d = saved_roi
+    x0, y0, x1, y1 = source_roi
     identity = _identity(record["path"])
-    direction = recipe.get("output_orientation")
     tile = _saved_strip_tile(owner, record, identity, saved_roi, source_roi, direction, step)
     if tile is None:
         pixels, icc = verified_pixels(record)
@@ -191,9 +208,7 @@ def _saved_tile(owner, recipe, mode, source_roi, step):
     if (hashlib.sha256(icc).hexdigest() != owner.manifest["icc_sha256"]
             or _identity(record["path"]) != identity):
         raise ValueError("高清参考成片与保存网格或身份不一致")
-    owner.reference_label = "已保存版本"
-    owner.metering_receipt = owner._metering_receipt(owner.manifest, mode)
-    return current, current, icc
+    return current, icc
 
 
 def render_viewport(owner, request, recipe=None, mode=None):
@@ -204,11 +219,20 @@ def render_viewport(owner, request, recipe=None, mode=None):
     if size is None:
         return None
     viewport = checked_viewport(request["viewport"], size)
-    if post_requires_full_grid(recipe.get("post_controls", {}).get(mode)):
-        return None
-    base_roi = output_rectangle(recipe, owner.manifest["roi"], owner.manifest["source_shape"])
-    source_roi = source_rectangle_for_viewport(base_roi, recipe.get("output_orientation"), viewport)
     step = viewport["sample_step"]
+    direction = recipe.get("output_orientation")
+    if post_requires_full_grid(recipe.get("post_controls", {}).get(mode)):
+        # A finished TIFF already includes every spatial effect and the
+        # resampling from straightening. Read in its finished coordinate grid.
+        finished_size = size[::-1] if direction and direction["quarter_turns"] % 2 else size
+        source_roi = source_rectangle_for_viewport([0, 0, *finished_size], direction, viewport)
+        result = _saved_tile(owner, recipe, mode, source_roi, step, finished_size=finished_size)
+        if result is None:
+            return None
+        owner.sample_step, owner.viewport_result, owner.output_size = step, viewport, size
+        return result
+    base_roi = output_rectangle(recipe, owner.manifest["roi"], owner.manifest["source_shape"])
+    source_roi = source_rectangle_for_viewport(base_roi, direction, viewport)
     tile_recipe = checked_recipe({**deepcopy(recipe), "crop": True, "output_roi": source_roi})
     result = _saved_tile(owner, recipe, mode, source_roi, step)
     if result is None and mode == "cool-shared-rgb" and recipe.get("nikon_research_controls"):
@@ -251,7 +275,7 @@ def render_viewport(owner, request, recipe=None, mode=None):
 
 
 def _color_anchor_tile(owner, recipe, mode, source_roi, step):
-    from .draft_preview import _anchor_recipe, _canonical, _verified_anchor_pixels
+    from .draft_preview import _anchor_recipe, _canonical, _verified_anchor_pixels, defer_comparison
 
     anchor_recipe = _anchor_recipe(recipe, mode)
     key = hashlib.sha256(_canonical([mode, anchor_recipe]).encode()).hexdigest()
@@ -267,8 +291,10 @@ def _color_anchor_tile(owner, recipe, mode, source_roi, step):
     before = pixels[y0:y1, x0:x1]
     sampled = sample_oriented(before, None, recipe.get("output_orientation"), step)
     current = owner._finish(sampled, recipe, mode)
-    reference = owner._reference(before, source_roi, recipe, mode, icc)
-    reference = sample_oriented(reference, None, recipe.get("output_orientation"), step)
+    reference = current
+    if not defer_comparison(owner):
+        reference = owner._reference(before, source_roi, recipe, mode, icc)
+        reference = sample_oriented(reference, None, recipe.get("output_orientation"), step)
     _verified_anchor_pixels(anchor, check_only=True)
     owner.metering_receipt = owner._metering_receipt(anchor["manifest"], mode)
     return np.array(current, copy=True), np.array(reference, copy=True), icc

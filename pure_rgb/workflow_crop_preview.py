@@ -76,7 +76,7 @@ def _configure_crop_handles(window):
     window.selection.crop_handles.configure(bounds, values.get("geometry.fine_rotation", 0))
 
 
-def _install(window, image, context, *, reference=False, scope_data=None):
+def _install(window, image, context, *, reference=False, scope_data=None, source_grid=None):
     if not _matches(window, context):
         return False
     photo = window.current_photo()
@@ -106,7 +106,7 @@ def _install(window, image, context, *, reference=False, scope_data=None):
     if is_crop:
         _configure_crop_handles(window)
     window.crop_locator_cache = dict(key=context["key"], image=image, context=deepcopy(context),
-                                    reference=reference, scope_data=scope_data)
+                                    reference=reference, scope_data=scope_data, source_grid=source_grid)
     window.crop_locator_context = deepcopy(context)
     window.canvas_stack.setCurrentWidget(window.selection)
     window.show_region_exit()
@@ -130,7 +130,8 @@ def refresh_crop_frame(window):
         _configure_crop_handles(window)
         return True
     return _install(window, cache["image"], cache["context"],
-                    reference=cache.get("reference", False), scope_data=cache.get("scope_data"))
+                    reference=cache.get("reference", False), scope_data=cache.get("scope_data"),
+                    source_grid=cache.get("source_grid"))
 
 
 def confirmed_crop_preview(window):
@@ -179,6 +180,133 @@ def confirmed_crop_preview(window):
     if min(x1 - x, y1 - y) < 2:
         return None
     return image.copy(x, y, x1 - x, y1 - y)
+
+
+def _sample_crop_grid(pixels, source, target, step):
+    """Map the existing locator grid into exact final-output coordinates."""
+    import cv2
+    import numpy as np
+
+    from .repair_geometry import _transform
+
+    grid_shape = tuple((extent + step - 1) // step for extent in source["output_size"][::-1])
+    if pixels.shape != (*grid_shape, 3) or source["source_shape"] != target["source_shape"]:
+        raise ValueError("裁切定位取样与当前源画幅不一致")
+    source_matrix, _ = _transform(source)
+    target_matrix, (width, height) = _transform(target)
+    # Map final sample centres through the source before interpolation. Fill
+    # stretched corners outside the actual crop with the renderer's black.
+    inverse = np.linalg.inv(target_matrix)
+    x = np.arange(0, width, step, dtype=np.float64)[None, :]
+    y = np.arange(0, height, step, dtype=np.float64)[:, None]
+
+    def coords(transform):
+        return tuple(a * x + b * y + c for a, b, c in transform[:2])
+
+    sx, sy = coords(inverse)
+    x0, y0, x1, y1 = target["rectangle"]
+    inside = (sx >= x0 - 1e-8) & (sx <= x1 - 1 + 1e-8) & (sy >= y0 - 1e-8) & (sy <= y1 - 1 + 1e-8)
+    map_x, map_y = coords((source_matrix @ inverse) / step)
+    sampled = cv2.remap(pixels, map_x.astype(np.float32), map_y.astype(np.float32),
+                        cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    sampled[~inside] = 0
+    return sampled
+
+
+def submit_crop_fit_preview(window):
+    """Submit a small, colour-matched crop/straighten preview without RAW processing."""
+    from types import SimpleNamespace
+
+    from .diagnostics import event
+    from .output_orientation import sample_oriented
+    from .preview_data import verified_pixels
+    from .preview_fit_transport import write_fit_records
+    from .preview_grid import post_requires_full_grid
+    from .preview_ui import Work
+    from .repair_geometry import frame_descriptor
+    from .repair_pipeline import preview_repair
+
+    photo, canvas = window.current_photo(), window.canvas
+    cache = getattr(window, "crop_locator_cache", None) or {}
+    cached_context = cache.get("context", {})
+    grid = cache.get("source_grid")
+    if (not grid or not photo or window.tasks.busy or window.geometry_role is not None
+            or not canvas.fit_mode or not canvas.current or canvas.split or window.compare.isChecked()
+            or (canvas.photo_lens and canvas.photo_lens.active)
+            or cached_context.get("photo") != photo["id"] or cached_context.get("engine") != photo["engine"]):
+        return False
+    engine, recipe = photo["engine"], window.project.recipe()
+    mode = RESULT_MODES[engine]
+    try:
+        locator = full_source_recipe(recipe, engine)
+        if (locator != cached_context.get("recipe")
+                or post_requires_full_grid(locator.get("post_controls", {}).get(mode))):
+            return False
+        manifest = json.loads(window.project.preview_base().read_text())
+        source, target = frame_descriptor(locator, manifest, mode), frame_descriptor(recipe, manifest, mode)
+        repair = window.project.repair_context(recipe=recipe)
+    except (OSError, ValueError):
+        return False
+    size, step = target["output_size"], grid["sample_step"]
+    if min(size) < step * 2:
+        return False
+    window.preview_timer.stop()
+    window.preview_scopes.cancel()
+    window.token += 1
+    token = window.token
+    window.live.invalidate(token)
+    window.preview_activity.start(token, "正在更新裁切与拉直预览…", stage="display", quiet_for=.18)
+    context = window.preview_context(recipe=recipe, repair_plan=repair)
+    context.update(output_size=size, reference_deferred=True, preview_quality=dict(
+        approximate=True, crop_proxy=True, label="已更新裁切与拉直预览",
+    ))
+    directory = window.live.directory
+
+    def check(_event=None):
+        if window.closing or token != window.token:
+            raise ValueError("裁切预览已被新的调整替换")
+
+    def render():
+        check()
+        source_grid = grid
+        if "record" in grid:
+            pixels, icc = verified_pixels(grid["record"])
+            pixels = sample_oriented(pixels, grid["direction"], locator.get("output_orientation"), step)
+            pixels.setflags(write=False)
+            source_grid = dict(pixels=pixels, icc=icc, sample_step=step)
+        pixels = _sample_crop_grid(source_grid["pixels"], source, target, step)
+        icc = source_grid["icc"]
+        provenance = None
+        if repair:
+            request = dict(draft_recipe=recipe, mode=mode, repair_plan=repair, directory=str(directory))
+            session = SimpleNamespace(manifest=manifest, output_size=size, sample_step=step)
+            pixels, _, provenance = preview_repair(request, session, pixels, pixels, icc, on_progress=check)
+        check()
+        records = write_fit_records(directory, token, pixels, pixels, icc, current_only=True)
+        if provenance is not None:
+            records[0].update(outside_mask_changed_pixels=0, repair_replay=provenance)
+        return records, source_grid
+
+    def shown(_, result):
+        records, source_grid = result
+        packet = dict(token=token, records=records, reference_deferred=True)
+        if window.closing or token != window.token or not window._preview_recipe_matches(context):
+            window.live.discard(packet)
+            return
+        cache["source_grid"] = source_grid
+        event("preview_crop_grid_reused", token=token, sample_step=step, repaired=bool(repair))
+        window.load_records(*records, sample_step=step, temporary=packet, context=context)
+
+    def failed(_, message):
+        if not window.closing and token == window.token and window._preview_recipe_matches(context):
+            event("preview_crop_grid_reuse_failed", token=token, message=message)
+            window.request_preview()
+
+    work = Work(token, render)
+    work.signals.done.connect(shown)
+    work.signals.failed.connect(failed)
+    window.pool.start(work)
+    return True
 
 
 def restore_crop_scopes(window):
@@ -297,7 +425,8 @@ def request_crop_frame(window):
     window.live.submit(dict(token=token, manifest=str(manifest), manifest_sha256=sha256(manifest),
                             mode=RESULT_MODES[context["engine"]], draft_recipe=context["recipe"],
                             controls=_controls(context["recipe"], RESULT_MODES[context["engine"]]),
-                            full_resolution=False, crop_locator=True, repair_plan=context["repair_plan"]))
+                            full_resolution=False, crop_locator=True, repair_plan=repair,
+                            **({"crop_source_grid": True} if context["locator_role"] == "crop" else {})))
     window.status_message("正在按当前 " + ENGINES[context["engine"]] + " 调色准备完整正像…")
     return True
 
@@ -315,7 +444,8 @@ def display_crop_record(window, token, record, context, *, sample_step=1, tempor
                         saved_direction=None, reference=False):
     """ICC conversion is asynchronous and bound to photo, recipe and monitor."""
     from .preview_ui import Work
-    from .output_orientation import _relative_document
+    from .output_orientation import _relative_document, sample_oriented
+    from .preview_fit_transport import FIT_TRANSPORT, MAX_FIT_EDGE, read_fit_record
     from .preview_requests_v44 import read_preview_metering
     from .workflow_display import DisplayTarget, named_reference_profile, profile_description
 
@@ -342,7 +472,25 @@ def display_crop_record(window, token, record, context, *, sample_step=1, tempor
                 image = image.transformed(QTransform().rotate(direction["quarter_turns"] * 90))
             if direction["flip_horizontal"] or direction["flip_vertical"]:
                 image = image.mirrored(direction["flip_horizontal"], direction["flip_vertical"])
-            return image, scopes, metering
+            source_grid = None
+            if not reference and context["locator_role"] == "crop":
+                source = (temporary or {}).get("crop_source") or (None if context["repair_plan"] else record)
+                if source is not None and source.get("transport") == FIT_TRANSPORT:
+                    try:
+                        pixels, icc = read_fit_record(source)
+                        pixels = sample_oriented(pixels, saved_direction, context["recipe"].get("output_orientation"))
+                        pixels.setflags(write=False)
+                        source_grid = dict(pixels=pixels, icc=icc, sample_step=sample_step)
+                    except (OSError, ValueError) as error:
+                        from .diagnostics import event
+
+                        event("crop_source_grid_invalid", token=token, message=str(error))
+                elif source is not None and not temporary and shape:
+                    # A saved whole-frame TIFF remains an authenticated source.
+                    # Read its bounded display grid on demand, once per locator.
+                    step = max(1, math.ceil(max(shape[:2]) / MAX_FIT_EDGE))
+                    source_grid = dict(record=source, direction=saved_direction, sample_step=step)
+            return image, scopes, metering, source_grid
         finally:
             if temporary:
                 window.live.discard(temporary)
@@ -353,13 +501,13 @@ def display_crop_record(window, token, record, context, *, sample_step=1, tempor
         if result_token != window.token or not _matches(window, context):
             return
         try:
-            image, scopes, metering = result
+            image, scopes, metering, source_grid = result
             # A slower saved-reference conversion must never replace a fresh
             # current-color frame delivered by the same generation.
             existing = getattr(window, "crop_locator_cache", {})
             if reference and existing.get("key") == context["key"] and not existing.get("reference", True):
                 return
-            if _install(window, image, context, reference=reference, scope_data=scopes):
+            if _install(window, image, context, reference=reference, scope_data=scopes, source_grid=source_grid):
                 if metering is not None:
                     window.project.remember_preview_metering(context["recipe"], metering)
                     window.refresh_metering_status()

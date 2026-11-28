@@ -217,6 +217,7 @@ class EditHistoryUI:
             self.status_message("请先修正尚未应用的参数，再撤回或重做。")
             return
         label = self.project.redo_label() if redo else self.project.undo_label()
+        before = self.project.recipe()
         geometry = self.edit_geometry()
         if not (self.project.redo() if redo else self.project.undo()):
             self.sync_history_actions()
@@ -230,9 +231,11 @@ class EditHistoryUI:
         self.refresh_photos()
         if in_crop:
             self.refresh_selection_preview()
-        elif geometry != self.edit_geometry():
-            self.canvas.fit()
-        self.schedule_preview()
+            self.schedule_preview()
+        elif not self.reuse_output_orientation(before):
+            if geometry != self.edit_geometry():
+                self.canvas.fit()
+            self.schedule_preview()
         self.status_message(("已重做：" if redo else "已撤回：") + label)
 
     def open_crop_tools(self, *, start_crop=False):

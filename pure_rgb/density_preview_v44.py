@@ -145,6 +145,7 @@ class DensityPreviewCache:
         self.engine_proxy_samples = OrderedDict()
         self.original_base_samples = OrderedDict()
         self.original_meter_values = OrderedDict()
+        self.original_highlight_measurements = OrderedDict()
         self.original_companion = None
         self.original_screen_base = None
         self.native_meter_proxy = None
@@ -582,7 +583,7 @@ class DensityPreviewCache:
                 receipt["effect_sampling"] = effect.receipt
         return _to_uint16_jit(image), icc, receipt
 
-    def _reference(self, recipe, mode, rectangle, step, direction, fallback, icc, *, share=False):
+    def _reference(self, recipe, mode, rectangle, step, direction, fallback, icc, *, share=False, bounded=False):
         from .draft_preview import _geometry_document, _identity, defer_comparison
         from .output_orientation import orient_reference, orient_codes
         from .preview_data import verified_pixels
@@ -607,6 +608,24 @@ class DensityPreviewCache:
         if cached is not None and cached["identity"] == identity:
             self.owner.reference_label = "已保存版本"
             return cached["pixels"] if share else cached["pixels"].copy()
+        # At 1:1, the A/B pane needs only its matching saved strips.
+        # A sampled fit has a different phase contract and keeps its own route.
+        if bounded and step == 1:
+            from .viewport_preview_v43 import _saved_strip_tile
+
+            tile = _saved_strip_tile(self.owner, record, identity, (a, b, c, d), rectangle, direction, step)
+            if tile is not None:
+                pixels, other = tile
+                if other != icc:
+                    raise ValueError("已保存预览参考ICC或身份不一致")
+                self.owner.reference_label = "已保存版本"
+                self.references[key] = dict(
+                    identity=identity,
+                    pixels=np.frombuffer(pixels.tobytes(), dtype=np.uint16).reshape(pixels.shape),
+                )
+                while len(self.references) > 2:
+                    self.references.popitem(last=False)
+                return pixels
         anchor = getattr(self.owner, "anchor", None)
         if (anchor is not None and anchor.get("owned") is False
                 and anchor["record"] == record and anchor["identity"] == identity
@@ -751,7 +770,7 @@ class DensityPreviewCache:
             self.owner.reference_label = ""
             reference = current
         else:
-            reference = self._reference(recipe, mode, phase_roi, step, direction, pixels, icc)
+            reference = self._reference(recipe, mode, phase_roi, step, direction, pixels, icc, bounded=viewport is not None)
         self.certificate.validate()
         if entry["domain"] is not None:
             entry["domain"].validate()
@@ -818,6 +837,7 @@ class DensityPreviewCache:
         self.engine_proxy_samples.clear()
         self.original_base_samples.clear()
         self.original_meter_values.clear()
+        self.original_highlight_measurements.clear()
         self.original_companion = None
         self.references.clear()
         if self.session is not None and self.session.processor is not None:

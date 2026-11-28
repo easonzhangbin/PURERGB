@@ -312,6 +312,8 @@ class LivePreview(QObject):
         records = event.get("records", [])
         if records and event.get("metering_sidecar") is not None:
             preview_metering_path(records[0]).unlink(missing_ok=True)
+        if event.get("crop_source") is not None:
+            records = [*records, event["crop_source"]]
         for path in {record["path"] for record in records}:
             Path(path).unlink(missing_ok=True)
 

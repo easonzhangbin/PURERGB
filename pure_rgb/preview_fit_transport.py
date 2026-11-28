@@ -16,12 +16,12 @@ _MAX_ICC = 4 * 1024**2
 _REFERENCE_ANCHOR = ".fit-reference-anchor.rgb16"
 
 
-def can_transport_fit(request, current, reference, icc):
+def can_transport_fit(request, current, reference, icc, *, repair_ready=False):
     return (
         request.get("preview_transport") == FIT_TRANSPORT
         and not any(request.get(key) for key in ("full_resolution", "viewport"))
         and (not request.get("crop_locator") or current is reference)
-        and request.get("repair_plan") is None
+        and (request.get("repair_plan") is None or repair_ready)
         and isinstance(icc, bytes) and 128 <= len(icc) <= _MAX_ICC
         and all(
             image.dtype == np.dtype(np.uint16) and image.ndim == 3 and image.shape[2] == 3
@@ -133,7 +133,7 @@ def write_fit_records(directory, token, current, reference, icc, *, current_only
 
 
 def discard_undelivered_fit(directory, token):
-    for path in fit_record_paths(directory, token):
+    for path in (*fit_record_paths(directory, token), *fit_record_paths(directory, f"{token}-crop-source")):
         for temporary in (path, path.with_suffix(".rgb16.part"), path.with_suffix(".metering.json")):
             temporary.unlink(missing_ok=True)
 

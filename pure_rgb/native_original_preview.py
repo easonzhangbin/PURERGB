@@ -398,9 +398,11 @@ def _matching_highlight_reference(cached, highlight):
 
 def _highlight_sample(cache, config, cached, highlight, point, rectangle, step, stage, *,
                       subgrid=None, film=None, print_ev=0.0):
+    from negpy.features.exposure.models import TARGETS_REVISION
+
     from .density_preview_v44 import _key
     from .highlight_sample_v46 import compose_native_sample
-    from .highlight_workflow import highlight_reference_config
+    from .highlight_workflow import _highlight_reference_render_config, highlight_reference_config
     from .positive_float import working_icc_bytes
 
     source = cache.session.source
@@ -409,11 +411,25 @@ def _highlight_sample(cache, config, cached, highlight, point, rectangle, step, 
     reference = cached.get("highlight_reference")
     reference_hit = _matching_highlight_reference(cached, highlight)
     if not reference_hit:
-        cache._progress("highlight_reference", .55, "正在测量高光参考并生成参考预览…")
         with span("native_preview_highlight_reference"):
-            settings, window = highlight_reference_config(
-                source, config, roi, reference_density_offset=offset, film=film,
-            )
+            # Metering reads only RAW and negative process coordinates. Paper,
+            # exposure and the displayed grid can change without re-reading them.
+            meter_key = (cache.certificate.sha256, tuple(roi), calculate_config_hash(config.process), TARGETS_REVISION)
+            measurements = cache.original_highlight_measurements
+            measured = measurements.get(meter_key)
+            if measured is None:
+                cache._progress("highlight_reference", .55, "正在测量高光参考…")
+                settings, window = highlight_reference_config(
+                    source, config, roi, reference_density_offset=offset, film=film,
+                )
+                measurements[meter_key] = settings.process, window
+                while len(measurements) > 3:
+                    measurements.popitem(last=False)
+                cache.reference_measurement_calls += 1
+            else:
+                measurements.move_to_end(meter_key)
+                process, window = measured
+                settings = _highlight_reference_render_config(config, process, offset)
             reference = _render_sample(cache, settings, cached["export"], rectangle, step, stage, print_ev=print_ev)
         if (reference["target"] != cached["target"]
                 or reference["encoded"].dtype != cached["encoded"].dtype):
@@ -421,7 +437,6 @@ def _highlight_sample(cache, config, cached, highlight, point, rectangle, step, 
         reference.update(roi=roi, reference_density_offset=offset,
                          window=dict(log_dense=list(window.log_dense), log_thin=list(window.log_thin)))
         cached["highlight_reference"] = reference
-        cache.reference_measurement_calls += 1
     key = _key([highlight, point, subgrid])
     slot = "interactive_result" if subgrid is not None else "result"
     result = reference.get(slot)
@@ -486,10 +501,13 @@ def try_original_density_screen(owner, request, recipe, mode):
         recipe.get(key) for key in ("flex_research_controls", "flex_profile", "experimental_film_controls")
     )
     locator = bool(request.get("crop_locator"))
+    crop_grid = locator and request.get("crop_source_grid") is True
     engine_proxy = request.get("engine_proxy") is True
     if ((mode != "native" and not nikon and not flex) or recipe.get("measurement_method") != "negpy"
             or recipe.get("source_mode")
-            or request.get("full_resolution") or request.get("repair_plan")
+            or request.get("full_resolution")
+            or (request.get("repair_plan") is not None
+                and ((locator and not crop_grid) or (engine_proxy and mode == "native")))
             or (locator and (mode != "native" or recipe["crop"] or "viewport" in request))
             or not recipe.get("roi")):
         return None
@@ -585,13 +603,15 @@ def try_original_density_screen(owner, request, recipe, mode):
     phase = oriented_source_sample_roi(rectangle, direction, step)
     lab = wanted.lab
     approximate = (
-        (native_tone or engine_proxy) and stage == "lab"
+        (native_tone or engine_proxy or crop_grid) and stage == "lab"
         and viewport is None and step > 1
         and lab.clahe_strength == lab.glow_amount == lab.halation_strength == 0
         and (lab.sharpen == 0 or lab.sharpen_method == SharpenMethod.USM)
     )
     if engine_proxy and (highlight or stage == "lab" and not approximate):
         return None
+    repair_proxy = (request.get("defer_repair") is True and native_tone and viewport is None
+                    and edge is not None and (approximate or stage == "base"))
 
     with span("native_preview_source"):
         session = cache.prepare_source()
@@ -621,6 +641,12 @@ def try_original_density_screen(owner, request, recipe, mode):
                 finer_key = normal_key
                 step *= factor
                 phase = oriented_source_sample_roi(rectangle, direction, step)
+    if repair_proxy and not interactive:
+        # No settled frame is required to render the first repaired-photo
+        # drag. Reuse the original meter and sample only the small display grid.
+        step *= max(1, (max(size) + edge * step - 1) // (edge * step))
+        phase = oriented_source_sample_roi(rectangle, direction, step)
+        interactive = True
     if (edge and edge <= _METER_PROXY_MAX_EDGE and native_tone and viewport is None
             and not interactive and not highlight and not headroom and not print_ev
             and (request.get("metering_edit") is True or _meter_drag_changes_process(cache, config))):
@@ -699,7 +725,7 @@ def try_original_density_screen(owner, request, recipe, mode):
                 event("flex_preview_saved_fit_reused", stride=native_step)
     hit = cached is not None
     if cached is None:
-        cache._progress("density_support", .28, "正在准备 NegPy 测量与转换…")
+        cache._progress("density_support", .28, "正在生成 NegPy 转换预览…")
         companion_grid = None
         if (stage == "lab" and (nikon or flex) and viewport is None and not edge
                 and not engine_proxy and not headroom):
@@ -742,7 +768,7 @@ def try_original_density_screen(owner, request, recipe, mode):
     if highlight:
         highlight_subgrid = None
         highlight_phase, highlight_step = phase, step
-        if (edge and native_tone and viewport is None
+        if (edge and native_tone and viewport is None and not interactive
                 and _matching_highlight_reference(cached, highlight)):
             # Both float grids and both masks have the same original source
             # phase. Strength is per-pixel, so decimate all four before blend.
@@ -775,7 +801,7 @@ def try_original_density_screen(owner, request, recipe, mode):
         owner.reference_label = ""
     else:
         reference = cache._reference(recipe, mode, phase, step, direction, pixels, icc,
-                                     share=fit_edge > 1400 and viewport is None)
+                                     share=fit_edge > 1400 and viewport is None, bounded=viewport is not None)
     # Store just the last finish for each small RGB16 fit sample. An unchanged
     # release can publish the actual dragged pixels, while other recipes still
     # run the appropriate final colour controls.

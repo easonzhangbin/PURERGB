@@ -483,20 +483,22 @@ def render(request, *, emit_callback=None, prepared_source=None):
         print_ev = native_print_ev(recipe)
         highlight_controls = native_local_highlight(recipe)
         spatial_controls = recipe.get("native_spatial_controls")
-        # These Native-only renders produce their own RGB16, export tags and
-        # pinned working ICC. Float/highlight need the neutral export settings,
-        # and other engines still consume the neutral reference pixels.
+        # These Native-only renders produce their own RGB16 and export tags.
+        # Legacy highlight needs the same export settings, while only the
+        # other engines consume the neutral reference pixels.
         ordinary_native_edits = native_overrides and not any((
             float_controls, highlight_controls, recipe.get("native_film"),
         ))
         skip_neutral_native = (
             only_mode == "native"
-            and (headroom or (print_ev and not highlight_controls) or bool(spatial_controls) or bool(ordinary_native_edits))
+            and (headroom or print_ev or spatial_controls or highlight_controls or ordinary_native_edits)
             and not recipe.get("density_metering")
             and not recipe.get("nikon_research_controls")
         )
         if skip_neutral_native:
             payload = export = native = icc = None
+            if highlight_controls:
+                export = native_export_settings(frozen)
         elif recipe.get("density_metering"):
             from .shared_density_metering_v43 import render_shared_measurement
 

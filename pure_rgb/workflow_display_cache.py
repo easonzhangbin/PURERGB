@@ -16,12 +16,25 @@ import threading
 
 import numpy as np
 from PIL import Image
-from PyQt6.QtGui import QColorSpace, QImage
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColorSpace, QImage, QTransform
 
 from .preview_data import verified_pixels
 from .preview_fit_transport import FIT_TRANSPORT, read_fit_record
 from .workflow_display import named_reference_profile, profile_description
 from .workflow_color_parallel import transform_packed_rgb, transform_rgb_image
+
+
+def orient_display_image(image, before, after):
+    """Apply the same pixel permutation as the output pipeline to a fit QImage."""
+    from .output_orientation import _relative_document
+
+    direction = _relative_document(before, after)
+    if direction["quarter_turns"]:
+        image = image.transformed(QTransform().rotate(90 * direction["quarter_turns"]))
+    if direction["flip_horizontal"]:
+        image = image.flipped(Qt.Orientation.Horizontal)
+    return image
 
 
 @dataclass(frozen=True)

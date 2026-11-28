@@ -18,7 +18,9 @@ import numpy as np
 
 from .native import sha256
 from .output_orientation import orient_reference, sample_oriented
-from .output_orientation_cache import _color_recipe, cache_budget_bytes
+from .output_orientation_cache import (
+    _color_recipe, cache_budget_bytes, cached_preview as cached_orientation_preview,
+)
 from .preview_data import verified_pixels
 from .workspace import checked_recipe, output_rectangle, source_recipe_identity
 
@@ -250,6 +252,7 @@ class DraftPreview:
         from .native_draft_preview_v40 import resolved_saved_recipe
 
         self.recipe = resolved_saved_recipe(self.manifest)
+        self.spatial_snapshot = self.manifest.get("native_spatial_snapshot")
         self.directory = Path(state_directory).resolve()
         self.anchor = None
         self.saved_session = None
@@ -322,7 +325,7 @@ class DraftPreview:
             raise ValueError("黑白草稿仅支持原生预览")
         return recipe, mode, full
 
-    def render(self, request):
+    def render(self, request, *, allow_full_viewport=True):
         from .diagnostics import span
         from .viewport_preview_v43 import (
             output_size_for_recipe, render_viewport, sample_full_viewport,
@@ -333,7 +336,7 @@ class DraftPreview:
         self.native_print = None
         self.metering_receipt = {}
         self._defer_reference = request.get("defer_reference") is True
-        self.reference_deferred = False
+        self.reference_deferred = self._defer_reference and "viewport" in request
         if self.density_preview is not None:
             self.density_preview.last_receipt = None
         self.viewport_result = None
@@ -347,9 +350,20 @@ class DraftPreview:
             if saved is not None:
                 self._validate(request)
                 return saved
-        elif (not request.get("full_resolution")
-              and (recipe.get("density_metering") or recipe.get("native_spatial_controls"))):
-            saved = self._saved_crop(recipe, mode, False)
+            if allow_full_viewport:
+                from .viewport_geometry import render_straightened_viewport
+
+                size = self.output_size
+                straightened = render_straightened_viewport(self, request, recipe, mode, size)
+                if straightened is not None:
+                    self._validate(request)
+                    return straightened
+                self.output_size = size
+        else:
+            saved = self._saved_orientation(request, recipe, mode)
+            if saved is None and (not request.get("full_resolution")
+                                  and (recipe.get("density_metering") or recipe.get("native_spatial_controls"))):
+                saved = self._saved_crop(recipe, mode, False)
             if saved is not None:
                 self.metering_receipt = self._metering_receipt(self.manifest, mode)
                 self._validate(request)
@@ -384,8 +398,11 @@ class DraftPreview:
             checked_viewport(viewport, viewport.get("output_size") if isinstance(viewport, dict) else None)
             result = render_viewport(self, request, recipe, mode)
             if result is None:
+                if not allow_full_viewport:
+                    return None
                 # Spatial/geometry operations keep their full-grid contract.
-                full_request = {key: value for key, value in request.items() if key != "viewport"}
+                full_request = {key: value for key, value in request.items()
+                                if key not in ("viewport", "defer_reference")}
                 full_request["full_resolution"] = True
                 result, viewport = sample_full_viewport(self._render_frame(full_request), request["viewport"])
                 self.viewport_result = viewport
@@ -404,7 +421,8 @@ class DraftPreview:
             approximate=False,
         )
         edge = request.get("interactive_edge")
-        if edge and request.get("repair_plan") is None and max(current.shape[:2]) <= edge:
+        if (edge and max(current.shape[:2]) <= edge
+                and (request.get("repair_plan") is None or request.get("engine_proxy") is True)):
             label = "引擎快速预览" if request.get("engine_proxy") else "拖动预览"
             self.preview_quality.update(approximate=edge < 1400, interactive_frame=True, label=label)
             return current, current, icc
@@ -455,6 +473,7 @@ class DraftPreview:
             and mode in self.manifest["results"]
             and _saved_color_valid(self.manifest, mode)
             and _replay_setup(recipe, mode) == _replay_setup(self.recipe, mode)
+            and _geometry_document(recipe, mode) == _geometry_document(self.recipe, mode)
             and not (recipe.get("source_mode") == "bw-single-v1"
                      and recipe.get("post_controls") != self.recipe.get("post_controls"))
         ):
@@ -531,7 +550,7 @@ class DraftPreview:
             _verified_anchor_pixels(anchor, check_only=True)
             return np.array(current, copy=True), np.array(reference, copy=True), icc
         current = self._finish(before, recipe, mode)
-        reference = self._reference(before, rectangle, recipe, mode, icc)
+        reference = current if defer_comparison(self) else self._reference(before, rectangle, recipe, mode, icc)
         if current.shape != reference.shape:
             raise ValueError("草稿与调整前预览几何不一致")
         step = 1 if full else max(1, int(np.ceil(max(current.shape[:2]) / 1400)))
@@ -602,6 +621,34 @@ class DraftPreview:
             ).reshape(pixels.shape)
         if old is not None and old.get("owned", True):
             shutil.rmtree(old["directory"], ignore_errors=True)
+
+    def _saved_orientation(self, request, recipe, mode):
+        """Permute a verified full saved result before considering RAW or Lab."""
+        if (mode != "native" or request.get("full_resolution") or request.get("crop_locator")
+                or request.get("tone_edit") or request.get("interactive_edge")
+                or request.get("release_priority")
+                or self.output_size is None
+                or recipe.get("output_orientation") == self.recipe.get("output_orientation")
+                or _color_recipe(recipe, mode) != _color_recipe(self.recipe, mode)):
+            return None
+        record = self.manifest["results"].get(mode)
+        if record is None or record.get("icc_sha256") != self.manifest.get("icc_sha256"):
+            return None
+        from .viewport_preview_v43 import output_size_for_recipe
+
+        saved_size = output_size_for_recipe(
+            self.recipe, self.manifest["source_shape"], self.manifest["roi"], mode,
+        )
+        if saved_size is None or record.get("shape") != [saved_size[1], saved_size[0], 3]:
+            return None
+        frame = cached_orientation_preview(self, recipe, mode, full_resolution=False)
+        if frame is not None:
+            from .diagnostics import event
+
+            self.reference_label = "已保存版本"
+            event("preview_saved_orientation_reused", mode=mode, sample_step=self.sample_step,
+                  output_size=self.output_size)
+        return frame
 
     def _saved_crop(self, recipe, mode, full):
         """Crop-only edits inside a saved canvas need no RAW/color preparation."""
@@ -679,6 +726,7 @@ class DraftPreview:
             session.processor.destroy_all()
 
     def close(self):
+        self._orientation_saved = None
         if self.density_preview is not None:
             self.density_preview.close()
             self.density_preview = None

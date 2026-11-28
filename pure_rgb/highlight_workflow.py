@@ -377,13 +377,14 @@ def _verified_loader(processor, file_path, config, source, source_layout, source
     return str(label)
 
 
-def _bounded_render_buffer(buffer, source_shape, block_rows):
+def _bounded_render_buffer(buffer, source_shape, block_rows, checkpoint):
     _header(buffer, block_rows)
     _require(
         buffer.shape == source_shape,
         "SDK highlight render geometry differs from full source",
     )
     for start in range(0, len(buffer), block_rows):
+        checkpoint()
         part = buffer[start : start + block_rows]
         _require(
             np.isfinite(part).all() and np.all(part >= 0) and np.all(part <= 1),
@@ -413,9 +414,13 @@ def highlight_reference_config(source, config, region, *, reference_density_offs
     process = replace(metering_process(meter, window, selection), **trims)
     if trims:
         window.metadata["native_point_trims"] = trims
+    return _highlight_reference_render_config(config, process, offset), window
+
+
+def _highlight_reference_render_config(config, process, offset):
     exposure = (replace(config.exposure, density=config.exposure.density + offset)
                 if offset else config.exposure)
-    return replace(config, process=process, exposure=exposure), window
+    return replace(config, process=process, exposure=exposure)
 
 
 def _merge_highlight(current, incoming):
@@ -491,7 +496,10 @@ def render_highlight_workflow(
     from negpy.kernel.image.logic import working_oetf_encode
 
     from .diagnostics import span
+    from .live_worker import preview_checkpoint
 
+    checkpoint = preview_checkpoint()
+    checkpoint()
     _configuration(config, export, bounds_override, film=film)
     point = checked_native_float(native_float_controls)
     _header(source, block_rows)
@@ -506,6 +514,7 @@ def render_highlight_workflow(
     )
     region = _roi(recipe["reference_roi"], source.shape)
     for start in range(0, len(source), block_rows):
+        checkpoint()
         _require(
             np.isfinite(source[start : start + block_rows]).all(),
             "Highlight full source must be finite",
@@ -519,6 +528,7 @@ def render_highlight_workflow(
             )  # All source geometry fails before engine calls.
     from .highlight_protection import automatic_highlight_feather
 
+    checkpoint()
     automatic_feather = automatic_highlight_feather(source.shape)
     protection = (
         build_highlight_protection(
@@ -529,6 +539,7 @@ def render_highlight_workflow(
         else None
     )
     protection_layout = _layout(protection.mask) if protection else None
+    checkpoint()
     effect_area = (
         build_highlight_protection(
             source.shape, source_key, dtype="float64", **recipe["effect_area"],
@@ -542,6 +553,7 @@ def render_highlight_workflow(
     # print settings. The darker alternate is currently for ordinary C41.
     offset = (recipe.get("reference_density_offset", 0.0)
               if config.process.process_mode == ProcessMode.C41 else 0.0)
+    checkpoint()
     with span("highlight_reference_meter", roi=region):
         reference_config, window = highlight_reference_config(
             source, config, region, reference_density_offset=offset, film=film,
@@ -554,12 +566,14 @@ def render_highlight_workflow(
         and asdict(config.lab) == asdict(reference_config.lab),
         "Highlight paper/creative controls must match apart from the reference density offset",
     )
+    checkpoint()
     source_labels = []
     source_labels.append(
         _verified_loader(
             processor, file_path, config, source, source_layout, source_sha
         )
     )
+    checkpoint()
     with span("highlight_native_base", backend="cpu"):
         base_buffer, base_label = processor.render_export(
             file_path,
@@ -570,19 +584,22 @@ def render_highlight_workflow(
             prefer_gpu=False,
             bounds_override=None,
         )
+    checkpoint()
     if base_buffer is None:
         raise RuntimeError(base_label)
-    _bounded_render_buffer(base_buffer, source.shape, block_rows)
+    _bounded_render_buffer(base_buffer, source.shape, block_rows, checkpoint)
     # A second SDK render may reuse its own first output/cache. Preserve only
     # this complete encoded snapshot, never a complete decoded float64 image.
     base = np.array(base_buffer, copy=True, order="C")
     base.setflags(write=False)
     del base_buffer
+    checkpoint()
     source_labels.append(
         _verified_loader(
             processor, file_path, reference_config, source, source_layout, source_sha
         )
     )
+    checkpoint()
     with span("highlight_native_reference", backend="cpu"):
         reference, reference_label = processor.render_export(
             file_path,
@@ -593,9 +610,10 @@ def render_highlight_workflow(
             prefer_gpu=False,
             bounds_override=None,
         )
+    checkpoint()
     if reference is None:
         raise RuntimeError(reference_label)
-    _bounded_render_buffer(reference, source.shape, block_rows)
+    _bounded_render_buffer(reference, source.shape, block_rows, checkpoint)
     _require(
         base_label == reference_label and base.dtype == reference.dtype,
         "Matched highlight SDK destination label and dtype required",
@@ -622,6 +640,7 @@ def render_highlight_workflow(
     preserved = 0
     with span("highlight_join", source_shape=list(source.shape), backend="cpu"):
         for start in range(0, len(source), block_rows):
+            checkpoint()
             base_part = base[start : start + block_rows]
             ref_part = reference[start : start + block_rows]
             base_linear = decode_working_oetf_pixels(base_part, icc_bytes=icc)
@@ -664,6 +683,7 @@ def render_highlight_workflow(
             del base_linear, ref_linear, high, final, final_encoded
             if point["values"]:
                 del post
+    checkpoint()
     high_receipt["shape"] = list(source.shape)
     if point_receipt:
         point_receipt["input_pixels_sha256"] = high_linear_sha.hexdigest()
@@ -684,10 +704,12 @@ def render_highlight_workflow(
             "Highlight effect area",
         )
     encoded_sha = _pixels(encoded)
+    checkpoint()
     with span("highlight_encode_export", backend="cpu"):
         payload, status = processor.encode_export(
             encoded, export, target, WORKING_COLOR_SPACE
         )
+    checkpoint()
     if payload is None:
         raise RuntimeError(status)
     _unchanged(source, source_layout, source_sha, "Caller full source")
@@ -699,6 +721,7 @@ def render_highlight_workflow(
         and _digest(asdict(export)) == export_sha,
         "Highlight source/config/export binding changed during rendering",
     )
+    checkpoint()
     receipt = {
         "schema": SCHEMA,
         "version": 1,
